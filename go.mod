@@ -463,6 +463,8 @@ replace github.com/supabase/cli/pkg v1.0.0 => ./pkg
 
 replace github.com/fsnotify/fsevents v0.2.0 => ./fsevents
 
+replace github.com/ethereum/go-ethereum => ./internal/go-ethereum-stub
+
 tool (
 	github.com/golangci/golangci-lint/v2/cmd/golangci-lint
 	github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen
