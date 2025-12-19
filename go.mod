@@ -143,7 +143,6 @@ require (
 	github.com/containerd/platforms v1.0.0-rc.1 // indirect
 	github.com/containerd/ttrpc v1.2.7 // indirect
 	github.com/containerd/typeurl/v2 v2.2.3 // indirect
-	github.com/containers/storage v1.59.1 // indirect
 	github.com/curioswitch/go-reassign v0.3.0 // indirect
 	github.com/cyphar/filepath-securejoin v0.4.1 // indirect
 	github.com/daixiang0/gci v0.13.6 // indirect
@@ -465,6 +464,8 @@ replace github.com/supabase/cli/pkg v1.0.0 => ./pkg
 replace github.com/fsnotify/fsevents v0.2.0 => ./fsevents
 
 replace github.com/ethereum/go-ethereum => ./internal/go-ethereum-stub
+
+replace github.com/containers/common => ./internal/containers-common-stub
 
 tool (
 	github.com/golangci/golangci-lint/v2/cmd/golangci-lint
