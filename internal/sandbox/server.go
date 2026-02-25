@@ -85,10 +85,13 @@ func getProcessesState(ctx context.Context, serverPort int) (*processesState, er
 		return nil, err
 	}
 	defer resp.Body.Close()
-
+	resp, err := pcClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("process-compose API returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("failed to get process states - unexpected status code: %s", resp.Status)
 	}
 
 	var states processesState
