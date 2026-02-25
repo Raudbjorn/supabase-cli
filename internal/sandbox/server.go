@@ -1,11 +1,16 @@
 package sandbox
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 const (
@@ -180,4 +185,177 @@ func isPostgresReady(states *processesState) bool {
 	}
 
 	return postgresReady && postgresInitReady
+}
+
+// restartProcess sends a restart request for a single process via the process-compose API.
+// POST /process/restart/:name
+func restartProcess(serverPort int, name string) error {
+	client := &http.Client{Timeout: HTTPClientTimeout}
+	url := fmt.Sprintf("http://127.0.0.1:%d/process/restart/%s", serverPort, name)
+
+	req, err := http.NewRequest(http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to restart process %s: %w", name, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to restart process %s (status %s): %s", name, resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+// stopProcess sends a stop signal to a single process via the process-compose API.
+// PATCH /process/stop/:name
+func stopProcess(serverPort int, name string) error {
+	client := &http.Client{Timeout: HTTPClientTimeout}
+	url := fmt.Sprintf("http://127.0.0.1:%d/process/stop/%s", serverPort, name)
+
+	req, err := http.NewRequest(http.MethodPatch, url, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to stop process %s: %w", name, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to stop process %s (status %s): %s", name, resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+// startProcess sends a start request for a single process via the process-compose API.
+// POST /process/start/:name
+func startProcess(serverPort int, name string) error {
+	client := &http.Client{Timeout: HTTPClientTimeout}
+	url := fmt.Sprintf("http://127.0.0.1:%d/process/start/%s", serverPort, name)
+
+	req, err := http.NewRequest(http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to start process %s: %w", name, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to start process %s (status %s): %s", name, resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+// processLog represents a single log message from the process-compose WebSocket API.
+type processLog struct {
+	ProcessName string `json:"process_name"`
+	Message     string `json:"message"`
+	Timestamp   string `json:"timestamp"`
+	IsStderr    bool   `json:"is_stderr"`
+}
+
+// streamProcessLogs connects to the process-compose WebSocket log endpoint and
+// writes log messages to the provided writer until the context is cancelled.
+// GET /process/logs/ws (WebSocket upgrade)
+func streamProcessLogs(ctx context.Context, serverPort int, processName string, w io.Writer) error {
+	url := fmt.Sprintf("ws://127.0.0.1:%d/process/logs/ws", serverPort)
+	if processName != "" {
+		url += "?name=" + processName
+	}
+
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to connect to log stream: %w", err)
+	}
+	defer conn.Close()
+
+	// Close connection when context is cancelled
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+
+	for {
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil // Context cancelled, normal shutdown
+			}
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+				return nil
+			}
+			return fmt.Errorf("log stream error: %w", err)
+		}
+
+		var logMsg processLog
+		if err := json.Unmarshal(message, &logMsg); err != nil {
+			// Not JSON, write raw message
+			fmt.Fprintln(w, string(message))
+			continue
+		}
+
+		fmt.Fprintln(w, formatLogMessage(&logMsg))
+	}
+}
+
+// formatLogMessage formats a log message for terminal output.
+func formatLogMessage(log *processLog) string {
+	return fmt.Sprintf("[%s] %s", log.ProcessName, strings.TrimRight(log.Message, "\n"))
+}
+
+// fetchProcessLogs retrieves historical logs for a process via the REST API.
+// GET /process/logs/:name/:endOffset/:limit
+func fetchProcessLogs(serverPort int, name string, limit int) ([]string, error) {
+	client := &http.Client{Timeout: HTTPClientTimeout}
+	url := fmt.Sprintf("http://127.0.0.1:%d/process/logs/%s/0/%d", serverPort, name, limit)
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch logs for %s: %w", name, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to fetch logs for %s (status %s): %s", name, resp.Status, strings.TrimSpace(string(body)))
+	}
+
+	var lines []string
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	return lines, scanner.Err()
+}
+
+// getProjectState fetches the full project state including dependency graph info.
+// GET /project/state
+func getProjectState(serverPort int) (map[string]interface{}, error) {
+	client := &http.Client{Timeout: HTTPClientTimeout}
+	url := fmt.Sprintf("http://127.0.0.1:%d/project/state", serverPort)
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var state map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+		return nil, fmt.Errorf("failed to decode project state: %w", err)
+	}
+	return state, nil
 }

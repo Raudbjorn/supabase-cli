@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/docker/docker/api/types/volume"
 	"github.com/spf13/afero"
@@ -13,7 +14,7 @@ import (
 	"github.com/supabase/cli/internal/utils/flags"
 )
 
-func Run(ctx context.Context, backup bool, projectId string, all bool, fsys afero.Fs) error {
+func Run(ctx context.Context, backup bool, projectId string, all bool, service string, fsys afero.Fs) error {
 	var searchProjectIdFilter string
 	if !all {
 		// Sanity checks.
@@ -23,6 +24,14 @@ func Run(ctx context.Context, backup bool, projectId string, all bool, fsys afer
 			return err
 		}
 		searchProjectIdFilter = utils.Config.ProjectId
+	}
+
+	// Handle --service flag for selective stop (sandbox only)
+	if service != "" {
+		if !sandbox.IsSandboxRunning(fsys, searchProjectIdFilter) {
+			return fmt.Errorf("--service flag requires sandbox mode. Start with: supabase start --sandbox")
+		}
+		return sandbox.StopService(ctx, fsys, searchProjectIdFilter, service, os.Stderr)
 	}
 
 	// Check if sandbox mode is running for this project

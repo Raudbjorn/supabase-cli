@@ -5,6 +5,7 @@ builds:
     binary: supabase
     flags:
       - -trimpath
+      - -pgo=auto
     ldflags:
       - -s -w -X github.com/supabase/cli/internal/utils.Version={{.Version}} -X github.com/supabase/cli/internal/utils.SentryDsn={{ .Env.SENTRY_DSN }}
     env:
