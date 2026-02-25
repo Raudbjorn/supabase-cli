@@ -3,7 +3,9 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -500,6 +502,14 @@ func GenerateProcessComposeConfig(goCtx context.Context, ctx *SandboxContext, po
 	}
 
 	return buf.String(), nil
+}
+
+// generateSecretKeyBase derives a 64-char hex secret from the JWT secret.
+// Elixir services (realtime, logflare) require SECRET_KEY_BASE >= 64 chars.
+func generateSecretKeyBase(jwtSecret string) string {
+	h := sha256.New()
+	h.Write([]byte("supabase-sandbox-secret-key-base:" + jwtSecret))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // WriteProcessComposeConfig generates and writes process-compose.yaml to the sandbox directory.

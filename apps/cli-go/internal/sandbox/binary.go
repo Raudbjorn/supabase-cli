@@ -31,6 +31,13 @@ const (
 	PostgresVersion       = "17.6.1.081-cli"
 	ProcessComposeVersion = "1.90.0"
 
+	// Docker image tags for services extracted via `docker create` + `docker cp`
+	RealtimeImage = "supabase/realtime:latest"
+	LogflareImage = "supabase/logflare:latest"
+	StorageImage  = "supabase/storage-api:latest"
+	PgmetaImage   = "supabase/postgres-meta:v0.95.2"
+	StudioImage   = "supabase/studio:latest"
+
 	// SpinnerTickInterval is how often the download spinner animation updates.
 	SpinnerTickInterval = 80 * time.Millisecond
 )
