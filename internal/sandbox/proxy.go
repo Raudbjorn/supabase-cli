@@ -19,6 +19,8 @@ type ProxyConfig struct {
 	GoTruePort         int
 	PostgRESTPort      int
 	PostgRESTAdminPort int
+	RealtimePort       int
+	StoragePort        int
 	ServiceRoleKey     string
 	ServiceRoleJWT     string
 	AnonKey            string
@@ -50,6 +52,16 @@ func RunProxy(config *ProxyConfig) error {
 
 	// REST Admin API (no auth transformation)
 	mux.Handle("/rest-admin/v1/", newProxyHandler(config, config.PostgRESTAdminPort, "/rest-admin/v1", false))
+
+	// Storage API (with auth transformation)
+	if config.StoragePort > 0 {
+		mux.Handle("/storage/v1/", newProxyHandler(config, config.StoragePort, "/storage/v1", true))
+	}
+
+	// Realtime WebSocket (with auth transformation)
+	if config.RealtimePort > 0 {
+		mux.Handle("/realtime/v1/", newProxyHandler(config, config.RealtimePort, "/realtime/v1", false))
+	}
 
 	// Wrap with CORS middleware
 	handler := corsMiddleware(mux)

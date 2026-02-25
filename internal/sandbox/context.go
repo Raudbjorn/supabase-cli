@@ -57,6 +57,11 @@ func (c *SandboxContext) PgDataDir() string {
 	return filepath.Join(utils.TempDir, "pgdata")
 }
 
+// StorageDataDir returns the path to the storage file backend directory.
+func (c *SandboxContext) StorageDataDir() string {
+	return filepath.Join(c.ConfigDir, "storage-data")
+}
+
 // EnsureDirectories creates all necessary directories for the sandbox.
 func (c *SandboxContext) EnsureDirectories(fsys afero.Fs) error {
 	dirs := []string{
@@ -64,6 +69,7 @@ func (c *SandboxContext) EnsureDirectories(fsys afero.Fs) error {
 		c.BinDir,
 		c.LogDir(),
 		c.PgDataDir(),
+		c.StorageDataDir(),
 	}
 
 	for _, dir := range dirs {

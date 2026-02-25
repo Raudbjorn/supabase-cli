@@ -17,6 +17,12 @@ type AllocatedPorts struct {
 	PostgREST      int `json:"postgrest"`
 	PostgRESTAdmin int `json:"postgrest_admin"`
 	ProcessCompose int `json:"process_compose"`
+	Realtime       int `json:"realtime"`
+	Logflare       int `json:"logflare"`
+	Storage        int `json:"storage"`
+	StorageAdmin   int `json:"storage_admin"`
+	PgMeta         int `json:"pgmeta"`
+	Studio         int `json:"studio"`
 }
 
 // SandboxState holds the complete runtime state for a sandbox instance.
@@ -66,6 +72,42 @@ func AllocatePorts(ctx context.Context) (*AllocatedPorts, error) {
 	ports.ProcessCompose, err = findAvailablePortRandom()
 	if err != nil {
 		return nil, fmt.Errorf("process-compose server port: %w", err)
+	}
+
+	// Realtime (Elixir/Phoenix, internal)
+	ports.Realtime, err = findAvailablePortRandom()
+	if err != nil {
+		return nil, fmt.Errorf("realtime port: %w", err)
+	}
+
+	// Logflare / Analytics (Elixir/Phoenix, internal)
+	ports.Logflare, err = findAvailablePortRandom()
+	if err != nil {
+		return nil, fmt.Errorf("logflare port: %w", err)
+	}
+
+	// Storage API (Node.js, internal)
+	ports.Storage, err = findAvailablePortRandom()
+	if err != nil {
+		return nil, fmt.Errorf("storage port: %w", err)
+	}
+
+	// Storage Admin (internal)
+	ports.StorageAdmin, err = findAvailablePortRandom()
+	if err != nil {
+		return nil, fmt.Errorf("storage admin port: %w", err)
+	}
+
+	// Postgres Meta (Node.js, internal)
+	ports.PgMeta, err = findAvailablePortRandom()
+	if err != nil {
+		return nil, fmt.Errorf("pgmeta port: %w", err)
+	}
+
+	// Studio (Next.js, user-facing)
+	ports.Studio, err = findAvailablePort(uint16(utils.Config.Studio.Port))
+	if err != nil {
+		return nil, fmt.Errorf("studio port: %w", err)
 	}
 
 	return ports, nil

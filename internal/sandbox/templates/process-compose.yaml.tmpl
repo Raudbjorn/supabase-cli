@@ -326,6 +326,8 @@ processes:
       --gotrue-port {{ .GoTruePort }}
       --postgrest-port {{ .PostgRESTPort }}
       --postgrest-admin-port {{ .PostgRESTAdminPort }}
+      --realtime-port {{ .RealtimePort }}
+      --storage-port {{ .StoragePort }}
       --service-role-key "{{ .ServiceRoleKey }}"
       --service-role-jwt "{{ .ServiceRoleJWT }}"
       --anon-key "{{ .AnonKey }}"
@@ -351,3 +353,309 @@ processes:
     availability:
       restart: on_failure
       max_restarts: 3
+
+  # ═══════════════════════════════════════════════════════════════
+  #  REALTIME  (Elixir/Phoenix)
+  # ═══════════════════════════════════════════════════════════════
+
+  realtime-migrate:
+    command: ./bin/migrate
+    working_dir: {{ .RealtimePath }}
+    environment:
+      - SECRET_KEY_BASE={{ .SecretKeyBase }}
+      - APP_NAME=realtime
+      - DB_HOST=127.0.0.1
+      - DB_PORT={{ .PostgresPort }}
+      - DB_USER=supabase_admin
+      - DB_PASSWORD={{ .DbPassword }}
+      - DB_NAME=postgres
+      - DB_IP_VERSION=ipv4
+      - DB_ENC_KEY=supabaserealtime
+      - API_JWT_SECRET={{ .JwtSecret }}
+      - LANG=en_US.UTF-8
+      - LANGUAGE=en_US:en
+      - LC_ALL=en_US.UTF-8
+      - MIX_ENV=prod
+      - ERL_CRASH_DUMP=/tmp/erl_crash_migrate.dump
+      - ERL_AFLAGS=-proto_dist inet6_tcp
+      - CLUSTER_STRATEGIES=EPMD
+    depends_on:
+      postgres-init:
+        condition: process_completed_successfully
+    availability:
+      restart: "no"
+    shutdown:
+      signal: 15
+      timeout_seconds: 30
+
+  realtime-seed:
+    command: ./bin/realtime eval 'Realtime.Release.seeds(Realtime.Repo)'
+    working_dir: {{ .RealtimePath }}
+    environment:
+      - SECRET_KEY_BASE={{ .SecretKeyBase }}
+      - APP_NAME=realtime
+      - DB_HOST=127.0.0.1
+      - DB_PORT={{ .PostgresPort }}
+      - DB_USER=supabase_admin
+      - DB_PASSWORD={{ .DbPassword }}
+      - DB_NAME=postgres
+      - DB_IP_VERSION=ipv4
+      - DB_ENC_KEY=supabaserealtime
+      - API_JWT_SECRET={{ .JwtSecret }}
+      - LANG=en_US.UTF-8
+      - LANGUAGE=en_US:en
+      - LC_ALL=en_US.UTF-8
+      - MIX_ENV=prod
+      - ERL_CRASH_DUMP=/tmp/erl_crash_seed.dump
+      - ERL_AFLAGS=-proto_dist inet6_tcp
+      - CLUSTER_STRATEGIES=EPMD
+      - SEED_SELF_HOST=true
+    depends_on:
+      realtime-migrate:
+        condition: process_completed_successfully
+    availability:
+      restart: "no"
+
+  realtime:
+    command: ./bin/server
+    working_dir: {{ .RealtimePath }}
+    environment:
+      - SECRET_KEY_BASE={{ .SecretKeyBase }}
+      - APP_NAME=realtime
+      - DB_HOST=127.0.0.1
+      - DB_PORT={{ .PostgresPort }}
+      - DB_USER=supabase_admin
+      - DB_PASSWORD={{ .DbPassword }}
+      - DB_NAME=postgres
+      - DB_IP_VERSION=ipv4
+      - DB_ENC_KEY=supabaserealtime
+      - DB_AFTER_CONNECT_QUERY=SET search_path TO _realtime
+      - API_JWT_SECRET={{ .JwtSecret }}
+      - PORT={{ .RealtimePort }}
+      - LANG=en_US.UTF-8
+      - LANGUAGE=en_US:en
+      - LC_ALL=en_US.UTF-8
+      - MIX_ENV=prod
+      - ERL_CRASH_DUMP=/tmp/erl_crash.dump
+      - ERL_AFLAGS=-proto_dist inet6_tcp
+      - CLUSTER_STRATEGIES=EPMD
+      - LOG_LEVEL=info
+      - SEED_SELF_HOST=true
+    depends_on:
+      realtime-seed:
+        condition: process_completed_successfully
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: {{ .RealtimePort }}
+        path: /
+        scheme: http
+      initial_delay_seconds: 5
+      period_seconds: 10
+      timeout_seconds: 5
+      failure_threshold: 5
+    availability:
+      restart: on_failure
+      backoff_seconds: 5
+      max_restarts: 10
+    shutdown:
+      signal: 15
+      timeout_seconds: 30
+
+  # ═══════════════════════════════════════════════════════════════
+  #  LOGFLARE / ANALYTICS  (Elixir/Phoenix)
+  # ═══════════════════════════════════════════════════════════════
+
+  logflare-migrate:
+    command: ./bin/logflare eval 'Logflare.Release.migrate'
+    working_dir: {{ .LogflarePath }}
+    environment:
+      - PHX_HTTP_PORT={{ .LogflarePort }}
+      - PHX_SECRET_KEY_BASE={{ .SecretKeyBase }}
+      - DB_HOSTNAME=127.0.0.1
+      - DB_PORT={{ .PostgresPort }}
+      - DB_DATABASE=postgres
+      - DB_USERNAME=supabase_admin
+      - DB_PASSWORD={{ .DbPassword }}
+      - DB_SCHEMA=_analytics
+      - LOGFLARE_SINGLE_TENANT=true
+      - LOGFLARE_SUPABASE_MODE=true
+      - LOGFLARE_API_KEY=local-logflare-api-key
+      - LOGFLARE_LOG_LEVEL=info
+      - POSTGRES_BACKEND_URL=postgresql://supabase_admin:{{ .DbPassword }}@127.0.0.1:{{ .PostgresPort }}/postgres
+      - POSTGRES_BACKEND_SCHEMA=_analytics
+      - LANG=en_US.UTF-8
+      - LANGUAGE=en_US:en
+      - LC_ALL=en_US.UTF-8
+    depends_on:
+      postgres-init:
+        condition: process_completed_successfully
+    availability:
+      restart: "no"
+    shutdown:
+      signal: 15
+      timeout_seconds: 30
+
+  logflare:
+    command: ./bin/logflare start --sname logflare
+    working_dir: {{ .LogflarePath }}
+    environment:
+      - PHX_HTTP_PORT={{ .LogflarePort }}
+      - PHX_SECRET_KEY_BASE={{ .SecretKeyBase }}
+      - DB_HOSTNAME=127.0.0.1
+      - DB_PORT={{ .PostgresPort }}
+      - DB_DATABASE=postgres
+      - DB_USERNAME=supabase_admin
+      - DB_PASSWORD={{ .DbPassword }}
+      - DB_SCHEMA=_analytics
+      - LOGFLARE_SINGLE_TENANT=true
+      - LOGFLARE_SUPABASE_MODE=true
+      - LOGFLARE_API_KEY=local-logflare-api-key
+      - LOGFLARE_LOG_LEVEL=info
+      - POSTGRES_BACKEND_URL=postgresql://supabase_admin:{{ .DbPassword }}@127.0.0.1:{{ .PostgresPort }}/postgres
+      - POSTGRES_BACKEND_SCHEMA=_analytics
+      - LANG=en_US.UTF-8
+      - LANGUAGE=en_US:en
+      - LC_ALL=en_US.UTF-8
+    depends_on:
+      logflare-migrate:
+        condition: process_completed_successfully
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: {{ .LogflarePort }}
+        path: /health
+        scheme: http
+      initial_delay_seconds: 5
+      period_seconds: 10
+      timeout_seconds: 5
+      failure_threshold: 5
+    availability:
+      restart: on_failure
+      backoff_seconds: 5
+      max_restarts: 10
+    shutdown:
+      signal: 15
+      timeout_seconds: 30
+
+  # ═══════════════════════════════════════════════════════════════
+  #  STORAGE API  (Node.js/Fastify)
+  # ═══════════════════════════════════════════════════════════════
+
+  storage-api:
+    command: node dist/start/server.js
+    working_dir: {{ .StoragePath }}
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://supabase_storage_admin:{{ .DbPassword }}@127.0.0.1:{{ .PostgresPort }}/postgres
+      - PGRST_JWT_SECRET={{ .JwtSecret }}
+      - AUTH_JWT_SECRET={{ .JwtSecret }}
+      - AUTH_JWT_ALGORITHM=HS256
+      - STORAGE_BACKEND=file
+      - STORAGE_FILE_BACKEND_PATH={{ .StorageDataDir }}
+      - SERVER_PORT={{ .StoragePort }}
+      - SERVER_ADMIN_PORT={{ .StorageAdminPort }}
+      - SERVER_HOST=0.0.0.0
+      - TENANT_ID=storage-single-tenant
+      - DB_INSTALL_ROLES=true
+      - LOG_LEVEL=info
+    depends_on:
+      postgres-init:
+        condition: process_completed_successfully
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: {{ .StoragePort }}
+        path: /status
+        scheme: http
+      initial_delay_seconds: 3
+      period_seconds: 10
+      timeout_seconds: 5
+      failure_threshold: 5
+    availability:
+      restart: on_failure
+      backoff_seconds: 5
+      max_restarts: 10
+    shutdown:
+      signal: 15
+      timeout_seconds: 15
+
+  # ═══════════════════════════════════════════════════════════════
+  #  POSTGRES META  (Node.js/Fastify)
+  # ═══════════════════════════════════════════════════════════════
+
+  postgres-meta:
+    command: node dist/server/server.js
+    working_dir: {{ .PgMetaPath }}
+    environment:
+      - PG_META_HOST=0.0.0.0
+      - PG_META_PORT={{ .PgMetaPort }}
+      - PG_META_DB_HOST=127.0.0.1
+      - PG_META_DB_PORT={{ .PostgresPort }}
+      - PG_META_DB_USER=postgres
+      - PG_META_DB_PASSWORD={{ .DbPassword }}
+      - PG_META_DB_NAME=postgres
+    depends_on:
+      postgres-init:
+        condition: process_completed_successfully
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: {{ .PgMetaPort }}
+        path: /health
+        scheme: http
+      initial_delay_seconds: 2
+      period_seconds: 10
+      timeout_seconds: 5
+      failure_threshold: 5
+    availability:
+      restart: on_failure
+      backoff_seconds: 3
+      max_restarts: 10
+    shutdown:
+      signal: 15
+      timeout_seconds: 10
+
+  # ═══════════════════════════════════════════════════════════════
+  #  STUDIO  (Next.js)
+  # ═══════════════════════════════════════════════════════════════
+
+  studio:
+    command: node apps/studio/server.js
+    working_dir: {{ .StudioPath }}
+    environment:
+      - NODE_ENV=production
+      - PORT={{ .StudioPort }}
+      - HOSTNAME=0.0.0.0
+      - STUDIO_PG_META_URL=http://127.0.0.1:{{ .PgMetaPort }}
+      - SUPABASE_URL=http://127.0.0.1:{{ .APIPort }}
+      - SUPABASE_PUBLIC_URL=http://127.0.0.1:{{ .APIPort }}
+      - SUPABASE_ANON_KEY={{ .AnonJWT }}
+      - SUPABASE_SERVICE_KEY={{ .ServiceRoleJWT }}
+      - NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:{{ .APIPort }}
+      - NEXT_PUBLIC_SUPABASE_ANON_KEY={{ .AnonJWT }}
+      - POSTGRES_PASSWORD={{ .DbPassword }}
+      - DEFAULT_ORGANIZATION_NAME=Default Organization
+      - DEFAULT_PROJECT_NAME=Default Project
+      - NEXT_ANALYTICS_BACKEND_PROVIDER=postgres
+      - SENTRY_IGNORE_API_RESOLUTION_ERROR=1
+    depends_on:
+      postgres-meta:
+        condition: process_healthy
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        port: {{ .StudioPort }}
+        path: /api/platform/profile
+        scheme: http
+      initial_delay_seconds: 5
+      period_seconds: 10
+      timeout_seconds: 5
+      failure_threshold: 5
+    availability:
+      restart: on_failure
+      backoff_seconds: 5
+      max_restarts: 10
+    shutdown:
+      signal: 15
+      timeout_seconds: 15

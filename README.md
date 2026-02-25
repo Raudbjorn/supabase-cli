@@ -1,177 +1,81 @@
-# Supabase CLI
+# Supabase CLI (Fork — Full Native Sandbox)
 
-[![Coverage Status](https://coveralls.io/repos/github/supabase/cli/badge.svg?branch=develop)](https://coveralls.io/github/supabase/cli?branch=develop) [![Bitbucket Pipelines](https://img.shields.io/bitbucket/pipelines/supabase-cli/setup-cli/master?style=flat-square&label=Bitbucket%20Canary)](https://bitbucket.org/supabase-cli/setup-cli/pipelines) [![Gitlab Pipeline Status](https://img.shields.io/gitlab/pipeline-status/sweatybridge%2Fsetup-cli?label=Gitlab%20Canary)
-](https://gitlab.com/sweatybridge/setup-cli/-/pipelines)
+Fork of the [Supabase CLI](https://github.com/supabase/cli) with an expanded `--sandbox` mode that runs **all 8 core services** natively — no Docker Compose at runtime.
 
-[Supabase](https://supabase.io) is an open source Firebase alternative. We're building the features of Firebase using enterprise-grade open source tools.
-
-This repository contains all the functionality for Supabase CLI.
-
-- [x] Running Supabase locally
-- [x] Managing database migrations
-- [x] Creating and deploying Supabase Functions
-- [x] Generating types directly from your database schema
-- [x] Making authenticated HTTP requests to [Management API](https://supabase.com/docs/reference/api/introduction)
-
-## Getting started
-
-### Install the CLI
-
-Available via [NPM](https://www.npmjs.com) as dev dependency. To install:
+## Sandbox Mode
 
 ```bash
-npm i supabase --save-dev
+supabase start --sandbox
 ```
 
-When installing with yarn 4, you need to disable experimental fetch with the following nodejs config.
+Starts a full local Supabase stack using native binaries and [process-compose](https://github.com/F1bonacc1/process-compose):
 
-```
-NODE_OPTIONS=--no-experimental-fetch yarn add supabase
-```
+| Service | Binary Source | Description |
+|---------|-------------|-------------|
+| **postgres** | GitHub release | PostgreSQL with Supabase extensions |
+| **auth** (GoTrue) | GitHub release | Authentication and JWT management |
+| **postgrest** | GitHub release | Auto-generated REST API |
+| **realtime** | Docker extraction | WebSocket-based real-time subscriptions |
+| **logflare** | Docker extraction | Analytics and log aggregation |
+| **storage-api** | Docker extraction | S3-compatible file storage |
+| **postgres-meta** | Docker extraction | Database introspection API |
+| **studio** | Docker extraction | Web-based admin dashboard |
 
-> **Note**
-For Bun versions below v1.0.17, you must add `supabase` as a [trusted dependency](https://bun.sh/guides/install/trusted) before running `bun add -D supabase`.
+Plus a built-in **reverse proxy** that routes all traffic through a single API URL.
 
-<details>
-  <summary><b>macOS</b></summary>
+### Prerequisites
 
-  Available via [Homebrew](https://brew.sh). To install:
+- **Docker** (build-time only — used to extract service binaries, not at runtime)
+- **Node.js** (for storage, postgres-meta, and studio)
+- Standard Supabase project with `config.toml`
 
-  ```sh
-  brew install supabase/tap/supabase
-  ```
+### How It Works
 
-  To install the beta release channel:
-  
-  ```sh
-  brew install supabase/tap/supabase-beta
-  brew link --overwrite supabase-beta
-  ```
-  
-  To upgrade:
+1. Downloads auth, postgrest, postgres, and process-compose from GitHub releases
+2. Extracts realtime, logflare, storage, pgmeta, and studio from official Docker images via `docker create` + `docker cp`
+3. Generates a `process-compose.yaml` from your project's `config.toml`
+4. Orchestrates all services with dynamic port allocation and health checks
 
-  ```sh
-  brew upgrade supabase
-  ```
-</details>
+Binaries are cached at `~/.supabase/bin/` and reused across projects.
 
-<details>
-  <summary><b>Windows</b></summary>
-
-  Available via [Scoop](https://scoop.sh). To install:
-
-  ```powershell
-  scoop bucket add supabase https://github.com/supabase/scoop-bucket.git
-  scoop install supabase
-  ```
-
-  To upgrade:
-
-  ```powershell
-  scoop update supabase
-  ```
-</details>
-
-<details>
-  <summary><b>Linux</b></summary>
-
-  Available via [Homebrew](https://brew.sh) and Linux packages.
-
-  #### via Homebrew
-
-  To install:
-
-  ```sh
-  brew install supabase/tap/supabase
-  ```
-
-  To upgrade:
-
-  ```sh
-  brew upgrade supabase
-  ```
-
-  #### via Linux packages
-
-  Linux packages are provided in [Releases](https://github.com/supabase/cli/releases). To install, download the `.apk`/`.deb`/`.rpm`/`.pkg.tar.zst` file depending on your package manager and run the respective commands.
-
-  ```sh
-  sudo apk add --allow-untrusted <...>.apk
-  ```
-
-  ```sh
-  sudo dpkg -i <...>.deb
-  ```
-
-  ```sh
-  sudo rpm -i <...>.rpm
-  ```
-
-  ```sh
-  sudo pacman -U <...>.pkg.tar.zst
-  ```
-</details>
-
-<details>
-  <summary><b>Other Platforms</b></summary>
-
-  You can also install the CLI via [go modules](https://go.dev/ref/mod#go-install) without the help of package managers.
-
-  ```sh
-  go install github.com/supabase/cli@latest
-  ```
-
-  Add a symlink to the binary in `$PATH` for easier access:
-
-  ```sh
-  ln -s "$(go env GOPATH)/bin/cli" /usr/bin/supabase
-  ```
-
-  This works on other non-standard Linux distros.
-</details>
-
-<details>
-  <summary><b>Community Maintained Packages</b></summary>
-
-  Available via [pkgx](https://pkgx.sh/). Package script [here](https://github.com/pkgxdev/pantry/blob/main/projects/supabase.com/cli/package.yml).
-  To install in your working directory:
-
-  ```bash
-  pkgx install supabase
-  ```
-
-  Available via [Nixpkgs](https://nixos.org/). Package script [here](https://github.com/NixOS/nixpkgs/blob/master/pkgs/development/tools/supabase-cli/default.nix).
-</details>
-
-### Run the CLI
+### Commands
 
 ```bash
-supabase bootstrap
+supabase start --sandbox          # Start all services
+supabase start --sandbox --reload # Hot-reload config without restart
+supabase stop                     # Stop all services
+supabase status                   # Show service URLs and ports
+supabase logs [service]           # Stream logs (db, auth, rest, realtime, storage, analytics, meta, studio)
+supabase restart [service]        # Restart a specific service
 ```
 
-Or using npx:
+### Output
+
+```
+APIs:
+  API URL:     http://127.0.0.1:{api}
+  REST:        http://127.0.0.1:{api}/rest/v1/
+  Auth:        http://127.0.0.1:{api}/auth/v1/
+  Realtime:    http://127.0.0.1:{api}/realtime/v1/
+  Storage:     http://127.0.0.1:{api}/storage/v1/
+  Studio:      http://127.0.0.1:{studio}
+
+Database:
+  URL:         postgresql://postgres:postgres@127.0.0.1:{db}/postgres
+```
+
+## Building from Source
 
 ```bash
-npx supabase bootstrap
+go build -o supabase .
+./supabase start --sandbox
 ```
 
-The bootstrap command will guide you through the process of setting up a Supabase project using one of the [starter](https://github.com/supabase-community/supabase-samples/blob/main/samples.json) templates.
+Requires Go >= 1.22.
 
-## Docs
+## Upstream
 
-Command & config reference can be found [here](https://supabase.com/docs/reference/cli/about).
+This fork tracks the upstream `develop` branch. The sandbox expansion lives on the `feature/full-sandbox` branch.
 
-## Breaking changes
-
-We follow semantic versioning for changes that directly impact CLI commands, flags, and configurations.
-
-However, due to dependencies on other service images, we cannot guarantee that schema migrations, seed.sql, and generated types will always work for the same CLI major version. If you need such guarantees, we encourage you to pin a specific version of CLI in package.json.
-
-## Developing
-
-To run from source:
-
-```sh
-# Go >= 1.22
-go run . help
-```
+- Upstream: https://github.com/supabase/cli
+- Docs: https://supabase.com/docs/reference/cli/about

@@ -3,7 +3,9 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -62,6 +64,25 @@ type processComposeConfig struct {
 	ServiceRoleJWT string
 	AnonKey        string
 	AnonJWT        string
+
+	// New service paths and ports
+	RealtimePath     string
+	RealtimePort     int
+	LogflarePath     string
+	LogflarePort     int
+	StoragePath      string
+	StoragePort      int
+	StorageAdminPort int
+	PgMetaPath       string
+	PgMetaPort       int
+	StudioPath       string
+	StudioPort       int
+
+	// Shared secrets for Elixir services
+	SecretKeyBase string
+
+	// Storage data directory
+	StorageDataDir string
 
 	// JWT configuration
 	JwtSecret     string
@@ -268,6 +289,9 @@ func GenerateProcessComposeConfig(goCtx context.Context, ctx *SandboxContext, po
 		rateLimitEmailSent = utils.Config.Auth.RateLimit.EmailSent
 	}
 
+	// Generate a secret_key_base for Elixir services (deterministic from JWT secret)
+	secretKeyBase := generateSecretKeyBase(utils.Config.Auth.JwtSecret.Value)
+
 	// Build postgres paths
 	postgresDir := GetPostgresDir(ctx.BinDir, postgresVersion)
 
@@ -298,6 +322,21 @@ func GenerateProcessComposeConfig(goCtx context.Context, ctx *SandboxContext, po
 		ServiceRoleJWT: utils.Config.Auth.ServiceRoleKey.Value,
 		AnonKey:        utils.Config.Auth.PublishableKey.Value,
 		AnonJWT:        utils.Config.Auth.AnonKey.Value,
+
+		// New services
+		RealtimePath:     GetServicePath(ctx.BinDir, "realtime"),
+		RealtimePort:     ctx.Ports.Realtime,
+		LogflarePath:     GetServicePath(ctx.BinDir, "logflare"),
+		LogflarePort:     ctx.Ports.Logflare,
+		StoragePath:      GetServicePath(ctx.BinDir, "storage"),
+		StoragePort:      ctx.Ports.Storage,
+		StorageAdminPort: ctx.Ports.StorageAdmin,
+		PgMetaPath:       GetServicePath(ctx.BinDir, "pgmeta"),
+		PgMetaPort:       ctx.Ports.PgMeta,
+		StudioPath:       GetServicePath(ctx.BinDir, "studio"),
+		StudioPort:       ctx.Ports.Studio,
+		SecretKeyBase:    secretKeyBase,
+		StorageDataDir:   filepath.Join(ctx.ConfigDir, "storage-data"),
 
 		// JWT configuration
 		JwtSecret:     utils.Config.Auth.JwtSecret.Value,
@@ -456,6 +495,14 @@ func GenerateProcessComposeConfig(goCtx context.Context, ctx *SandboxContext, po
 	}
 
 	return buf.String(), nil
+}
+
+// generateSecretKeyBase derives a 64-char hex secret from the JWT secret.
+// Elixir services (realtime, logflare) require SECRET_KEY_BASE >= 64 chars.
+func generateSecretKeyBase(jwtSecret string) string {
+	h := sha256.New()
+	h.Write([]byte("supabase-sandbox-secret-key-base:" + jwtSecret))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // WriteProcessComposeConfig generates and writes process-compose.yaml to the sandbox directory.
