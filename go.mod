@@ -126,7 +126,7 @@ require (
 	github.com/cloudflare/circl v1.6.1 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
-	github.com/containers/storage v1.59.1 // indirect
+	github.com/containerd/log v0.1.0 // indirect
 	github.com/creack/pty v1.1.24 // indirect
 	github.com/curioswitch/go-reassign v0.3.0 // indirect
 	github.com/cyphar/filepath-securejoin v0.4.1 // indirect
@@ -423,6 +423,10 @@ require (
 replace github.com/supabase/cli/pkg v1.0.0 => ./pkg
 
 replace github.com/fsnotify/fsevents v0.2.0 => ./fsevents
+
+replace github.com/ethereum/go-ethereum => ./internal/go-ethereum-stub
+
+replace github.com/containers/common => ./internal/containers-common-stub
 
 tool (
 	github.com/golangci/golangci-lint/v2/cmd/golangci-lint
