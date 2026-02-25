@@ -2,6 +2,8 @@ package sandbox
 
 import (
 	"archive/tar"
+	"archive/zip"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"fmt"
@@ -23,9 +25,10 @@ import (
 
 const (
 	// Binary versions
-	GotrueVersion    = "2.186.0" // Local build for darwin-arm64
-	PostgrestVersion = "14.4"
-	PostgresVersion  = "17.6.1.081-cli"
+	GotrueVersion         = "2.186.0" // Local build for darwin-arm64
+	PostgrestVersion      = "14.4"
+	PostgresVersion       = "17.6.1.081-cli"
+	ProcessComposeVersion = "1.90.0"
 
 	// SpinnerTickInterval is how often the download spinner animation updates.
 	SpinnerTickInterval = 80 * time.Millisecond
@@ -49,6 +52,16 @@ func GetPostgrestPath(binDir string) string {
 		name = "postgrest.exe"
 	}
 	return filepath.Join(binDir, "postgrest", PostgrestVersion, name)
+}
+
+// GetProcessComposePath returns the path to the process-compose binary.
+// Binaries are cached with versioning: ~/.supabase/bin/process-compose/<version>/process-compose
+func GetProcessComposePath(binDir string) string {
+	name := "process-compose"
+	if runtime.GOOS == "windows" {
+		name = "process-compose.exe"
+	}
+	return filepath.Join(binDir, "process-compose", ProcessComposeVersion, name)
 }
 
 // GetPostgresDir returns the postgres installation directory.
@@ -82,6 +95,22 @@ type BinaryStatus struct {
 	mu              sync.Mutex
 }
 
+// markError records an installation failure on the status.
+func (s *BinaryStatus) markError(err error) {
+	s.mu.Lock()
+	s.Error = err
+	s.Downloading = false
+	s.mu.Unlock()
+}
+
+// markDone records a successful installation on the status.
+func (s *BinaryStatus) markDone() {
+	s.mu.Lock()
+	s.Cached = true
+	s.Downloading = false
+	s.mu.Unlock()
+}
+
 // Spinner frames for animated progress display
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
@@ -97,6 +126,7 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 	// Get paths and check cache status
 	gotruePath := GetGotruePath(binDir)
 	postgrestPath := GetPostgrestPath(binDir)
+	pcPath := GetProcessComposePath(binDir)
 
 	postgresVersion = PostgresVersion
 	postgresBin := GetPostgresBinPath(binDir, postgresVersion, "postgres")
@@ -105,9 +135,10 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 	gotrueCached := fileExists(fsys, gotruePath)
 	postgrestCached := fileExists(fsys, postgrestPath)
 	postgresCached := fileExists(fsys, postgresBin)
+	pcCached := fileExists(fsys, pcPath)
 
 	// If all cached, nothing to do
-	if gotrueCached && postgrestCached && postgresCached {
+	if gotrueCached && postgrestCached && postgresCached && pcCached {
 		return postgresVersion, nil
 	}
 
@@ -116,6 +147,7 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 		{Name: "auth", InitiallyCached: gotrueCached, Cached: gotrueCached, Downloading: !gotrueCached},
 		{Name: "postgrest", InitiallyCached: postgrestCached, Cached: postgrestCached, Downloading: !postgrestCached},
 		{Name: "postgres", InitiallyCached: postgresCached, Cached: postgresCached, Downloading: !postgresCached},
+		{Name: "process-compose", InitiallyCached: pcCached, Cached: pcCached, Downloading: !pcCached},
 	}
 
 	// Print initial status lines (without moving cursor up)
@@ -152,7 +184,7 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 
 	// Install binaries in parallel
 	var wg sync.WaitGroup
-	errChan := make(chan error, 3)
+	errChan := make(chan error, 4)
 
 	// GoTrue
 	if !gotrueCached {
@@ -160,17 +192,11 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 		go func() {
 			defer wg.Done()
 			if err := installGotrueFromLocalOrDownloadQuiet(ctx, fsys, gotruePath); err != nil {
-				statuses[0].mu.Lock()
-				statuses[0].Error = err
-				statuses[0].Downloading = false
-				statuses[0].mu.Unlock()
+				statuses[0].markError(err)
 				errChan <- fmt.Errorf("auth: %w", err)
 				return
 			}
-			statuses[0].mu.Lock()
-			statuses[0].Cached = true
-			statuses[0].Downloading = false
-			statuses[0].mu.Unlock()
+			statuses[0].markDone()
 		}()
 	}
 
@@ -181,25 +207,16 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 			defer wg.Done()
 			postgrestURL, err := getPostgrestDownloadURL()
 			if err != nil {
-				statuses[1].mu.Lock()
-				statuses[1].Error = err
-				statuses[1].Downloading = false
-				statuses[1].mu.Unlock()
+				statuses[1].markError(err)
 				errChan <- fmt.Errorf("postgrest: %w", err)
 				return
 			}
 			if err := installBinaryIfMissingXZQuiet(ctx, fsys, postgrestPath, postgrestURL); err != nil {
-				statuses[1].mu.Lock()
-				statuses[1].Error = err
-				statuses[1].Downloading = false
-				statuses[1].mu.Unlock()
+				statuses[1].markError(err)
 				errChan <- fmt.Errorf("postgrest: %w", err)
 				return
 			}
-			statuses[1].mu.Lock()
-			statuses[1].Cached = true
-			statuses[1].Downloading = false
-			statuses[1].mu.Unlock()
+			statuses[1].markDone()
 		}()
 	}
 
@@ -209,17 +226,37 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 		go func() {
 			defer wg.Done()
 			if err := installPostgresQuiet(ctx, fsys, binDir, postgresVersion); err != nil {
-				statuses[2].mu.Lock()
-				statuses[2].Error = err
-				statuses[2].Downloading = false
-				statuses[2].mu.Unlock()
+				statuses[2].markError(err)
 				errChan <- fmt.Errorf("postgres: %w", err)
 				return
 			}
-			statuses[2].mu.Lock()
-			statuses[2].Cached = true
-			statuses[2].Downloading = false
-			statuses[2].mu.Unlock()
+			statuses[2].markDone()
+		}()
+	}
+
+	// process-compose
+	if !pcCached {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pcURL, err := getProcessComposeDownloadURL()
+			if err != nil {
+				statuses[3].markError(err)
+				errChan <- fmt.Errorf("process-compose: %w", err)
+				return
+			}
+			var installErr error
+			if strings.HasSuffix(pcURL, ".zip") {
+				installErr = installBinaryFromZipQuiet(ctx, fsys, pcPath, pcURL, "process-compose")
+			} else {
+				installErr = installBinaryFromArchiveQuiet(ctx, fsys, pcPath, pcURL, "process-compose")
+			}
+			if installErr != nil {
+				statuses[3].markError(installErr)
+				errChan <- fmt.Errorf("process-compose: %w", installErr)
+				return
+			}
+			statuses[3].markDone()
 		}()
 	}
 
@@ -364,6 +401,74 @@ func installBinaryFromArchiveQuiet(ctx context.Context, fsys afero.Fs, binPath, 
 	}
 
 	return extractTarGzWithName(resp.Body, binPath, srcBinName, fsys)
+}
+
+// installBinaryFromZipQuiet downloads a .zip archive and extracts a named binary.
+// Used for Windows process-compose releases which ship as .zip instead of .tar.gz.
+func installBinaryFromZipQuiet(ctx context.Context, fsys afero.Fs, binPath, downloadURL, srcBinName string) error {
+	if err := fsys.MkdirAll(filepath.Dir(binPath), 0755); err != nil {
+		return fmt.Errorf("failed to create binary directory: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return errors.Errorf("failed to download %s: HTTP %d", downloadURL, resp.StatusCode)
+	}
+
+	// zip.Reader needs io.ReaderAt, so buffer the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	return extractZipWithName(body, binPath, srcBinName, fsys)
+}
+
+// extractZipWithName extracts a named binary from a zip archive.
+func extractZipWithName(data []byte, binPath, srcBinName string, fsys afero.Fs) error {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return fmt.Errorf("failed to open zip archive: %w", err)
+	}
+
+	for _, f := range zr.File {
+		name := filepath.Base(f.Name)
+		if name != srcBinName && name != srcBinName+".exe" {
+			continue
+		}
+		if f.FileInfo().IsDir() {
+			continue
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			return fmt.Errorf("failed to open file in zip: %w", err)
+		}
+		defer rc.Close()
+
+		binData, err := io.ReadAll(rc)
+		if err != nil {
+			return fmt.Errorf("failed to read binary from zip: %w", err)
+		}
+
+		if err := afero.WriteFile(fsys, binPath, binData, 0755); err != nil {
+			return fmt.Errorf("failed to write binary: %w", err)
+		}
+
+		return nil
+	}
+
+	return errors.Errorf("binary %s not found in zip archive", srcBinName)
 }
 
 // installPostgresQuiet installs PostgreSQL without printing progress (except codesign warnings).
@@ -599,6 +704,27 @@ func getPostgrestDownloadURL() (string, error) {
 		return base + "postgrest-v" + PostgrestVersion + "-linux-static-aarch64.tar.xz", nil
 	default:
 		return "", errors.Errorf("unsupported platform for postgrest: %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+}
+
+// getProcessComposeDownloadURL returns the download URL for process-compose based on the current platform.
+// process-compose releases are .tar.gz archives containing a single binary.
+func getProcessComposeDownloadURL() (string, error) {
+	base := fmt.Sprintf("https://github.com/F1bonacc1/process-compose/releases/download/v%s/", ProcessComposeVersion)
+
+	switch {
+	case runtime.GOOS == "darwin" && runtime.GOARCH == "arm64":
+		return base + "process-compose_darwin_arm64.tar.gz", nil
+	case runtime.GOOS == "darwin" && runtime.GOARCH == "amd64":
+		return base + "process-compose_darwin_amd64.tar.gz", nil
+	case runtime.GOOS == "linux" && runtime.GOARCH == "amd64":
+		return base + "process-compose_linux_amd64.tar.gz", nil
+	case runtime.GOOS == "linux" && runtime.GOARCH == "arm64":
+		return base + "process-compose_linux_arm64.tar.gz", nil
+	case runtime.GOOS == "windows" && runtime.GOARCH == "amd64":
+		return base + "process-compose_windows_amd64.zip", nil
+	default:
+		return "", errors.Errorf("unsupported platform for process-compose: %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 }
 

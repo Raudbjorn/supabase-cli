@@ -475,19 +475,28 @@ func WriteProcessComposeConfig(goCtx context.Context, ctx *SandboxContext, fsys 
 
 // RunProject starts all services using process-compose as a background server.
 // It spawns a detached server process and waits for postgres to be healthy.
-func RunProject(configPath string, sandboxCtx *SandboxContext, fsys afero.Fs) error {
-	return runDetached(configPath, sandboxCtx, fsys)
+func RunProject(ctx context.Context, configPath string, sandboxCtx *SandboxContext, fsys afero.Fs) error {
+	return runDetached(ctx, configPath, sandboxCtx, fsys)
 }
 
-// runDetached spawns a background server process and waits for postgres to be healthy.
+// runDetached spawns a background process-compose server and waits for postgres to be healthy.
 // Returns after postgres is ready so migrations can run. Call WaitForAllServices after migrations.
-// The server process runs the HTTP API for graceful shutdown via 'supabase stop'.
-func runDetached(configPath string, sandboxCtx *SandboxContext, fsys afero.Fs) error {
-	// Spawn the server as a detached background process
-	// Use absolute path to handle --workdir flag
-	serverCmd := exec.Command(getExecutablePath(), "_sandbox-server",
+// The server process runs the REST API for graceful shutdown via 'supabase stop'.
+func runDetached(ctx context.Context, configPath string, sandboxCtx *SandboxContext, fsys afero.Fs) error {
+	// Safety: pcBin is derived from GetProcessComposePath() which constructs a path
+	// under the controlled sandboxCtx.BinDir directory — never from user input.
+	pcBin := GetProcessComposePath(sandboxCtx.BinDir)
+
+	// Verify the binary is functional before spawning the full server
+	if out, err := exec.CommandContext(ctx, pcBin, "version").CombinedOutput(); err != nil {
+		return fmt.Errorf("process-compose binary check failed (corrupt download?): %s: %w", string(out), err)
+	}
+
+	// Spawn process-compose as a detached background process
+	serverCmd := exec.Command(pcBin, "up",
 		"--config", configPath,
 		"--port", fmt.Sprintf("%d", sandboxCtx.Ports.ProcessCompose),
+		"--tui=false",
 	)
 
 	// Redirect output to log file
@@ -525,11 +534,9 @@ func runDetached(configPath string, sandboxCtx *SandboxContext, fsys afero.Fs) e
 
 	// Wait for postgres to be healthy (so migrations can run)
 	// Other services continue starting in background
-	if err := WaitForPostgresReady(sandboxCtx.Ports.ProcessCompose, DefaultServiceTimeout); err != nil {
-		// Try to kill the server process
-		if serverCmd.Process != nil {
-			_ = serverCmd.Process.Kill()
-		}
+	if err := WaitForPostgresReady(ctx, sandboxCtx.Ports.ProcessCompose, DefaultServiceTimeout); err != nil {
+		// Graceful shutdown via SIGTERM instead of SIGKILL
+		_ = terminateProcess(serverCmd.Process.Pid)
 		return err
 	}
 
@@ -537,8 +544,8 @@ func runDetached(configPath string, sandboxCtx *SandboxContext, fsys afero.Fs) e
 }
 
 // WaitForAllServices waits for all services to be healthy.
-func WaitForAllServices(processComposePort int, timeout time.Duration) error {
-	return WaitForServerReady(processComposePort, timeout)
+func WaitForAllServices(ctx context.Context, processComposePort int, timeout time.Duration) error {
+	return WaitForServerReady(ctx, processComposePort, timeout)
 }
 
 // getExecutablePath returns the absolute path to the current executable.

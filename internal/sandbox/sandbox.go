@@ -79,7 +79,7 @@ func Run(ctx context.Context, fsys afero.Fs) error {
 
 	// 9. Start process-compose and wait for postgres to be healthy
 	// This starts all services but only waits for postgres so we can run migrations
-	if err := RunProject(processComposePath, sandboxCtx, fsys); err != nil {
+	if err := RunProject(ctx, processComposePath, sandboxCtx, fsys); err != nil {
 		return err
 	}
 
@@ -99,7 +99,7 @@ func Run(ctx context.Context, fsys afero.Fs) error {
 	// 11. Wait for all services to be healthy
 	fmt.Fprintln(os.Stderr, "Starting services...")
 	fmt.Fprintln(os.Stderr, "Waiting for health checks...")
-	if err := WaitForAllServices(sandboxCtx.Ports.ProcessCompose, DefaultServiceTimeout); err != nil {
+	if err := WaitForAllServices(ctx, sandboxCtx.Ports.ProcessCompose, DefaultServiceTimeout); err != nil {
 		return err
 	}
 
