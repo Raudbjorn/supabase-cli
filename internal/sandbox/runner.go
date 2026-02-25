@@ -336,7 +336,7 @@ func GenerateProcessComposeConfig(goCtx context.Context, ctx *SandboxContext, po
 		StudioPath:       GetServicePath(ctx.BinDir, "studio"),
 		StudioPort:       ctx.Ports.Studio,
 		SecretKeyBase:    secretKeyBase,
-		StorageDataDir:   filepath.Join(ctx.ConfigDir, "storage-data"),
+		StorageDataDir:   ctx.StorageDataDir(),
 
 		// JWT configuration
 		JwtSecret:     utils.Config.Auth.JwtSecret.Value,

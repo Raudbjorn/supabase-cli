@@ -30,12 +30,14 @@ const (
 	PostgresVersion       = "17.6.1.081-cli"
 	ProcessComposeVersion = "1.90.0"
 
-	// Docker image tags for services extracted via `docker create` + `docker cp`
-	RealtimeImage = "supabase/realtime:latest"
-	LogflareImage = "supabase/logflare:latest"
-	StorageImage  = "supabase/storage-api:latest"
+	// Docker image tags for services extracted via `docker create` + `docker cp`.
+	// Pinned to explicit versions matching the CLI's Docker Compose setup
+	// (pkg/config/templates/Dockerfile) for deterministic sandbox behavior.
+	RealtimeImage = "supabase/realtime:v2.78.0"
+	LogflareImage = "supabase/logflare:1.33.1"
+	StorageImage  = "supabase/storage-api:v1.39.1"
 	PgmetaImage   = "supabase/postgres-meta:v0.95.2"
-	StudioImage   = "supabase/studio:latest"
+	StudioImage   = "supabase/studio:2026.02.16-sha-26c615c"
 
 	// SpinnerTickInterval is how often the download spinner animation updates.
 	SpinnerTickInterval = 80 * time.Millisecond
@@ -278,12 +280,16 @@ func extractDockerService(ctx context.Context, binDir string, svc dockerService)
 // applyPostExtractionFixups applies host-specific fixups after Docker extraction.
 // Ported from supabase-unified/extract.sh.
 func applyPostExtractionFixups(binDir string) error {
-	// Rebuild fs-xattr native addon for host Node.js (storage service)
+	// Rebuild fs-xattr native addon for host Node.js (storage service).
+	// Only attempt if npm is available to avoid noisy failures on systems
+	// where Node is installed without npm.
 	fsXattrDir := filepath.Join(GetServicePath(binDir, "storage"), "node_modules", "fs-xattr")
 	if dirExists(fsXattrDir) {
-		cmd := exec.Command("npm", "rebuild")
-		cmd.Dir = fsXattrDir
-		cmd.Run() // Best-effort, non-fatal
+		if _, err := exec.LookPath("npm"); err == nil {
+			cmd := exec.Command("npm", "rebuild")
+			cmd.Dir = fsXattrDir
+			cmd.Run() // Best-effort, non-fatal
+		}
 	}
 
 	// Sentry CPU profiler ABI symlink for postgres-meta
@@ -314,15 +320,32 @@ func fixSentryABI(profilerDir string) {
 		return
 	}
 
-	// Find the newest available ABI binary
+	// Find the highest available ABI binary (deterministic: sorted by name,
+	// ABI numbers are zero-padded in filenames so lexicographic == numeric order).
 	entries, err := os.ReadDir(profilerDir)
 	if err != nil {
 		return
 	}
+
+	const prefix = "sentry_cpu_profiler-linux-x64-glibc-"
 	var best string
+	var bestABI int
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "sentry_cpu_profiler-linux-x64-glibc-") && strings.HasSuffix(e.Name(), ".node") {
-			best = e.Name()
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".node") {
+			continue
+		}
+		// Extract ABI number: "sentry_cpu_profiler-linux-x64-glibc-127.node" → "127"
+		abiStr := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".node")
+		abi := 0
+		for _, c := range abiStr {
+			if c >= '0' && c <= '9' {
+				abi = abi*10 + int(c-'0')
+			}
+		}
+		if abi > bestABI {
+			bestABI = abi
+			best = name
 		}
 	}
 	if best != "" {

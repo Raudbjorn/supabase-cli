@@ -58,7 +58,7 @@ func RunProxy(config *ProxyConfig) error {
 		mux.Handle("/storage/v1/", newProxyHandler(config, config.StoragePort, "/storage/v1", true))
 	}
 
-	// Realtime WebSocket (with auth transformation)
+	// Realtime WebSocket (no auth transformation — clients pass JWT directly via query param)
 	if config.RealtimePort > 0 {
 		mux.Handle("/realtime/v1/", newProxyHandler(config, config.RealtimePort, "/realtime/v1", false))
 	}
