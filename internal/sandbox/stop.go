@@ -95,6 +95,33 @@ func terminateProcess(pid int) error {
 	return process.Signal(syscall.SIGTERM)
 }
 
+// StopService stops a single sandbox service by name without tearing down the stack.
+func StopService(ctx context.Context, fsys afero.Fs, projectId string, service string, w io.Writer) error {
+	processName, ok := KnownServices[service]
+	if !ok {
+		return fmt.Errorf("unknown service %q. Valid services: %v", service, RestartableServices())
+	}
+
+	sandboxCtx, err := NewSandboxContext(projectId)
+	if err != nil {
+		return fmt.Errorf("failed to create sandbox context: %w", err)
+	}
+
+	state, err := sandboxCtx.LoadState(fsys)
+	if err != nil {
+		return fmt.Errorf("sandbox is not running (no state file): %w", err)
+	}
+
+	fmt.Fprintf(w, "Stopping %s...\n", service)
+
+	if err := stopProcess(state.Ports.ProcessCompose, processName); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(w, "Service %s stopped. Use 'supabase restart %s' to start it again.\n", service, service)
+	return nil
+}
+
 // Cleanup removes all sandbox-related resources for a project.
 // This includes the config directory and postgres data directory.
 func Cleanup(ctx context.Context, fsys afero.Fs, projectId string, w io.Writer) error {

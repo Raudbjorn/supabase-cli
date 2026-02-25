@@ -16,11 +16,6 @@ import (
 
 	"github.com/containerd/errdefs"
 	podman "github.com/containers/common/libnetwork/types"
-	"github.com/docker/cli/cli/command"
-	"github.com/docker/cli/cli/compose/loader"
-	dockerConfig "github.com/docker/cli/cli/config"
-	dockerFlags "github.com/docker/cli/cli/flags"
-	"github.com/docker/cli/cli/streams"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
@@ -39,19 +34,17 @@ import (
 var Docker = NewDocker()
 
 func NewDocker() *client.Client {
-	// TODO: refactor to initialize lazily
-	cli, err := command.NewDockerCli()
-	if err != nil {
-		log.Fatalln("Failed to create Docker client:", err)
-	}
 	// Silence otel errors as users don't care about docker metrics
 	// 2024/08/12 23:11:12 1 errors occurred detecting resource:
 	// 	* conflicting Schema URL: https://opentelemetry.io/schemas/1.21.0
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(cause error) {}))
-	if err := cli.Initialize(&dockerFlags.ClientOptions{}); err != nil {
-		log.Fatalln("Failed to initialize Docker client:", err)
+	// Use docker/docker/client directly instead of going through docker/cli.
+	// This eliminates the heavy docker/cli dependency tree.
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		log.Fatalln("Failed to create Docker client:", err)
 	}
-	return cli.Client().(*client.Client)
+	return cli
 }
 
 const (
@@ -166,11 +159,14 @@ var (
 
 func GetRegistryAuth() string {
 	registryOnce.Do(func() {
-		config := dockerConfig.LoadDefaultConfigFile(os.Stderr)
-		// Ref: https://docs.docker.com/engine/api/sdk/examples/#pull-an-image-with-authentication
-		auth, err := config.GetAuthConfig(GetRegistry())
+		// Load auth config directly from ~/.docker/config.json instead of
+		// using docker/cli's config loader. This eliminates the docker/cli dependency.
+		auth, err := LoadDockerAuthConfig(GetRegistry())
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Failed to load registry credentials:", err)
+			return
+		}
+		if auth.Auth == "" && auth.Username == "" {
 			return
 		}
 		encoded, err := json.Marshal(auth)
@@ -213,7 +209,7 @@ func DockerImagePull(ctx context.Context, imageTag string, w io.Writer) error {
 		return errors.Errorf("failed to pull docker image: %w", err)
 	}
 	defer out.Close()
-	if err := jsonmessage.DisplayJSONMessagesToStream(out, streams.NewOut(w), nil); err != nil {
+	if err := jsonmessage.DisplayJSONMessagesToStream(out, NewOutputStream(w), nil); err != nil {
 		return errors.Errorf("failed to display json stream: %w", err)
 	}
 	return nil
@@ -277,7 +273,7 @@ func DockerStart(ctx context.Context, config container.Config, hostConfig contai
 	// Configure container volumes
 	var binds, sources []string
 	for _, bind := range hostConfig.Binds {
-		spec, err := loader.ParseVolume(bind)
+		spec, err := ParseVolume(bind)
 		if err != nil {
 			return "", errors.Errorf("failed to parse docker volume: %w", err)
 		}
