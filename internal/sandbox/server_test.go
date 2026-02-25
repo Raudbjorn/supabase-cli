@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -60,6 +61,21 @@ func TestGetProcessesState_ServerDown(t *testing.T) {
 	_, err := getProcessesState(context.Background(), 1) // port 1 is not listening
 	if err == nil {
 		t.Fatal("expected error when server is down")
+	}
+}
+
+func TestGetProcessesState_BadStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	_, err := getProcessesState(context.Background(), testPort(t, srv))
+	if err == nil {
+		t.Fatal("expected error for non-200 status code")
+	}
+	if !strings.Contains(err.Error(), "500") {
+		t.Errorf("expected error to contain status code, got %q", err.Error())
 	}
 }
 

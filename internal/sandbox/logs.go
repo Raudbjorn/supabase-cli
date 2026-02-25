@@ -30,9 +30,9 @@ func StreamLogs(ctx context.Context, fsys afero.Fs, projectId string, service st
 	// Resolve service name alias if provided
 	processName := ""
 	if service != "" {
-		name, ok := KnownServices[service]
-		if !ok {
-			return fmt.Errorf("unknown service %q. Valid services: %v", service, RestartableServices())
+		name, err := ResolveProcessName(service)
+		if err != nil {
+			return err
 		}
 		processName = name
 	}

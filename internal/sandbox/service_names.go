@@ -35,3 +35,13 @@ func ValidServiceNames() []string {
 	sort.Strings(names)
 	return names
 }
+
+// ReverseLookup returns a map from process-compose process names to user-facing
+// service names. Shared by status.go and services.go to avoid rebuilding inline.
+func ReverseLookup() map[string]string {
+	m := make(map[string]string, len(serviceMapping))
+	for userFacing, pcName := range serviceMapping {
+		m[pcName] = userFacing
+	}
+	return m
+}

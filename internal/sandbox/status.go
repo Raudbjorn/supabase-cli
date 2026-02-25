@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/spf13/afero"
 	"github.com/supabase/cli/internal/utils"
@@ -40,7 +39,7 @@ func Status(ctx context.Context, projectId string, fsys afero.Fs) ([]ServiceStat
 		return nil, fmt.Errorf("failed to query process-compose: %w", err)
 	}
 
-	// Port mapping for user-facing display
+	// Port mapping for user-facing display (keyed by PC process name)
 	portMap := map[string]int{
 		"postgres":  state.Ports.Postgres,
 		"gotrue":    state.Ports.GoTrue,
@@ -48,23 +47,17 @@ func Status(ctx context.Context, projectId string, fsys afero.Fs) ([]ServiceStat
 		"proxy":     state.Ports.API,
 	}
 
-	// User-facing name mapping
-	displayName := map[string]string{
-		"proxy": "api",
-	}
+	// Map PC names back to user-facing names
+	reverseLookup := ReverseLookup()
 
 	var statuses []ServiceStatus
 	for _, ps := range pcStates.States {
-		// Skip one-shot init/migrate processes from user-facing status
-		if strings.HasSuffix(ps.Name, "-init") || strings.HasSuffix(ps.Name, "-migrate") {
+		// Only include processes that have a user-facing mapping
+		name, ok := reverseLookup[ps.Name]
+		if !ok {
 			continue
 		}
-
 		port := portMap[ps.Name]
-		name := ps.Name
-		if dn, ok := displayName[ps.Name]; ok {
-			name = dn
-		}
 
 		healthy := isStateReady(&ps)
 		status := ps.Status

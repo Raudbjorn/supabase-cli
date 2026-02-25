@@ -51,7 +51,7 @@ Requires sandbox mode (--sandbox flag on start).`,
 			return sandbox.StreamLogs(cmd.Context(), fsys, utils.Config.ProjectId, service, followLogs, tailLines, os.Stdout)
 		},
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-			return sandbox.RestartableServices(), cobra.ShellCompDirectiveNoFileComp
+			return sandbox.ValidServiceNames(), cobra.ShellCompDirectiveNoFileComp
 		},
 	}
 )

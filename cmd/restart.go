@@ -41,12 +41,12 @@ Requires sandbox mode (--sandbox flag on start).`,
 			return sandbox.RestartService(cmd.Context(), fsys, utils.Config.ProjectId, args[0], os.Stderr)
 		},
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-			return sandbox.RestartableServices(), cobra.ShellCompDirectiveNoFileComp
+			return sandbox.ValidServiceNames(), cobra.ShellCompDirectiveNoFileComp
 		},
 	}
 )
 
 func init() {
-	restartCmd.Long += "\n\nValid services: " + strings.Join(sandbox.RestartableServices(), ", ")
+	restartCmd.Long += "\n\nValid services: " + strings.Join(sandbox.ValidServiceNames(), ", ")
 	rootCmd.AddCommand(restartCmd)
 }

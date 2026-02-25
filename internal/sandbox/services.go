@@ -159,11 +159,8 @@ func mapProcessStatesToServiceInfo(states *processesState) []ServiceInfo {
 		return nil
 	}
 
-	// Build reverse lookup: PC name -> user-facing name
-	reverseLookup := make(map[string]string, len(serviceMapping))
-	for userFacing, pcName := range serviceMapping {
-		reverseLookup[pcName] = userFacing
-	}
+	// Map PC names back to user-facing names
+	reverseLookup := ReverseLookup()
 
 	var services []ServiceInfo
 	for _, state := range states.States {
