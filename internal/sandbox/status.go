@@ -35,7 +35,7 @@ func Status(ctx context.Context, projectId string, fsys afero.Fs) ([]ServiceStat
 	// Use process-compose API to get all process states at once.
 	// This is superior to individual HTTP health checks because process-compose
 	// already monitors health probes and understands the dependency graph.
-	pcStates, err := getProcessesState(state.Ports.ProcessCompose)
+	pcStates, err := getProcessesState(ctx, state.Ports.ProcessCompose)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query process-compose: %w", err)
 	}

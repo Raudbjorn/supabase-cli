@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -119,6 +120,136 @@ func shutDownProject(ctx context.Context, serverPort int) error {
 	return nil
 }
 
+// getProcessState fetches a single process state from the process-compose REST API.
+func getProcessState(ctx context.Context, serverPort int, name string) (*processState, error) {
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d/process/%s", serverPort, url.PathEscape(name))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := pcClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get process %q state: %s", name, resp.Status)
+	}
+
+	var state processState
+	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+		return nil, fmt.Errorf("failed to decode process state: %w", err)
+	}
+	return &state, nil
+}
+
+// restartProcess sends a restart request for a single process.
+func restartProcess(ctx context.Context, serverPort int, name string) error {
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d/process/restart/%s", serverPort, url.PathEscape(name))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := pcClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to restart process %q: %s", name, resp.Status)
+	}
+	return nil
+}
+
+// stopProcess sends a stop request for a single process.
+func stopProcess(ctx context.Context, serverPort int, name string) error {
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d/process/stop/%s", serverPort, url.PathEscape(name))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, apiURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := pcClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to stop process %q: %s", name, resp.Status)
+	}
+	return nil
+}
+
+// startProcess sends a start request for a single process.
+func startProcess(ctx context.Context, serverPort int, name string) error {
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d/process/start/%s", serverPort, url.PathEscape(name))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := pcClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to start process %q: %s", name, resp.Status)
+	}
+	return nil
+}
+
+// reloadProject sends a hot-reload request to process-compose.
+func reloadProject(ctx context.Context, serverPort int) error {
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d/project", serverPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := pcClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to reload project: %s", resp.Status)
+	}
+	return nil
+}
+
+// checkLiveness checks if the process-compose server is alive.
+func checkLiveness(ctx context.Context, serverPort int) bool {
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d/live", serverPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := pcClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// checkReadiness checks if all process-compose managed processes are ready.
+func checkReadiness(ctx context.Context, serverPort int) bool {
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d/ready", serverPort)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := pcClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
 // WaitForServerReady polls the process-compose server until all services are healthy.
 func WaitForServerReady(ctx context.Context, serverPort int, timeout time.Duration) error {
 	return waitForCondition(ctx, timeout, "timeout waiting for services to become healthy", func(ctx context.Context) bool {
@@ -197,78 +328,6 @@ func isPostgresReady(states *processesState) bool {
 	return postgresReady && postgresInitReady
 }
 
-// restartProcess sends a restart request for a single process via the process-compose API.
-// POST /process/restart/:name
-func restartProcess(serverPort int, name string) error {
-	client := &http.Client{Timeout: HTTPClientTimeout}
-	url := fmt.Sprintf("http://127.0.0.1:%d/process/restart/%s", serverPort, name)
-
-	req, err := http.NewRequest(http.MethodPost, url, nil)
-	if err != nil {
-		return err
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to restart process %s: %w", name, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to restart process %s (status %s): %s", name, resp.Status, strings.TrimSpace(string(body)))
-	}
-	return nil
-}
-
-// stopProcess sends a stop signal to a single process via the process-compose API.
-// PATCH /process/stop/:name
-func stopProcess(serverPort int, name string) error {
-	client := &http.Client{Timeout: HTTPClientTimeout}
-	url := fmt.Sprintf("http://127.0.0.1:%d/process/stop/%s", serverPort, name)
-
-	req, err := http.NewRequest(http.MethodPatch, url, nil)
-	if err != nil {
-		return err
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to stop process %s: %w", name, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to stop process %s (status %s): %s", name, resp.Status, strings.TrimSpace(string(body)))
-	}
-	return nil
-}
-
-// startProcess sends a start request for a single process via the process-compose API.
-// POST /process/start/:name
-func startProcess(serverPort int, name string) error {
-	client := &http.Client{Timeout: HTTPClientTimeout}
-	url := fmt.Sprintf("http://127.0.0.1:%d/process/start/%s", serverPort, name)
-
-	req, err := http.NewRequest(http.MethodPost, url, nil)
-	if err != nil {
-		return err
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to start process %s: %w", name, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to start process %s (status %s): %s", name, resp.Status, strings.TrimSpace(string(body)))
-	}
-	return nil
-}
-
 // processLog represents a single log message from the process-compose WebSocket API.
 type processLog struct {
 	ProcessName string `json:"process_name"`
@@ -281,12 +340,12 @@ type processLog struct {
 // writes log messages to the provided writer until the context is cancelled.
 // GET /process/logs/ws (WebSocket upgrade)
 func streamProcessLogs(ctx context.Context, serverPort int, processName string, w io.Writer) error {
-	url := fmt.Sprintf("ws://127.0.0.1:%d/process/logs/ws", serverPort)
+	wsURL := fmt.Sprintf("ws://127.0.0.1:%d/process/logs/ws", serverPort)
 	if processName != "" {
-		url += "?name=" + processName
+		wsURL += "?name=" + url.QueryEscape(processName)
 	}
 
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url, nil)
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to connect to log stream: %w", err)
 	}
@@ -329,10 +388,9 @@ func formatLogMessage(log *processLog) string {
 // fetchProcessLogs retrieves historical logs for a process via the REST API.
 // GET /process/logs/:name/:endOffset/:limit
 func fetchProcessLogs(serverPort int, name string, limit int) ([]string, error) {
-	client := &http.Client{Timeout: HTTPClientTimeout}
-	url := fmt.Sprintf("http://127.0.0.1:%d/process/logs/%s/0/%d", serverPort, name, limit)
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d/process/logs/%s/0/%d", serverPort, url.PathEscape(name), limit)
 
-	resp, err := client.Get(url)
+	resp, err := pcClient.Get(apiURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch logs for %s: %w", name, err)
 	}
@@ -354,10 +412,9 @@ func fetchProcessLogs(serverPort int, name string, limit int) ([]string, error) 
 // getProjectState fetches the full project state including dependency graph info.
 // GET /project/state
 func getProjectState(serverPort int) (map[string]interface{}, error) {
-	client := &http.Client{Timeout: HTTPClientTimeout}
-	url := fmt.Sprintf("http://127.0.0.1:%d/project/state", serverPort)
+	apiURL := fmt.Sprintf("http://127.0.0.1:%d/project/state", serverPort)
 
-	resp, err := client.Get(url)
+	resp, err := pcClient.Get(apiURL)
 	if err != nil {
 		return nil, err
 	}

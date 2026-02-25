@@ -2,13 +2,26 @@ package sandbox
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 
+	"github.com/gorilla/websocket"
 	"github.com/spf13/afero"
 	"github.com/supabase/cli/internal/utils"
 )
+
+// logMessage mirrors the process-compose WebSocket log message format.
+type logMessage struct {
+	ProcessName string `json:"process_name"`
+	Message     string `json:"message"`
+}
+
+// logStreamDialer is the WebSocket dialer used for log streaming.
+// Package-level var allows test override.
+var logStreamDialer = websocket.DefaultDialer
 
 // StreamLogs streams live logs from sandbox services to the provided writer.
 // If service is empty, streams logs from all services.
@@ -61,7 +74,7 @@ func fetchAndPrintLogs(serverPort int, processName string, tail int, w io.Writer
 	}
 
 	// Fetch logs for all known services
-	states, err := getProcessesState(serverPort)
+	states, err := getProcessesState(context.Background(), serverPort)
 	if err != nil {
 		return fmt.Errorf("failed to get process states: %w", err)
 	}
@@ -86,4 +99,52 @@ func fetchAndPrintLogs(serverPort int, processName string, tail int, w io.Writer
 	}
 
 	return nil
+}
+
+// buildLogWSURL constructs the WebSocket URL for log streaming.
+func buildLogWSURL(serverPort int, pcName string, follow bool) string {
+	params := url.Values{}
+	if pcName != "" {
+		params.Set("name", pcName)
+	}
+	params.Set("follow", fmt.Sprintf("%t", follow))
+
+	return fmt.Sprintf("ws://127.0.0.1:%d/process/logs/ws?%s", serverPort, params.Encode())
+}
+
+// streamFromWebSocket dials a WebSocket and writes formatted log messages to w.
+// It respects context cancellation for clean shutdown.
+func streamFromWebSocket(ctx context.Context, wsURL string, w io.Writer) error {
+	conn, _, err := logStreamDialer.DialContext(ctx, wsURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to connect to log stream: %w", err)
+	}
+
+	// Close the connection when context is cancelled
+	go func() {
+		<-ctx.Done()
+		conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		conn.Close()
+	}()
+
+	for {
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			// Normal closure or context cancellation
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure) || ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("log stream error: %w", err)
+		}
+
+		var msg logMessage
+		if err := json.Unmarshal(message, &msg); err != nil {
+			// Fall back to raw output if not JSON
+			fmt.Fprintln(w, string(message))
+			continue
+		}
+
+		fmt.Fprintf(w, "%s | %s\n", msg.ProcessName, msg.Message)
+	}
 }
