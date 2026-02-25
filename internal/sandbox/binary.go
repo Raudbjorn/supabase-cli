@@ -23,10 +23,10 @@ import (
 
 const (
 	// Binary versions
-	GotrueVersion          = "2.186.0" // Local build for darwin-arm64
-	PostgrestVersion       = "14.4"
-	PostgresVersion        = "17.6.1.081-cli"
-	ProcessComposeVersion  = "1.90.0"
+	GotrueVersion         = "2.186.0" // Local build for darwin-arm64
+	PostgrestVersion      = "14.4"
+	PostgresVersion       = "17.6.1.081-cli"
+	ProcessComposeVersion = "1.90.0"
 
 	// SpinnerTickInterval is how often the download spinner animation updates.
 	SpinnerTickInterval = 80 * time.Millisecond
@@ -645,6 +645,8 @@ func getProcessComposeDownloadURL() (string, error) {
 		return base + "process-compose_linux_amd64.tar.gz", nil
 	case runtime.GOOS == "linux" && runtime.GOARCH == "arm64":
 		return base + "process-compose_linux_arm64.tar.gz", nil
+	case runtime.GOOS == "windows" && runtime.GOARCH == "amd64":
+		return base + "process-compose_windows_amd64.zip", nil
 	default:
 		return "", errors.Errorf("unsupported platform for process-compose: %s/%s", runtime.GOOS, runtime.GOARCH)
 	}

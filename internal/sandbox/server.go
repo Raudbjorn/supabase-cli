@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -36,13 +38,13 @@ type processesState struct {
 
 // Process status constants matching process-compose API values.
 const (
-	pcStatusRunning    = "Running"
-	pcStatusLaunched   = "Launched"
-	pcStatusCompleted  = "Completed"
-	pcStatusDisabled   = "Disabled"
-	pcStatusSkipped    = "Skipped"
-	pcStatusLaunching  = "Launching"
-	pcHealthReady      = "Ready"
+	pcStatusRunning   = "Running"
+	pcStatusLaunched  = "Launched"
+	pcStatusCompleted = "Completed"
+	pcStatusDisabled  = "Disabled"
+	pcStatusSkipped   = "Skipped"
+	pcStatusLaunching = "Launching"
+	pcHealthReady     = "Ready"
 )
 
 // waitForCondition polls until the check function returns true, the parent context
@@ -60,6 +62,9 @@ func waitForCondition(ctx context.Context, timeout time.Duration, timeoutMsg str
 	for {
 		select {
 		case <-ctx.Done():
+			if ctx.Err() != nil {
+				return fmt.Errorf("%s: %w", timeoutMsg, ctx.Err())
+			}
 			return fmt.Errorf("%s", timeoutMsg)
 		case <-ticker.C:
 			if check(ctx) {
@@ -80,6 +85,11 @@ func getProcessesState(ctx context.Context, serverPort int) (*processesState, er
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("process-compose API returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
 
 	var states processesState
 	if err := json.NewDecoder(resp.Body).Decode(&states); err != nil {

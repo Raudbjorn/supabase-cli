@@ -483,6 +483,8 @@ func RunProject(ctx context.Context, configPath string, sandboxCtx *SandboxConte
 // Returns after postgres is ready so migrations can run. Call WaitForAllServices after migrations.
 // The server process runs the REST API for graceful shutdown via 'supabase stop'.
 func runDetached(ctx context.Context, configPath string, sandboxCtx *SandboxContext, fsys afero.Fs) error {
+	// Safety: pcBin is derived from GetProcessComposePath() which constructs a path
+	// under the controlled sandboxCtx.BinDir directory — never from user input.
 	pcBin := GetProcessComposePath(sandboxCtx.BinDir)
 
 	// Verify the binary is functional before spawning the full server
