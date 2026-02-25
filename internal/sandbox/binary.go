@@ -93,6 +93,22 @@ type BinaryStatus struct {
 	mu              sync.Mutex
 }
 
+// markError records an installation failure on the status.
+func (s *BinaryStatus) markError(err error) {
+	s.mu.Lock()
+	s.Error = err
+	s.Downloading = false
+	s.mu.Unlock()
+}
+
+// markDone records a successful installation on the status.
+func (s *BinaryStatus) markDone() {
+	s.mu.Lock()
+	s.Cached = true
+	s.Downloading = false
+	s.mu.Unlock()
+}
+
 // Spinner frames for animated progress display
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
@@ -174,17 +190,11 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 		go func() {
 			defer wg.Done()
 			if err := installGotrueFromLocalOrDownloadQuiet(ctx, fsys, gotruePath); err != nil {
-				statuses[0].mu.Lock()
-				statuses[0].Error = err
-				statuses[0].Downloading = false
-				statuses[0].mu.Unlock()
+				statuses[0].markError(err)
 				errChan <- fmt.Errorf("auth: %w", err)
 				return
 			}
-			statuses[0].mu.Lock()
-			statuses[0].Cached = true
-			statuses[0].Downloading = false
-			statuses[0].mu.Unlock()
+			statuses[0].markDone()
 		}()
 	}
 
@@ -195,25 +205,16 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 			defer wg.Done()
 			postgrestURL, err := getPostgrestDownloadURL()
 			if err != nil {
-				statuses[1].mu.Lock()
-				statuses[1].Error = err
-				statuses[1].Downloading = false
-				statuses[1].mu.Unlock()
+				statuses[1].markError(err)
 				errChan <- fmt.Errorf("postgrest: %w", err)
 				return
 			}
 			if err := installBinaryIfMissingXZQuiet(ctx, fsys, postgrestPath, postgrestURL); err != nil {
-				statuses[1].mu.Lock()
-				statuses[1].Error = err
-				statuses[1].Downloading = false
-				statuses[1].mu.Unlock()
+				statuses[1].markError(err)
 				errChan <- fmt.Errorf("postgrest: %w", err)
 				return
 			}
-			statuses[1].mu.Lock()
-			statuses[1].Cached = true
-			statuses[1].Downloading = false
-			statuses[1].mu.Unlock()
+			statuses[1].markDone()
 		}()
 	}
 
@@ -223,17 +224,11 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 		go func() {
 			defer wg.Done()
 			if err := installPostgresQuiet(ctx, fsys, binDir, postgresVersion); err != nil {
-				statuses[2].mu.Lock()
-				statuses[2].Error = err
-				statuses[2].Downloading = false
-				statuses[2].mu.Unlock()
+				statuses[2].markError(err)
 				errChan <- fmt.Errorf("postgres: %w", err)
 				return
 			}
-			statuses[2].mu.Lock()
-			statuses[2].Cached = true
-			statuses[2].Downloading = false
-			statuses[2].mu.Unlock()
+			statuses[2].markDone()
 		}()
 	}
 
@@ -244,25 +239,16 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 			defer wg.Done()
 			pcURL, err := getProcessComposeDownloadURL()
 			if err != nil {
-				statuses[3].mu.Lock()
-				statuses[3].Error = err
-				statuses[3].Downloading = false
-				statuses[3].mu.Unlock()
+				statuses[3].markError(err)
 				errChan <- fmt.Errorf("process-compose: %w", err)
 				return
 			}
 			if err := installBinaryFromArchiveQuiet(ctx, fsys, pcPath, pcURL, "process-compose"); err != nil {
-				statuses[3].mu.Lock()
-				statuses[3].Error = err
-				statuses[3].Downloading = false
-				statuses[3].mu.Unlock()
+				statuses[3].markError(err)
 				errChan <- fmt.Errorf("process-compose: %w", err)
 				return
 			}
-			statuses[3].mu.Lock()
-			statuses[3].Cached = true
-			statuses[3].Downloading = false
-			statuses[3].mu.Unlock()
+			statuses[3].markDone()
 		}()
 	}
 

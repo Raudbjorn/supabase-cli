@@ -13,9 +13,13 @@ const (
 	PollingInterval = 2 * time.Second
 	// InitialStartupDelay gives the server time to start before polling.
 	InitialStartupDelay = 1 * time.Second
-	// HTTPClientTimeout is the timeout for HTTP requests to the process-compose API.
-	HTTPClientTimeout = 5 * time.Second
+	// pcAPITimeout is the timeout for HTTP requests to the process-compose REST API.
+	pcAPITimeout = 5 * time.Second
 )
+
+// pcClient is a shared HTTP client for process-compose API calls.
+// Reused across calls to benefit from connection pooling.
+var pcClient = &http.Client{Timeout: pcAPITimeout}
 
 // processState mirrors the process-compose API response for a single process.
 type processState struct {
@@ -41,9 +45,10 @@ const (
 	pcHealthReady      = "Ready"
 )
 
-// waitForCondition polls until the check function returns true or timeout is reached.
-func waitForCondition(timeout time.Duration, timeoutMsg string, check func() bool) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+// waitForCondition polls until the check function returns true, the parent context
+// is cancelled, or the timeout is reached.
+func waitForCondition(ctx context.Context, timeout time.Duration, timeoutMsg string, check func(ctx context.Context) bool) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	ticker := time.NewTicker(PollingInterval)
@@ -55,21 +60,22 @@ func waitForCondition(timeout time.Duration, timeoutMsg string, check func() boo
 	for {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf(timeoutMsg)
+			return fmt.Errorf("%s", timeoutMsg)
 		case <-ticker.C:
-			if check() {
+			if check(ctx) {
 				return nil
 			}
 		}
 	}
 }
 
-// getProcessesState fetches all process states from the process-compose HTTP API.
-func getProcessesState(serverPort int) (*processesState, error) {
-	client := &http.Client{Timeout: HTTPClientTimeout}
-	url := fmt.Sprintf("http://127.0.0.1:%d/processes", serverPort)
-
-	resp, err := client.Get(url)
+// getProcessesState fetches all process states from the process-compose REST API.
+func getProcessesState(ctx context.Context, serverPort int) (*processesState, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/processes", serverPort), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := pcClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -82,17 +88,13 @@ func getProcessesState(serverPort int) (*processesState, error) {
 	return &states, nil
 }
 
-// shutDownProject sends a shutdown request to the process-compose HTTP API.
-func shutDownProject(serverPort int) error {
-	client := &http.Client{Timeout: HTTPClientTimeout}
-	url := fmt.Sprintf("http://127.0.0.1:%d/project/stop/", serverPort)
-
-	req, err := http.NewRequest(http.MethodPost, url, nil)
+// shutDownProject sends a shutdown request to the process-compose REST API.
+func shutDownProject(ctx context.Context, serverPort int) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/project/stop/", serverPort), nil)
 	if err != nil {
 		return err
 	}
-
-	resp, err := client.Do(req)
+	resp, err := pcClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -105,9 +107,9 @@ func shutDownProject(serverPort int) error {
 }
 
 // WaitForServerReady polls the process-compose server until all services are healthy.
-func WaitForServerReady(serverPort int, timeout time.Duration) error {
-	return waitForCondition(timeout, "timeout waiting for services to become healthy", func() bool {
-		states, err := getProcessesState(serverPort)
+func WaitForServerReady(ctx context.Context, serverPort int, timeout time.Duration) error {
+	return waitForCondition(ctx, timeout, "timeout waiting for services to become healthy", func(ctx context.Context) bool {
+		states, err := getProcessesState(ctx, serverPort)
 		if err != nil {
 			return false
 		}
@@ -151,9 +153,9 @@ func isStateReady(state *processState) bool {
 
 // WaitForPostgresReady polls the process-compose server until postgres and postgres-init are ready.
 // This allows migrations to run before other services are fully healthy.
-func WaitForPostgresReady(serverPort int, timeout time.Duration) error {
-	return waitForCondition(timeout, "timeout waiting for postgres to become healthy", func() bool {
-		states, err := getProcessesState(serverPort)
+func WaitForPostgresReady(ctx context.Context, serverPort int, timeout time.Duration) error {
+	return waitForCondition(ctx, timeout, "timeout waiting for postgres to become healthy", func(ctx context.Context) bool {
+		states, err := getProcessesState(ctx, serverPort)
 		if err != nil {
 			return false
 		}

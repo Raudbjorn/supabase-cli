@@ -37,10 +37,10 @@ func Stop(ctx context.Context, fsys afero.Fs, projectId string, backup bool, w i
 
 	fmt.Fprintln(w, "Stopping services...")
 
-	// Try graceful shutdown via HTTP API first
+	// Try graceful shutdown via REST API first
 	stopped := false
 	if state.Ports.ProcessCompose > 0 {
-		if err := shutDownProject(state.Ports.ProcessCompose); err == nil {
+		if err := shutDownProject(ctx, state.Ports.ProcessCompose); err == nil {
 			stopped = true
 			// Give processes time to shut down gracefully
 			time.Sleep(ShutdownGracePeriod)
