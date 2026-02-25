@@ -57,7 +57,7 @@ func Status(ctx context.Context, projectId string, fsys afero.Fs) ([]ServiceStat
 		if !ok {
 			continue
 		}
-		port := portMap[ps.Name]
+		port, _ := portMap[ps.Name] // 0 if process has no exposed port
 
 		healthy := isStateReady(&ps)
 		status := ps.Status

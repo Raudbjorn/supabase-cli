@@ -119,13 +119,23 @@ func streamFromWebSocket(ctx context.Context, wsURL string, w io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("failed to connect to log stream: %w", err)
 	}
+	defer conn.Close()
+
+	// done is closed when this function returns, allowing the cancellation
+	// goroutine to exit even if the context is never cancelled.
+	done := make(chan struct{})
+	defer close(done)
 
 	// Close the connection when context is cancelled
 	go func() {
-		<-ctx.Done()
-		conn.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-		conn.Close()
+		select {
+		case <-ctx.Done():
+			// Best-effort close frame before hard close
+			_ = conn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			conn.Close()
+		case <-done:
+		}
 	}()
 
 	for {

@@ -7,9 +7,9 @@ import (
 )
 
 var (
-	noBackup       bool
-	projectId      string
-	all            bool
+	noBackup        bool
+	projectId       string
+	all             bool
 	stopServiceName string
 
 	stopCmd = &cobra.Command{

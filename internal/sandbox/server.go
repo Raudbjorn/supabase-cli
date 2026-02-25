@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -60,16 +61,27 @@ func waitForCondition(ctx context.Context, timeout time.Duration, timeoutMsg str
 	ticker := time.NewTicker(PollingInterval)
 	defer ticker.Stop()
 
-	// Initial delay to let the server start
-	time.Sleep(InitialStartupDelay)
+	// Initial delay to let the server start (cancellable, unlike time.Sleep)
+	if InitialStartupDelay > 0 {
+		timer := time.NewTimer(InitialStartupDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return ctx.Err()
+			}
+			return fmt.Errorf("%s: %w", timeoutMsg, ctx.Err())
+		case <-timer.C:
+		}
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			if ctx.Err() != nil {
-				return fmt.Errorf("%s: %w", timeoutMsg, ctx.Err())
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return ctx.Err()
 			}
-			return fmt.Errorf("%s", timeoutMsg)
+			return fmt.Errorf("%s: %w", timeoutMsg, ctx.Err())
 		case <-ticker.C:
 			if check(ctx) {
 				return nil

@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -285,21 +286,24 @@ func TestGetProcessState_ContextCancellation(t *testing.T) {
 }
 
 func TestGetProcessState_PathEscape(t *testing.T) {
-	// Verify that names with special characters are properly escaped
+	// Verify that names with special characters are properly escaped.
+	// The handler only accepts the correctly escaped path.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The path should be /process/my%2Fprocess (escaped slash)
-		if r.URL.RawPath == "/process/my%2Fprocess" || r.URL.Path == "/process/my/process" {
-			json.NewEncoder(w).Encode(processState{Name: "my/process", Status: pcStatusRunning})
+		if r.URL.EscapedPath() != "/process/my%2Fprocess" {
+			http.Error(w, "unexpected escaped path: "+r.URL.EscapedPath(), http.StatusBadRequest)
 			return
 		}
-		http.Error(w, "not found", http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(processState{Name: "my/process", Status: pcStatusRunning})
 	}))
 	defer srv.Close()
 
-	// This tests that url.PathEscape is used correctly
-	_, err := getProcessState(context.Background(), testPort(t, srv), "my/process")
-	// We just verify no panic occurs; actual routing depends on server implementation
-	_ = err
+	got, err := getProcessState(context.Background(), testPort(t, srv), "my/process")
+	if err != nil {
+		t.Fatalf("getProcessState() error = %v", err)
+	}
+	if got.Name != "my/process" {
+		t.Fatalf("got.Name = %q, want %q", got.Name, "my/process")
+	}
 }
 
 func TestIsStateReady(t *testing.T) {
@@ -358,4 +362,37 @@ func TestIsAllStatesReady(t *testing.T) {
 			t.Error("expected false when one state is not ready")
 		}
 	})
+}
+
+func TestWaitForCondition_CancelDuringInitialDelay(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel immediately so it fires during the initial delay
+	cancel()
+
+	err := waitForCondition(ctx, 5*time.Second, "should not timeout", func(ctx context.Context) bool {
+		return false
+	})
+	if err == nil {
+		t.Fatal("expected error from cancelled context")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestWaitForCondition_TimeoutWrapped(t *testing.T) {
+	ctx := context.Background()
+	// Use a very short timeout so it expires quickly
+	err := waitForCondition(ctx, 50*time.Millisecond, "test timeout msg", func(ctx context.Context) bool {
+		return false
+	})
+	if err == nil {
+		t.Fatal("expected error from timeout")
+	}
+	if !strings.Contains(err.Error(), "test timeout msg") {
+		t.Errorf("expected timeout message in error, got %q", err.Error())
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected wrapped DeadlineExceeded, got %v", err)
+	}
 }

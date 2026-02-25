@@ -50,6 +50,9 @@ var (
 		Use:     "start",
 		Short:   "Start containers for Supabase local development",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if reloadConfig && !sandboxMode {
+				return fmt.Errorf("--reload requires --sandbox")
+			}
 			fsys := afero.NewOsFs()
 			// Sandbox mode uses process-compose with native binaries instead of Docker Compose
 			if sandboxMode {
