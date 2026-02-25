@@ -2,6 +2,8 @@ package sandbox
 
 import (
 	"archive/tar"
+	"archive/zip"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"fmt"
@@ -243,9 +245,15 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 				errChan <- fmt.Errorf("process-compose: %w", err)
 				return
 			}
-			if err := installBinaryFromArchiveQuiet(ctx, fsys, pcPath, pcURL, "process-compose"); err != nil {
-				statuses[3].markError(err)
-				errChan <- fmt.Errorf("process-compose: %w", err)
+			var installErr error
+			if strings.HasSuffix(pcURL, ".zip") {
+				installErr = installBinaryFromZipQuiet(ctx, fsys, pcPath, pcURL, "process-compose")
+			} else {
+				installErr = installBinaryFromArchiveQuiet(ctx, fsys, pcPath, pcURL, "process-compose")
+			}
+			if installErr != nil {
+				statuses[3].markError(installErr)
+				errChan <- fmt.Errorf("process-compose: %w", installErr)
 				return
 			}
 			statuses[3].markDone()
@@ -393,6 +401,74 @@ func installBinaryFromArchiveQuiet(ctx context.Context, fsys afero.Fs, binPath, 
 	}
 
 	return extractTarGzWithName(resp.Body, binPath, srcBinName, fsys)
+}
+
+// installBinaryFromZipQuiet downloads a .zip archive and extracts a named binary.
+// Used for Windows process-compose releases which ship as .zip instead of .tar.gz.
+func installBinaryFromZipQuiet(ctx context.Context, fsys afero.Fs, binPath, downloadURL, srcBinName string) error {
+	if err := fsys.MkdirAll(filepath.Dir(binPath), 0755); err != nil {
+		return fmt.Errorf("failed to create binary directory: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return errors.Errorf("failed to download %s: HTTP %d", downloadURL, resp.StatusCode)
+	}
+
+	// zip.Reader needs io.ReaderAt, so buffer the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	return extractZipWithName(body, binPath, srcBinName, fsys)
+}
+
+// extractZipWithName extracts a named binary from a zip archive.
+func extractZipWithName(data []byte, binPath, srcBinName string, fsys afero.Fs) error {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return fmt.Errorf("failed to open zip archive: %w", err)
+	}
+
+	for _, f := range zr.File {
+		name := filepath.Base(f.Name)
+		if name != srcBinName && name != srcBinName+".exe" {
+			continue
+		}
+		if f.FileInfo().IsDir() {
+			continue
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			return fmt.Errorf("failed to open file in zip: %w", err)
+		}
+		defer rc.Close()
+
+		binData, err := io.ReadAll(rc)
+		if err != nil {
+			return fmt.Errorf("failed to read binary from zip: %w", err)
+		}
+
+		if err := afero.WriteFile(fsys, binPath, binData, 0755); err != nil {
+			return fmt.Errorf("failed to write binary: %w", err)
+		}
+
+		return nil
+	}
+
+	return errors.Errorf("binary %s not found in zip archive", srcBinName)
 }
 
 // installPostgresQuiet installs PostgreSQL without printing progress (except codesign warnings).
