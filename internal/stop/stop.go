@@ -2,7 +2,6 @@ package stop
 
 import (
 	"context"
-	_ "embed"
 	"fmt"
 	"io"
 	"os"
