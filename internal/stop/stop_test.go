@@ -47,7 +47,7 @@ func TestStopCommand(t *testing.T) {
 				Name: utils.DbId,
 			}}})
 		// Run test
-		err := Run(context.Background(), true, "", false, fsys)
+		err := Run(context.Background(), true, "", false, "", fsys)
 		// Check error
 		assert.NoError(t, err)
 		assert.Empty(t, apitest.ListUnmatchedRequests())
@@ -126,7 +126,7 @@ func TestStopCommand(t *testing.T) {
 			JSON([]container.Summary{})
 
 		// Run test
-		err := Run(context.Background(), true, "", true, fsys)
+		err := Run(context.Background(), true, "", true, "", fsys)
 
 		// Check error
 		assert.NoError(t, err)
@@ -138,7 +138,7 @@ func TestStopCommand(t *testing.T) {
 		fsys := afero.NewMemMapFs()
 		require.NoError(t, afero.WriteFile(fsys, utils.ConfigPath, []byte("malformed"), 0644))
 		// Run test
-		err := Run(context.Background(), false, "", false, fsys)
+		err := Run(context.Background(), false, "", false, "", fsys)
 		// Check error
 		assert.ErrorContains(t, err, "toml: expected = after a key, but the document ends there")
 	})
@@ -154,7 +154,7 @@ func TestStopCommand(t *testing.T) {
 			Get("/v" + utils.Docker.ClientVersion() + "/containers/json").
 			Reply(http.StatusServiceUnavailable)
 		// Run test
-		err := Run(context.Background(), false, "test", false, afero.NewReadOnlyFs(fsys))
+		err := Run(context.Background(), false, "test", false, "", afero.NewReadOnlyFs(fsys))
 		// Check error
 		assert.ErrorContains(t, err, "request returned 503 Service Unavailable for API route and version")
 		assert.Empty(t, apitest.ListUnmatchedRequests())
