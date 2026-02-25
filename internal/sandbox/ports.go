@@ -22,7 +22,7 @@ type AllocatedPorts struct {
 // SandboxState holds the complete runtime state for a sandbox instance.
 // Stored in state.json - replaces both ports.json and pids.json.
 type SandboxState struct {
-	PID   int            `json:"pid"`   // _sandbox-server process ID
+	PID   int            `json:"pid"`   // process-compose server process ID
 	Ports AllocatedPorts `json:"ports"` // Allocated ports for all services
 }
 

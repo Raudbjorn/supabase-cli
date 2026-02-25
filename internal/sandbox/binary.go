@@ -23,9 +23,10 @@ import (
 
 const (
 	// Binary versions
-	GotrueVersion    = "2.186.0" // Local build for darwin-arm64
-	PostgrestVersion = "14.4"
-	PostgresVersion  = "17.6.1.081-cli"
+	GotrueVersion          = "2.186.0" // Local build for darwin-arm64
+	PostgrestVersion       = "14.4"
+	PostgresVersion        = "17.6.1.081-cli"
+	ProcessComposeVersion  = "1.90.0"
 
 	// SpinnerTickInterval is how often the download spinner animation updates.
 	SpinnerTickInterval = 80 * time.Millisecond
@@ -49,6 +50,16 @@ func GetPostgrestPath(binDir string) string {
 		name = "postgrest.exe"
 	}
 	return filepath.Join(binDir, "postgrest", PostgrestVersion, name)
+}
+
+// GetProcessComposePath returns the path to the process-compose binary.
+// Binaries are cached with versioning: ~/.supabase/bin/process-compose/<version>/process-compose
+func GetProcessComposePath(binDir string) string {
+	name := "process-compose"
+	if runtime.GOOS == "windows" {
+		name = "process-compose.exe"
+	}
+	return filepath.Join(binDir, "process-compose", ProcessComposeVersion, name)
 }
 
 // GetPostgresDir returns the postgres installation directory.
@@ -97,6 +108,7 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 	// Get paths and check cache status
 	gotruePath := GetGotruePath(binDir)
 	postgrestPath := GetPostgrestPath(binDir)
+	pcPath := GetProcessComposePath(binDir)
 
 	postgresVersion = PostgresVersion
 	postgresBin := GetPostgresBinPath(binDir, postgresVersion, "postgres")
@@ -105,9 +117,10 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 	gotrueCached := fileExists(fsys, gotruePath)
 	postgrestCached := fileExists(fsys, postgrestPath)
 	postgresCached := fileExists(fsys, postgresBin)
+	pcCached := fileExists(fsys, pcPath)
 
 	// If all cached, nothing to do
-	if gotrueCached && postgrestCached && postgresCached {
+	if gotrueCached && postgrestCached && postgresCached && pcCached {
 		return postgresVersion, nil
 	}
 
@@ -116,6 +129,7 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 		{Name: "auth", InitiallyCached: gotrueCached, Cached: gotrueCached, Downloading: !gotrueCached},
 		{Name: "postgrest", InitiallyCached: postgrestCached, Cached: postgrestCached, Downloading: !postgrestCached},
 		{Name: "postgres", InitiallyCached: postgresCached, Cached: postgresCached, Downloading: !postgresCached},
+		{Name: "process-compose", InitiallyCached: pcCached, Cached: pcCached, Downloading: !pcCached},
 	}
 
 	// Print initial status lines (without moving cursor up)
@@ -152,7 +166,7 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 
 	// Install binaries in parallel
 	var wg sync.WaitGroup
-	errChan := make(chan error, 3)
+	errChan := make(chan error, 4)
 
 	// GoTrue
 	if !gotrueCached {
@@ -220,6 +234,35 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 			statuses[2].Cached = true
 			statuses[2].Downloading = false
 			statuses[2].mu.Unlock()
+		}()
+	}
+
+	// process-compose
+	if !pcCached {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pcURL, err := getProcessComposeDownloadURL()
+			if err != nil {
+				statuses[3].mu.Lock()
+				statuses[3].Error = err
+				statuses[3].Downloading = false
+				statuses[3].mu.Unlock()
+				errChan <- fmt.Errorf("process-compose: %w", err)
+				return
+			}
+			if err := installBinaryFromArchiveQuiet(ctx, fsys, pcPath, pcURL, "process-compose"); err != nil {
+				statuses[3].mu.Lock()
+				statuses[3].Error = err
+				statuses[3].Downloading = false
+				statuses[3].mu.Unlock()
+				errChan <- fmt.Errorf("process-compose: %w", err)
+				return
+			}
+			statuses[3].mu.Lock()
+			statuses[3].Cached = true
+			statuses[3].Downloading = false
+			statuses[3].mu.Unlock()
 		}()
 	}
 
@@ -599,6 +642,25 @@ func getPostgrestDownloadURL() (string, error) {
 		return base + "postgrest-v" + PostgrestVersion + "-linux-static-aarch64.tar.xz", nil
 	default:
 		return "", errors.Errorf("unsupported platform for postgrest: %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+}
+
+// getProcessComposeDownloadURL returns the download URL for process-compose based on the current platform.
+// process-compose releases are .tar.gz archives containing a single binary.
+func getProcessComposeDownloadURL() (string, error) {
+	base := fmt.Sprintf("https://github.com/F1bonacc1/process-compose/releases/download/v%s/", ProcessComposeVersion)
+
+	switch {
+	case runtime.GOOS == "darwin" && runtime.GOARCH == "arm64":
+		return base + "process-compose_darwin_arm64.tar.gz", nil
+	case runtime.GOOS == "darwin" && runtime.GOARCH == "amd64":
+		return base + "process-compose_darwin_amd64.tar.gz", nil
+	case runtime.GOOS == "linux" && runtime.GOARCH == "amd64":
+		return base + "process-compose_linux_amd64.tar.gz", nil
+	case runtime.GOOS == "linux" && runtime.GOARCH == "arm64":
+		return base + "process-compose_linux_arm64.tar.gz", nil
+	default:
+		return "", errors.Errorf("unsupported platform for process-compose: %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 }
 

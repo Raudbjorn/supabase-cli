@@ -479,15 +479,16 @@ func RunProject(configPath string, sandboxCtx *SandboxContext, fsys afero.Fs) er
 	return runDetached(configPath, sandboxCtx, fsys)
 }
 
-// runDetached spawns a background server process and waits for postgres to be healthy.
+// runDetached spawns a background process-compose server and waits for postgres to be healthy.
 // Returns after postgres is ready so migrations can run. Call WaitForAllServices after migrations.
 // The server process runs the HTTP API for graceful shutdown via 'supabase stop'.
 func runDetached(configPath string, sandboxCtx *SandboxContext, fsys afero.Fs) error {
-	// Spawn the server as a detached background process
-	// Use absolute path to handle --workdir flag
-	serverCmd := exec.Command(getExecutablePath(), "_sandbox-server",
+	// Spawn process-compose as a detached background process
+	pcBin := GetProcessComposePath(sandboxCtx.BinDir)
+	serverCmd := exec.Command(pcBin, "up",
 		"--config", configPath,
 		"--port", fmt.Sprintf("%d", sandboxCtx.Ports.ProcessCompose),
+		"--tui=false",
 	)
 
 	// Redirect output to log file

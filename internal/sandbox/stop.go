@@ -11,7 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/f1bonacc1/process-compose/src/client"
 	"github.com/spf13/afero"
 )
 
@@ -41,8 +40,7 @@ func Stop(ctx context.Context, fsys afero.Fs, projectId string, backup bool, w i
 	// Try graceful shutdown via HTTP API first
 	stopped := false
 	if state.Ports.ProcessCompose > 0 {
-		pcClient := client.NewTcpClient("127.0.0.1", state.Ports.ProcessCompose, 100)
-		if err := pcClient.ShutDownProject(); err == nil {
+		if err := shutDownProject(state.Ports.ProcessCompose); err == nil {
 			stopped = true
 			// Give processes time to shut down gracefully
 			time.Sleep(ShutdownGracePeriod)
