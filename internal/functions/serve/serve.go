@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/docker/cli/cli/compose/loader"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
@@ -160,7 +159,7 @@ func ServeFunctions(ctx context.Context, envFilePath string, noVerifyJWT *bool, 
 	if watcher := runtimeOption.fileWatcher; watcher != nil {
 		var watchPaths []string
 		for _, b := range binds {
-			if spec, err := loader.ParseVolume(b); err != nil {
+			if spec, err := utils.ParseVolume(b); err != nil {
 				return errors.Errorf("failed to parse docker volume: %w", err)
 			} else if spec.Type == string(mount.TypeBind) {
 				watchPaths = append(watchPaths, spec.Source)

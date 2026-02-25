@@ -3,18 +3,10 @@ package sandbox
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"os"
-	"os/exec"
-	"time"
 
 	"github.com/spf13/afero"
 	"github.com/supabase/cli/internal/utils"
-)
-
-const (
-	// HealthCheckTimeout is the timeout for HTTP health check requests.
-	HealthCheckTimeout = 2 * time.Second
 )
 
 // ServiceStatus represents the health status of a service.
@@ -25,119 +17,72 @@ type ServiceStatus struct {
 	Healthy bool
 }
 
-// Status checks the health of all sandbox services for the given project.
+// Status checks the health of all sandbox services using the process-compose API.
+// This provides DAG-aware readiness by leveraging process-compose's built-in health
+// probes and dependency graph, rather than doing independent health checks.
 func Status(ctx context.Context, projectId string, fsys afero.Fs) ([]ServiceStatus, error) {
 	sandboxCtx, err := NewSandboxContext(projectId)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sandbox context: %w", err)
 	}
 
-	// Load state to find services
 	state, err := sandboxCtx.LoadState(fsys)
 	if err != nil {
 		return nil, fmt.Errorf("sandbox is not running (no state file): %w", err)
 	}
 
+	// Use process-compose API to get all process states at once.
+	// This is superior to individual HTTP health checks because process-compose
+	// already monitors health probes and understands the dependency graph.
+	pcStates, err := getProcessesState(ctx, state.Ports.ProcessCompose)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query process-compose: %w", err)
+	}
+
+	// Port mapping for user-facing display (keyed by PC process name)
+	portMap := map[string]int{
+		"postgres":  state.Ports.Postgres,
+		"gotrue":    state.Ports.GoTrue,
+		"postgrest": state.Ports.PostgREST,
+		"proxy":     state.Ports.API,
+	}
+
+	// Map PC names back to user-facing names
+	reverseLookup := ReverseLookup()
+
 	var statuses []ServiceStatus
+	for _, ps := range pcStates.States {
+		// Only include processes that have a user-facing mapping
+		name, ok := reverseLookup[ps.Name]
+		if !ok {
+			continue
+		}
+		port, _ := portMap[ps.Name] // 0 if process has no exposed port
 
-	// Check postgres (native process using pg_isready)
-	pgStatus := checkPostgresStatus(ctx, fsys, sandboxCtx.BinDir, state.Ports.Postgres)
-	statuses = append(statuses, pgStatus)
+		healthy := isStateReady(&ps)
+		status := ps.Status
+		if healthy {
+			status = "running"
+		} else if ps.Status == pcStatusLaunching {
+			status = "starting"
+		} else if ps.Status == pcStatusCompleted {
+			status = "completed"
+		}
 
-	// Check gotrue (native process)
-	gotrueStatus := checkHTTPStatus("gotrue", state.Ports.GoTrue, "/health")
-	statuses = append(statuses, gotrueStatus)
+		// Append health probe info if available
+		if ps.HasHealthProbe && !healthy && ps.Status == pcStatusRunning {
+			status = "waiting for health check"
+		}
 
-	// Check postgrest (native process)
-	postgrestStatus := checkHTTPStatus("postgrest", state.Ports.PostgREST, "/")
-	statuses = append(statuses, postgrestStatus)
-
-	// Check api proxy (process-compose managed)
-	apiStatus := checkHTTPStatus("api", state.Ports.API, "/health")
-	statuses = append(statuses, apiStatus)
+		statuses = append(statuses, ServiceStatus{
+			Name:    name,
+			Status:  status,
+			Port:    port,
+			Healthy: healthy,
+		})
+	}
 
 	return statuses, nil
-}
-
-// checkPostgresStatus checks if native postgres is healthy using pg_isready.
-func checkPostgresStatus(ctx context.Context, fsys afero.Fs, binDir string, port int) ServiceStatus {
-	status := ServiceStatus{
-		Name: "postgres",
-		Port: port,
-	}
-
-	if port == 0 {
-		status.Status = "not configured"
-		status.Healthy = false
-		return status
-	}
-
-	// Load postgres version from persistent file
-	postgresVersion, err := LoadPostgresVersion(fsys)
-	if err != nil {
-		status.Status = "unknown version"
-		status.Healthy = false
-		return status
-	}
-
-	// Use pg_isready to check postgres health
-	pgIsReady := GetPostgresBinPath(binDir, postgresVersion, "pg_isready")
-	cmd := exec.CommandContext(ctx, pgIsReady,
-		"-h", "127.0.0.1",
-		"-p", fmt.Sprintf("%d", port),
-		"-U", "postgres",
-	)
-
-	// Set library path for shared libraries
-	libDir := GetPostgresLibDir(binDir, postgresVersion)
-	setLibraryPath(cmd, libDir)
-
-	if err := cmd.Run(); err != nil {
-		status.Status = "not responding"
-		status.Healthy = false
-		return status
-	}
-
-	status.Status = "running"
-	status.Healthy = true
-	return status
-}
-
-// checkHTTPStatus checks if a service is responding to HTTP requests.
-func checkHTTPStatus(name string, port int, path string) ServiceStatus {
-	status := ServiceStatus{
-		Name: name,
-		Port: port,
-	}
-
-	if port == 0 {
-		status.Status = "not configured"
-		status.Healthy = false
-		return status
-	}
-
-	client := &http.Client{
-		Timeout: HealthCheckTimeout,
-	}
-
-	url := fmt.Sprintf("http://127.0.0.1:%d%s", port, path)
-	resp, err := client.Get(url)
-	if err != nil {
-		status.Status = "not responding"
-		status.Healthy = false
-		return status
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-		status.Status = "running"
-		status.Healthy = true
-	} else {
-		status.Status = fmt.Sprintf("unhealthy (%d)", resp.StatusCode)
-		status.Healthy = false
-	}
-
-	return status
 }
 
 // ShowStatus checks sandbox status and prints it using the same format as Docker mode.
@@ -162,16 +107,24 @@ func ShowStatus(ctx context.Context, projectId string, fsys afero.Fs) error {
 		return err
 	}
 
-	// Check if any service is unhealthy
+	// Print per-service health checklist
 	var unhealthy []string
 	for _, s := range statuses {
-		if !s.Healthy {
+		if s.Healthy {
+			if s.Port > 0 {
+				fmt.Fprintf(os.Stderr, "  %s %s (port %d)\n", utils.Green("✓"), s.Name, s.Port)
+			} else {
+				fmt.Fprintf(os.Stderr, "  %s %s\n", utils.Green("✓"), s.Name)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "  %s %s: %s\n", utils.Red("✗"), s.Name, s.Status)
 			unhealthy = append(unhealthy, s.Name)
 		}
 	}
+	fmt.Fprintln(os.Stderr)
 
 	if len(unhealthy) > 0 {
-		fmt.Fprintf(os.Stderr, "Unhealthy services: %v\n", unhealthy)
+		fmt.Fprintf(os.Stderr, "%s Unhealthy services: %v\n\n", utils.Yellow("WARNING:"), unhealthy)
 	}
 
 	// Print status message matching Docker mode

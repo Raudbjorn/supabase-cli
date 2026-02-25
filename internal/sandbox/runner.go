@@ -485,6 +485,7 @@ func RunProject(ctx context.Context, configPath string, sandboxCtx *SandboxConte
 func runDetached(ctx context.Context, configPath string, sandboxCtx *SandboxContext, fsys afero.Fs) error {
 	// Safety: pcBin is derived from GetProcessComposePath() which constructs a path
 	// under the controlled sandboxCtx.BinDir directory — never from user input.
+	// All exec.Command calls below use only pcBin and CLI-generated arguments.
 	pcBin := GetProcessComposePath(sandboxCtx.BinDir)
 
 	// Verify the binary is functional before spawning the full server
