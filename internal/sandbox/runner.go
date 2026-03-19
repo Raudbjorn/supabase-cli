@@ -3,9 +3,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	_ "embed"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -79,7 +77,10 @@ type processComposeConfig struct {
 	StudioPort       int
 
 	// Shared secrets for Elixir services
-	SecretKeyBase string
+	SecretKeyBase      string
+	RealtimeErlAflags  string // e.g. "-proto_dist inet_tcp" or "-proto_dist inet6_tcp"
+	RealtimeEncKey     string // DB_ENC_KEY for realtime
+	RealtimeIpVersion  string // "ipv4" or "ipv6"
 
 	// Storage data directory
 	StorageDataDir string
@@ -289,8 +290,9 @@ func GenerateProcessComposeConfig(goCtx context.Context, ctx *SandboxContext, po
 		rateLimitEmailSent = utils.Config.Auth.RateLimit.EmailSent
 	}
 
-	// Generate a secret_key_base for Elixir services (deterministic from JWT secret)
-	secretKeyBase := generateSecretKeyBase(utils.Config.Auth.JwtSecret.Value)
+	// Use the pre-generated SecretKeyBase from the realtime config so sandbox
+	// matches the defaults and behavior of the standard (Docker) stack.
+	secretKeyBase := utils.Config.Realtime.SecretKeyBase
 
 	// Build postgres paths
 	postgresDir := GetPostgresDir(ctx.BinDir, postgresVersion)
@@ -335,8 +337,11 @@ func GenerateProcessComposeConfig(goCtx context.Context, ctx *SandboxContext, po
 		PgMetaPort:       ctx.Ports.PgMeta,
 		StudioPath:       GetServicePath(ctx.BinDir, "studio"),
 		StudioPort:       ctx.Ports.Studio,
-		SecretKeyBase:    secretKeyBase,
-		StorageDataDir:   ctx.StorageDataDir(),
+		SecretKeyBase:     secretKeyBase,
+		RealtimeErlAflags: utils.ToRealtimeEnv(utils.Config.Realtime.IpVersion),
+		RealtimeEncKey:    utils.Config.Realtime.EncryptionKey,
+		RealtimeIpVersion: strings.ToLower(string(utils.Config.Realtime.IpVersion)),
+		StorageDataDir:    ctx.StorageDataDir(),
 
 		// JWT configuration
 		JwtSecret:     utils.Config.Auth.JwtSecret.Value,
@@ -495,14 +500,6 @@ func GenerateProcessComposeConfig(goCtx context.Context, ctx *SandboxContext, po
 	}
 
 	return buf.String(), nil
-}
-
-// generateSecretKeyBase derives a 64-char hex secret from the JWT secret.
-// Elixir services (realtime, logflare) require SECRET_KEY_BASE >= 64 chars.
-func generateSecretKeyBase(jwtSecret string) string {
-	h := sha256.New()
-	h.Write([]byte("supabase-sandbox-secret-key-base:" + jwtSecret))
-	return hex.EncodeToString(h.Sum(nil))
 }
 
 // WriteProcessComposeConfig generates and writes process-compose.yaml to the sandbox directory.

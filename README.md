@@ -51,7 +51,7 @@ supabase restart [service]        # Restart a specific service
 
 ### Output
 
-```
+```text
 APIs:
   API URL:     http://127.0.0.1:{api}
   REST:        http://127.0.0.1:{api}/rest/v1/

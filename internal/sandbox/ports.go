@@ -39,13 +39,13 @@ func AllocatePorts(ctx context.Context) (*AllocatedPorts, error) {
 	var err error
 
 	// API port (from config.toml [api] port)
-	ports.API, err = findAvailablePort(uint16(utils.Config.Api.Port))
+	ports.API, err = findAvailablePort(utils.Config.Api.Port)
 	if err != nil {
 		return nil, fmt.Errorf("api port: %w", err)
 	}
 
 	// Postgres port (from config.toml [db] port)
-	ports.Postgres, err = findAvailablePort(uint16(utils.Config.Db.Port))
+	ports.Postgres, err = findAvailablePort(utils.Config.Db.Port)
 	if err != nil {
 		return nil, fmt.Errorf("postgres port: %w", err)
 	}
@@ -105,7 +105,7 @@ func AllocatePorts(ctx context.Context) (*AllocatedPorts, error) {
 	}
 
 	// Studio (Next.js, user-facing)
-	ports.Studio, err = findAvailablePort(uint16(utils.Config.Studio.Port))
+	ports.Studio, err = findAvailablePort(utils.Config.Studio.Port)
 	if err != nil {
 		return nil, fmt.Errorf("studio port: %w", err)
 	}

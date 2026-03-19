@@ -20,6 +20,7 @@ import (
 	"github.com/go-errors/errors"
 	"github.com/spf13/afero"
 	"github.com/supabase/cli/internal/utils"
+	"github.com/supabase/cli/pkg/config"
 	"github.com/ulikunitz/xz"
 )
 
@@ -29,15 +30,6 @@ const (
 	PostgrestVersion      = "14.4"
 	PostgresVersion       = "17.6.1.081-cli"
 	ProcessComposeVersion = "1.90.0"
-
-	// Docker image tags for services extracted via `docker create` + `docker cp`.
-	// Pinned to explicit versions matching the CLI's Docker Compose setup
-	// (pkg/config/templates/Dockerfile) for deterministic sandbox behavior.
-	RealtimeImage = "supabase/realtime:v2.78.0"
-	LogflareImage = "supabase/logflare:1.33.1"
-	StorageImage  = "supabase/storage-api:v1.39.1"
-	PgmetaImage   = "supabase/postgres-meta:v0.95.2"
-	StudioImage   = "supabase/studio:2026.02.16-sha-26c615c"
 
 	// SpinnerTickInterval is how often the download spinner animation updates.
 	SpinnerTickInterval = 80 * time.Millisecond
@@ -114,18 +106,28 @@ type dockerService struct {
 	NeedsNode bool   // whether this service requires Node.js on host
 }
 
-// dockerServices lists all services to extract from Docker images.
-var dockerServices = []dockerService{
-	{Name: "realtime", Image: RealtimeImage, SrcPath: "/app/."},
-	{Name: "logflare", Image: LogflareImage, SrcPath: "/opt/app/rel/logflare/."},
-	{Name: "storage", Image: StorageImage, SrcPath: "/app/.", NeedsNode: true},
-	{Name: "pgmeta", Image: PgmetaImage, SrcPath: "/usr/src/app/.", NeedsNode: true},
-	{Name: "studio", Image: StudioImage, SrcPath: "/app/.", NeedsNode: true},
+// getDockerServices returns the list of services to extract from Docker images.
+// Image tags are read from config.Images (parsed from pkg/config/templates/Dockerfile)
+// so they stay in sync with the CLI's Docker Compose setup automatically.
+func getDockerServices() []dockerService {
+	return []dockerService{
+		{Name: "realtime", Image: config.Images.Realtime, SrcPath: "/app/."},
+		{Name: "logflare", Image: config.Images.Logflare, SrcPath: "/opt/app/rel/logflare/."},
+		{Name: "storage", Image: config.Images.Storage, SrcPath: "/app/.", NeedsNode: true},
+		{Name: "pgmeta", Image: config.Images.Pgmeta, SrcPath: "/usr/src/app/.", NeedsNode: true},
+		{Name: "studio", Image: config.Images.Studio, SrcPath: "/app/.", NeedsNode: true},
+	}
 }
 
 // InstallDockerServices extracts services from Docker images if not already cached.
 // Uses `docker create` + `docker cp` + `docker rm` to avoid running containers.
 func InstallDockerServices(ctx context.Context, binDir string) error {
+	// Docker images contain Linux-amd64 binaries; extraction is only
+	// meaningful on Linux hosts.
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("Docker service extraction is only supported on Linux (current: %s)", runtime.GOOS)
+	}
+
 	servicesDir := GetServicesDir(binDir)
 	if err := os.MkdirAll(servicesDir, 0755); err != nil {
 		return fmt.Errorf("failed to create services directory: %w", err)
@@ -133,7 +135,7 @@ func InstallDockerServices(ctx context.Context, binDir string) error {
 
 	// Check which services need extraction
 	var missing []dockerService
-	for _, svc := range dockerServices {
+	for _, svc := range getDockerServices() {
 		svcDir := GetServicePath(binDir, svc.Name)
 		if !dirExists(svcDir) {
 			missing = append(missing, svc)
@@ -255,10 +257,12 @@ func extractDockerService(ctx context.Context, binDir string, svc dockerService)
 		return fmt.Errorf("docker create %s failed: %s: %w", svc.Image, string(out), err)
 	}
 
-	// Ensure cleanup
+	// Ensure cleanup — log errors so stale containers are diagnosable
 	defer func() {
 		rmCmd := exec.Command("docker", "rm", containerName)
-		rmCmd.Run()
+		if out, err := rmCmd.CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to remove container %s: %s: %v\n", containerName, string(out), err)
+		}
 	}()
 
 	// Create destination
@@ -288,7 +292,9 @@ func applyPostExtractionFixups(binDir string) error {
 		if _, err := exec.LookPath("npm"); err == nil {
 			cmd := exec.Command("npm", "rebuild")
 			cmd.Dir = fsXattrDir
-			cmd.Run() // Best-effort, non-fatal
+			if out, err := cmd.CombinedOutput(); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: npm rebuild fs-xattr failed: %s: %v\n", string(out), err)
+			}
 		}
 	}
 
@@ -349,7 +355,9 @@ func fixSentryABI(profilerDir string) {
 		}
 	}
 	if best != "" {
-		os.Symlink(best, target)
+		if err := os.Symlink(best, target); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to create Sentry ABI symlink: %v\n", err)
+		}
 	}
 }
 
@@ -441,8 +449,11 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 	postgresCached := fileExists(fsys, postgresBin)
 	pcCached := fileExists(fsys, pcPath)
 
-	// If all cached, nothing to do
+	// If all GitHub binaries are cached, skip download phase but still check Docker services
 	if gotrueCached && postgrestCached && postgresCached && pcCached {
+		if err := InstallDockerServices(ctx, binDir); err != nil {
+			return "", fmt.Errorf("docker service extraction: %w", err)
+		}
 		return postgresVersion, nil
 	}
 

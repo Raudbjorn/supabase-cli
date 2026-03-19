@@ -369,15 +369,15 @@ processes:
       - DB_USER=supabase_admin
       - DB_PASSWORD={{ .DbPassword }}
       - DB_NAME=postgres
-      - DB_IP_VERSION=ipv4
-      - DB_ENC_KEY=supabaserealtime
+      - DB_IP_VERSION={{ .RealtimeIpVersion }}
+      - DB_ENC_KEY={{ .RealtimeEncKey }}
       - API_JWT_SECRET={{ .JwtSecret }}
       - LANG=en_US.UTF-8
       - LANGUAGE=en_US:en
       - LC_ALL=en_US.UTF-8
       - MIX_ENV=prod
       - ERL_CRASH_DUMP=/tmp/erl_crash_migrate.dump
-      - ERL_AFLAGS=-proto_dist inet6_tcp
+      - ERL_AFLAGS={{ .RealtimeErlAflags }}
       - CLUSTER_STRATEGIES=EPMD
     depends_on:
       postgres-init:
@@ -399,15 +399,15 @@ processes:
       - DB_USER=supabase_admin
       - DB_PASSWORD={{ .DbPassword }}
       - DB_NAME=postgres
-      - DB_IP_VERSION=ipv4
-      - DB_ENC_KEY=supabaserealtime
+      - DB_IP_VERSION={{ .RealtimeIpVersion }}
+      - DB_ENC_KEY={{ .RealtimeEncKey }}
       - API_JWT_SECRET={{ .JwtSecret }}
       - LANG=en_US.UTF-8
       - LANGUAGE=en_US:en
       - LC_ALL=en_US.UTF-8
       - MIX_ENV=prod
       - ERL_CRASH_DUMP=/tmp/erl_crash_seed.dump
-      - ERL_AFLAGS=-proto_dist inet6_tcp
+      - ERL_AFLAGS={{ .RealtimeErlAflags }}
       - CLUSTER_STRATEGIES=EPMD
       - SEED_SELF_HOST=true
     depends_on:
@@ -427,8 +427,8 @@ processes:
       - DB_USER=supabase_admin
       - DB_PASSWORD={{ .DbPassword }}
       - DB_NAME=postgres
-      - DB_IP_VERSION=ipv4
-      - DB_ENC_KEY=supabaserealtime
+      - DB_IP_VERSION={{ .RealtimeIpVersion }}
+      - DB_ENC_KEY={{ .RealtimeEncKey }}
       - DB_AFTER_CONNECT_QUERY=SET search_path TO _realtime
       - API_JWT_SECRET={{ .JwtSecret }}
       - PORT={{ .RealtimePort }}
@@ -437,7 +437,7 @@ processes:
       - LC_ALL=en_US.UTF-8
       - MIX_ENV=prod
       - ERL_CRASH_DUMP=/tmp/erl_crash.dump
-      - ERL_AFLAGS=-proto_dist inet6_tcp
+      - ERL_AFLAGS={{ .RealtimeErlAflags }}
       - CLUSTER_STRATEGIES=EPMD
       - LOG_LEVEL=info
       - SEED_SELF_HOST=true
@@ -630,10 +630,10 @@ processes:
       - STUDIO_PG_META_URL=http://127.0.0.1:{{ .PgMetaPort }}
       - SUPABASE_URL=http://127.0.0.1:{{ .APIPort }}
       - SUPABASE_PUBLIC_URL=http://127.0.0.1:{{ .APIPort }}
-      - SUPABASE_ANON_KEY={{ .AnonJWT }}
+      - SUPABASE_ANON_KEY={{ .AnonKey }}
       - SUPABASE_SERVICE_KEY={{ .ServiceRoleJWT }}
       - NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:{{ .APIPort }}
-      - NEXT_PUBLIC_SUPABASE_ANON_KEY={{ .AnonJWT }}
+      - NEXT_PUBLIC_SUPABASE_ANON_KEY={{ .AnonKey }}
       - POSTGRES_PASSWORD={{ .DbPassword }}
       - DEFAULT_ORGANIZATION_NAME=Default Organization
       - DEFAULT_PROJECT_NAME=Default Project
