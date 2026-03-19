@@ -20,11 +20,12 @@ import (
 	"github.com/go-errors/errors"
 	"github.com/spf13/afero"
 	"github.com/supabase/cli/internal/utils"
+	"github.com/supabase/cli/pkg/config"
 	"github.com/ulikunitz/xz"
 )
 
 const (
-	// Binary versions
+	// Binary versions (GitHub release downloads)
 	GotrueVersion         = "2.186.0" // Local build for darwin-arm64
 	PostgrestVersion      = "14.4"
 	PostgresVersion       = "17.6.1.081-cli"
@@ -85,6 +86,317 @@ func GetPostgresLibDir(binDir, version string) string {
 	return filepath.Join(GetPostgresDir(binDir, version), "lib")
 }
 
+// GetServicesDir returns the base directory for Docker-extracted services.
+// Located at: ~/.supabase/bin/services/
+func GetServicesDir(binDir string) string {
+	return filepath.Join(binDir, "services")
+}
+
+// GetServicePath returns the path to a specific extracted service directory.
+// e.g., ~/.supabase/bin/services/realtime/
+func GetServicePath(binDir, service string) string {
+	return filepath.Join(GetServicesDir(binDir), service)
+}
+
+// dockerService describes a service to extract from a Docker image.
+type dockerService struct {
+	Name      string // display name and target directory
+	Image     string // Docker image reference
+	SrcPath   string // path inside the container to copy from
+	NeedsNode bool   // whether this service requires Node.js on host
+}
+
+// getDockerServices returns the list of services to extract from Docker images.
+// Image tags are read from config.Images (parsed from pkg/config/templates/Dockerfile)
+// so they stay in sync with the CLI's Docker Compose setup automatically.
+func getDockerServices() []dockerService {
+	return []dockerService{
+		{Name: "realtime", Image: config.Images.Realtime, SrcPath: "/app/."},
+		{Name: "logflare", Image: config.Images.Logflare, SrcPath: "/opt/app/rel/logflare/."},
+		{Name: "storage", Image: config.Images.Storage, SrcPath: "/app/.", NeedsNode: true},
+		{Name: "pgmeta", Image: config.Images.Pgmeta, SrcPath: "/usr/src/app/.", NeedsNode: true},
+		{Name: "studio", Image: config.Images.Studio, SrcPath: "/app/.", NeedsNode: true},
+	}
+}
+
+// InstallDockerServices extracts services from Docker images if not already cached.
+// Uses `docker create` + `docker cp` + `docker rm` to avoid running containers.
+func InstallDockerServices(ctx context.Context, binDir string) error {
+	// Docker images contain Linux-amd64 binaries; extraction is only
+	// meaningful on Linux hosts.
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("Docker service extraction is only supported on Linux (current: %s)", runtime.GOOS)
+	}
+
+	servicesDir := GetServicesDir(binDir)
+	if err := os.MkdirAll(servicesDir, 0755); err != nil {
+		return fmt.Errorf("failed to create services directory: %w", err)
+	}
+
+	// Check which services need extraction
+	var missing []dockerService
+	for _, svc := range getDockerServices() {
+		svcDir := GetServicePath(binDir, svc.Name)
+		if !dirExists(svcDir) {
+			missing = append(missing, svc)
+		}
+	}
+
+	if len(missing) == 0 {
+		return nil
+	}
+
+	// Verify docker is available
+	if _, err := exec.LookPath("docker"); err != nil {
+		return fmt.Errorf("docker is required to extract service binaries: %w", err)
+	}
+
+	// Check if Node.js is needed and available
+	needsNode := false
+	for _, svc := range missing {
+		if svc.NeedsNode {
+			needsNode = true
+			break
+		}
+	}
+	if needsNode {
+		if _, err := exec.LookPath("node"); err != nil {
+			return fmt.Errorf("node is required for storage/pgmeta/studio services: %w", err)
+		}
+	}
+
+	// Build status display for Docker extraction
+	statuses := make([]*BinaryStatus, len(missing))
+	for i, svc := range missing {
+		statuses[i] = &BinaryStatus{Name: svc.Name, Downloading: true}
+	}
+
+	// Print initial status
+	for _, s := range statuses {
+		icon := utils.Aqua(spinnerFrames[0])
+		fmt.Fprintf(os.Stderr, " %s %s Extracting from Docker\n", icon, s.Name)
+	}
+
+	// Start spinner
+	done := make(chan struct{})
+	spinnerDone := make(chan struct{})
+	go func() {
+		defer close(spinnerDone)
+		frame := 0
+		ticker := time.NewTicker(SpinnerTickInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				frame = (frame + 1) % len(spinnerFrames)
+				printDockerStatus(statuses, frame, false)
+			}
+		}
+	}()
+
+	// Extract in parallel
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(missing))
+
+	for i, svc := range missing {
+		wg.Add(1)
+		go func(idx int, s dockerService) {
+			defer wg.Done()
+			if err := extractDockerService(ctx, binDir, s); err != nil {
+				statuses[idx].markError(err)
+				errChan <- fmt.Errorf("%s: %w", s.Name, err)
+				return
+			}
+			statuses[idx].markDone()
+		}(i, svc)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	// Stop spinner
+	close(done)
+	<-spinnerDone
+
+	// Print final status
+	printDockerStatus(statuses, 0, true)
+
+	// Collect errors
+	var errs []error
+	for err := range errChan {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+
+	// Post-extraction fixups
+	if err := applyPostExtractionFixups(binDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: post-extraction fixups: %v\n", err)
+	}
+
+	return nil
+}
+
+// extractDockerService extracts a single service from its Docker image.
+func extractDockerService(ctx context.Context, binDir string, svc dockerService) error {
+	destDir := GetServicePath(binDir, svc.Name)
+	containerName := fmt.Sprintf("supabase-extract-%s-%d", svc.Name, os.Getpid())
+
+	// Pull image if not available locally
+	pullCmd := exec.CommandContext(ctx, "docker", "pull", svc.Image)
+	if out, err := pullCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("docker pull %s failed: %s: %w", svc.Image, string(out), err)
+	}
+
+	// Create container (not started)
+	createCmd := exec.CommandContext(ctx, "docker", "create", "--name", containerName, svc.Image)
+	if out, err := createCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("docker create %s failed: %s: %w", svc.Image, string(out), err)
+	}
+
+	// Ensure cleanup — log errors so stale containers are diagnosable
+	defer func() {
+		rmCmd := exec.Command("docker", "rm", containerName)
+		if out, err := rmCmd.CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to remove container %s: %s: %v\n", containerName, string(out), err)
+		}
+	}()
+
+	// Create destination
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return fmt.Errorf("failed to create %s: %w", destDir, err)
+	}
+
+	// Copy files out
+	cpCmd := exec.CommandContext(ctx, "docker", "cp", containerName+":"+svc.SrcPath, destDir+"/")
+	if out, err := cpCmd.CombinedOutput(); err != nil {
+		// Cleanup partial extraction on failure
+		os.RemoveAll(destDir)
+		return fmt.Errorf("docker cp from %s failed: %s: %w", svc.Image, string(out), err)
+	}
+
+	return nil
+}
+
+// applyPostExtractionFixups applies host-specific fixups after Docker extraction.
+// Ported from supabase-unified/extract.sh.
+func applyPostExtractionFixups(binDir string) error {
+	// Rebuild fs-xattr native addon for host Node.js (storage service).
+	// Only attempt if npm is available to avoid noisy failures on systems
+	// where Node is installed without npm.
+	fsXattrDir := filepath.Join(GetServicePath(binDir, "storage"), "node_modules", "fs-xattr")
+	if dirExists(fsXattrDir) {
+		if _, err := exec.LookPath("npm"); err == nil {
+			cmd := exec.Command("npm", "rebuild")
+			cmd.Dir = fsXattrDir
+			if out, err := cmd.CombinedOutput(); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: npm rebuild fs-xattr failed: %s: %v\n", string(out), err)
+			}
+		}
+	}
+
+	// Sentry CPU profiler ABI symlink for postgres-meta
+	profilerDir := filepath.Join(GetServicePath(binDir, "pgmeta"), "node_modules", "@sentry-internal", "node-cpu-profiler", "lib")
+	if dirExists(profilerDir) {
+		fixSentryABI(profilerDir)
+	}
+
+	return nil
+}
+
+// fixSentryABI creates an ABI symlink for the Sentry CPU profiler.
+// The Docker image ships binaries for Node 18/20/22 (ABI 108/115/127).
+// If the host has a newer ABI, create a symlink to suppress warnings.
+func fixSentryABI(profilerDir string) {
+	// Get host Node.js ABI
+	out, err := exec.Command("node", "-e", "process.stdout.write(process.versions.modules)").Output()
+	if err != nil {
+		return
+	}
+	hostABI := strings.TrimSpace(string(out))
+	if hostABI == "" {
+		return
+	}
+
+	target := filepath.Join(profilerDir, fmt.Sprintf("sentry_cpu_profiler-linux-x64-glibc-%s.node", hostABI))
+	if fileExistsOS(target) {
+		return
+	}
+
+	// Find the highest available ABI binary (deterministic: sorted by name,
+	// ABI numbers are zero-padded in filenames so lexicographic == numeric order).
+	entries, err := os.ReadDir(profilerDir)
+	if err != nil {
+		return
+	}
+
+	const prefix = "sentry_cpu_profiler-linux-x64-glibc-"
+	var best string
+	var bestABI int
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".node") {
+			continue
+		}
+		// Extract ABI number: "sentry_cpu_profiler-linux-x64-glibc-127.node" → "127"
+		abiStr := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".node")
+		abi := 0
+		for _, c := range abiStr {
+			if c >= '0' && c <= '9' {
+				abi = abi*10 + int(c-'0')
+			}
+		}
+		if abi > bestABI {
+			bestABI = abi
+			best = name
+		}
+	}
+	if best != "" {
+		if err := os.Symlink(best, target); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to create Sentry ABI symlink: %v\n", err)
+		}
+	}
+}
+
+// printDockerStatus prints the Docker extraction status display.
+func printDockerStatus(statuses []*BinaryStatus, spinnerFrame int, final bool) {
+	for range statuses {
+		fmt.Fprint(os.Stderr, "\033[A\033[K")
+	}
+
+	for _, s := range statuses {
+		s.mu.Lock()
+		var icon, status string
+		if s.Error != nil {
+			icon = utils.Red("✗")
+			status = fmt.Sprintf("Error - %v", s.Error)
+		} else if s.Downloading {
+			icon = utils.Aqua(spinnerFrames[spinnerFrame])
+			status = "Extracting from Docker"
+		} else {
+			icon = utils.Green("✔")
+			status = "Extracted"
+		}
+		fmt.Fprintf(os.Stderr, " %s %s %s\n", icon, s.Name, status)
+		s.mu.Unlock()
+	}
+}
+
+// dirExists checks if a directory exists and contains at least one entry.
+func dirExists(path string) bool {
+	entries, err := os.ReadDir(path)
+	return err == nil && len(entries) > 0
+}
+
+// fileExistsOS checks if a file exists using the OS filesystem.
+func fileExistsOS(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 // BinaryStatus represents the installation status of a binary.
 type BinaryStatus struct {
 	Name            string
@@ -137,8 +449,11 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 	postgresCached := fileExists(fsys, postgresBin)
 	pcCached := fileExists(fsys, pcPath)
 
-	// If all cached, nothing to do
+	// If all GitHub binaries are cached, skip download phase but still check Docker services
 	if gotrueCached && postgrestCached && postgresCached && pcCached {
+		if err := InstallDockerServices(ctx, binDir); err != nil {
+			return "", fmt.Errorf("docker service extraction: %w", err)
+		}
 		return postgresVersion, nil
 	}
 
@@ -278,6 +593,11 @@ func InstallBinaries(ctx context.Context, fsys afero.Fs, binDir string) (postgre
 	}
 	if len(errs) > 0 {
 		return "", errors.Join(errs...)
+	}
+
+	// Extract Docker-based services (realtime, logflare, storage, pgmeta, studio)
+	if err := InstallDockerServices(ctx, binDir); err != nil {
+		return "", fmt.Errorf("docker service extraction: %w", err)
 	}
 
 	return postgresVersion, nil

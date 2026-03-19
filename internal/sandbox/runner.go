@@ -63,6 +63,28 @@ type processComposeConfig struct {
 	AnonKey        string
 	AnonJWT        string
 
+	// New service paths and ports
+	RealtimePath     string
+	RealtimePort     int
+	LogflarePath     string
+	LogflarePort     int
+	StoragePath      string
+	StoragePort      int
+	StorageAdminPort int
+	PgMetaPath       string
+	PgMetaPort       int
+	StudioPath       string
+	StudioPort       int
+
+	// Shared secrets for Elixir services
+	SecretKeyBase      string
+	RealtimeErlAflags  string // e.g. "-proto_dist inet_tcp" or "-proto_dist inet6_tcp"
+	RealtimeEncKey     string // DB_ENC_KEY for realtime
+	RealtimeIpVersion  string // "ipv4" or "ipv6"
+
+	// Storage data directory
+	StorageDataDir string
+
 	// JWT configuration
 	JwtSecret     string
 	JwtExpiry     uint
@@ -268,6 +290,10 @@ func GenerateProcessComposeConfig(goCtx context.Context, ctx *SandboxContext, po
 		rateLimitEmailSent = utils.Config.Auth.RateLimit.EmailSent
 	}
 
+	// Use the pre-generated SecretKeyBase from the realtime config so sandbox
+	// matches the defaults and behavior of the standard (Docker) stack.
+	secretKeyBase := utils.Config.Realtime.SecretKeyBase
+
 	// Build postgres paths
 	postgresDir := GetPostgresDir(ctx.BinDir, postgresVersion)
 
@@ -298,6 +324,24 @@ func GenerateProcessComposeConfig(goCtx context.Context, ctx *SandboxContext, po
 		ServiceRoleJWT: utils.Config.Auth.ServiceRoleKey.Value,
 		AnonKey:        utils.Config.Auth.PublishableKey.Value,
 		AnonJWT:        utils.Config.Auth.AnonKey.Value,
+
+		// New services
+		RealtimePath:     GetServicePath(ctx.BinDir, "realtime"),
+		RealtimePort:     ctx.Ports.Realtime,
+		LogflarePath:     GetServicePath(ctx.BinDir, "logflare"),
+		LogflarePort:     ctx.Ports.Logflare,
+		StoragePath:      GetServicePath(ctx.BinDir, "storage"),
+		StoragePort:      ctx.Ports.Storage,
+		StorageAdminPort: ctx.Ports.StorageAdmin,
+		PgMetaPath:       GetServicePath(ctx.BinDir, "pgmeta"),
+		PgMetaPort:       ctx.Ports.PgMeta,
+		StudioPath:       GetServicePath(ctx.BinDir, "studio"),
+		StudioPort:       ctx.Ports.Studio,
+		SecretKeyBase:     secretKeyBase,
+		RealtimeErlAflags: utils.ToRealtimeEnv(utils.Config.Realtime.IpVersion),
+		RealtimeEncKey:    utils.Config.Realtime.EncryptionKey,
+		RealtimeIpVersion: strings.ToLower(string(utils.Config.Realtime.IpVersion)),
+		StorageDataDir:    ctx.StorageDataDir(),
 
 		// JWT configuration
 		JwtSecret:     utils.Config.Auth.JwtSecret.Value,

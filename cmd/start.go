@@ -80,7 +80,7 @@ func init() {
 	flags.StringSliceVarP(&excludedContainers, "exclude", "x", []string{}, "Names of containers to not start. ["+names+"]")
 	flags.BoolVar(&ignoreHealthCheck, "ignore-health-check", false, "Ignore unhealthy services and exit 0")
 	flags.BoolVar(&preview, "preview", false, "Connect to feature preview branch")
-	flags.BoolVar(&sandboxMode, "sandbox", false, "Run in sandbox mode using native binaries (experimental)")
+	flags.BoolVar(&sandboxMode, "sandbox", false, "Run all services natively without Docker Compose (postgres, auth, rest, realtime, storage, analytics, meta, studio)")
 	flags.BoolVar(&reloadConfig, "reload", false, "Hot-reload sandbox configuration without full restart (requires --sandbox)")
 	cobra.CheckErr(flags.MarkHidden("preview"))
 	rootCmd.AddCommand(startCmd)

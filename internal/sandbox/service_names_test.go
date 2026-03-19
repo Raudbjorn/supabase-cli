@@ -15,7 +15,12 @@ func TestResolveProcessName(t *testing.T) {
 		{name: "auth maps to gotrue", input: "auth", want: "gotrue"},
 		{name: "rest maps to postgrest", input: "rest", want: "postgrest"},
 		{name: "api maps to proxy", input: "api", want: "proxy"},
-		{name: "unknown service", input: "storage", wantErr: true},
+		{name: "realtime maps to realtime", input: "realtime", want: "realtime"},
+		{name: "storage maps to storage-api", input: "storage", want: "storage-api"},
+		{name: "analytics maps to logflare", input: "analytics", want: "logflare"},
+		{name: "meta maps to postgres-meta", input: "meta", want: "postgres-meta"},
+		{name: "studio maps to studio", input: "studio", want: "studio"},
+		{name: "unknown service", input: "billing", wantErr: true},
 		{name: "empty string", input: "", wantErr: true},
 		{name: "postgres is not user-facing", input: "postgres", wantErr: true},
 		{name: "gotrue is not user-facing", input: "gotrue", wantErr: true},
@@ -41,9 +46,9 @@ func TestResolveProcessName(t *testing.T) {
 func TestValidServiceNames(t *testing.T) {
 	names := ValidServiceNames()
 
-	// Should contain exactly 4 services
-	if len(names) != 4 {
-		t.Fatalf("ValidServiceNames() returned %d names, want 4", len(names))
+	// Should contain exactly 9 services
+	if len(names) != 9 {
+		t.Fatalf("ValidServiceNames() returned %d names, want 9", len(names))
 	}
 
 	// Should be sorted
@@ -55,10 +60,30 @@ func TestValidServiceNames(t *testing.T) {
 	}
 
 	// Should contain expected names
-	expected := map[string]bool{"api": true, "auth": true, "db": true, "rest": true}
+	expected := map[string]bool{
+		"api": true, "auth": true, "db": true, "rest": true,
+		"realtime": true, "storage": true, "analytics": true,
+		"meta": true, "studio": true,
+	}
 	for _, name := range names {
 		if !expected[name] {
 			t.Errorf("ValidServiceNames() contains unexpected name %q", name)
+		}
+	}
+}
+
+func TestReverseLookup(t *testing.T) {
+	m := ReverseLookup()
+
+	// Every process-compose name should map back to a user-facing name
+	for userFacing, pcName := range serviceMapping {
+		got, ok := m[pcName]
+		if !ok {
+			t.Errorf("ReverseLookup() missing key %q (from %q)", pcName, userFacing)
+			continue
+		}
+		if got != userFacing {
+			t.Errorf("ReverseLookup()[%q] = %q, want %q", pcName, got, userFacing)
 		}
 	}
 }

@@ -119,6 +119,8 @@ func PrettyPrintSandbox(w io.Writer, sandboxCtx *SandboxContext) {
 	dbURL := fmt.Sprintf("postgresql://%s@127.0.0.1:%d/postgres",
 		url.UserPassword("postgres", utils.Config.Db.Password), ports.Postgres)
 
+	studioURL := fmt.Sprintf("http://127.0.0.1:%d", ports.Studio)
+
 	groups := []outputGroup{
 		{
 			Name: "🌐 APIs",
@@ -126,6 +128,9 @@ func PrettyPrintSandbox(w io.Writer, sandboxCtx *SandboxContext) {
 				{Label: "API URL", Value: apiURL, Type: outputLink},
 				{Label: "REST", Value: fmt.Sprintf("%s/rest/v1/", apiURL), Type: outputLink},
 				{Label: "Auth", Value: fmt.Sprintf("%s/auth/v1/", apiURL), Type: outputLink},
+				{Label: "Realtime", Value: fmt.Sprintf("%s/realtime/v1/", apiURL), Type: outputLink},
+				{Label: "Storage", Value: fmt.Sprintf("%s/storage/v1/", apiURL), Type: outputLink},
+				{Label: "Studio", Value: studioURL, Type: outputLink},
 			},
 		},
 		{

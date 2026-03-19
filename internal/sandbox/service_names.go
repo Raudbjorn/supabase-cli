@@ -9,10 +9,15 @@ import (
 // Only long-running services are included; one-shot processes (postgres-init, gotrue-migrate)
 // are excluded since they don't make sense for restart/stop/start operations.
 var serviceMapping = map[string]string{
-	"db":   "postgres",
-	"auth": "gotrue",
-	"rest": "postgrest",
-	"api":  "proxy",
+	"db":        "postgres",
+	"auth":      "gotrue",
+	"rest":      "postgrest",
+	"api":       "proxy",
+	"realtime":  "realtime",
+	"storage":   "storage-api",
+	"analytics": "logflare",
+	"meta":      "postgres-meta",
+	"studio":    "studio",
 }
 
 // ResolveProcessName maps a user-facing service name to the corresponding

@@ -10,6 +10,8 @@ var (
 	proxyGotruePort         int
 	proxyPostgrestPort      int
 	proxyPostgrestAdminPort int
+	proxyRealtimePort       int
+	proxyStoragePort        int
 	proxyServiceRoleKey     string
 	proxyServiceRoleJWT     string
 	proxyAnonKey            string
@@ -28,6 +30,8 @@ var (
 				GoTruePort:         proxyGotruePort,
 				PostgRESTPort:      proxyPostgrestPort,
 				PostgRESTAdminPort: proxyPostgrestAdminPort,
+				RealtimePort:       proxyRealtimePort,
+				StoragePort:        proxyStoragePort,
 				ServiceRoleKey:     proxyServiceRoleKey,
 				ServiceRoleJWT:     proxyServiceRoleJWT,
 				AnonKey:            proxyAnonKey,
@@ -44,6 +48,8 @@ func init() {
 	flags.IntVar(&proxyGotruePort, "gotrue-port", 0, "GoTrue backend port")
 	flags.IntVar(&proxyPostgrestPort, "postgrest-port", 0, "PostgREST backend port")
 	flags.IntVar(&proxyPostgrestAdminPort, "postgrest-admin-port", 0, "PostgREST admin backend port")
+	flags.IntVar(&proxyRealtimePort, "realtime-port", 0, "Realtime backend port")
+	flags.IntVar(&proxyStoragePort, "storage-port", 0, "Storage API backend port")
 	flags.StringVar(&proxyServiceRoleKey, "service-role-key", "", "Service role API key")
 	flags.StringVar(&proxyServiceRoleJWT, "service-role-jwt", "", "Service role JWT")
 	flags.StringVar(&proxyAnonKey, "anon-key", "", "Anonymous API key")
