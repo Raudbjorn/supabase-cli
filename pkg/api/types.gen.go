@@ -4655,8 +4655,9 @@ type V1RestorePointPostBody struct {
 
 // V1RestorePointResponse defines model for V1RestorePointResponse.
 type V1RestorePointResponse struct {
-	Name   string                       `json:"name"`
-	Status V1RestorePointResponseStatus `json:"status"`
+	CompletedOn nullable.Nullable[time.Time] `json:"completed_on"`
+	Name        string                       `json:"name"`
+	Status      V1RestorePointResponseStatus `json:"status"`
 }
 
 // V1RestorePointResponseStatus defines model for V1RestorePointResponse.Status.
@@ -4994,6 +4995,12 @@ type V1ApplyAMigrationParams struct {
 type V1UpsertAMigrationParams struct {
 	// IdempotencyKey A unique key to ensure the same migration is tracked only once.
 	IdempotencyKey *string `json:"Idempotency-Key,omitempty"`
+}
+
+// V1GetDatabaseOpenapiParams defines parameters for V1GetDatabaseOpenapi.
+type V1GetDatabaseOpenapiParams struct {
+	// Schema The database schema to generate the OpenAPI spec for
+	Schema *string `form:"schema,omitempty" json:"schema,omitempty"`
 }
 
 // V1CreateAFunctionParams defines parameters for V1CreateAFunction.
