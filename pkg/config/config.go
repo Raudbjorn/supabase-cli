@@ -225,6 +225,12 @@ type (
 		Enabled bool `toml:"enabled" json:"enabled"`
 	}
 
+	PgDeltaConfig struct {
+		Enabled               bool   `toml:"enabled" json:"enabled"`
+		DeclarativeSchemaPath string `toml:"declarative_schema_path" json:"declarative_schema_path"`
+		FormatOptions         string `toml:"format_options" json:"format_options"`
+	}
+
 	inspect struct {
 		Rules []rule `toml:"rules" json:"rules"`
 	}
@@ -237,13 +243,14 @@ type (
 	}
 
 	experimental struct {
-		OrioleDBVersion string    `toml:"orioledb_version" json:"orioledb_version"`
-		S3Host          string    `toml:"s3_host" json:"s3_host"`
-		S3Region        string    `toml:"s3_region" json:"s3_region"`
-		S3AccessKey     string    `toml:"s3_access_key" json:"s3_access_key"`
-		S3SecretKey     string    `toml:"s3_secret_key" json:"s3_secret_key"`
-		Webhooks        *webhooks `toml:"webhooks" json:"webhooks"`
-		Inspect         inspect   `toml:"inspect" json:"inspect"`
+		OrioleDBVersion string         `toml:"orioledb_version" json:"orioledb_version"`
+		S3Host          string         `toml:"s3_host" json:"s3_host"`
+		S3Region        string         `toml:"s3_region" json:"s3_region"`
+		S3AccessKey     string         `toml:"s3_access_key" json:"s3_access_key"`
+		S3SecretKey     string         `toml:"s3_secret_key" json:"s3_secret_key"`
+		Webhooks        *webhooks      `toml:"webhooks" json:"webhooks"`
+		PgDelta         *PgDeltaConfig `toml:"pgdelta" json:"pgdelta"`
+		Inspect         inspect        `toml:"inspect" json:"inspect"`
 	}
 )
 
@@ -252,6 +259,11 @@ func (a *auth) Clone() auth {
 	if copy.Captcha != nil {
 		capt := *a.Captcha
 		copy.Captcha = &capt
+	}
+	if copy.Passkey != nil {
+		passkey := *a.Passkey
+		passkey.RpOrigins = slices.Clone(a.Passkey.RpOrigins)
+		copy.Passkey = &passkey
 	}
 	copy.External = maps.Clone(a.External)
 	if a.Email.Smtp != nil {
@@ -314,6 +326,10 @@ func (c *baseConfig) Clone() baseConfig {
 	if c.Experimental.Webhooks != nil {
 		webhooks := *c.Experimental.Webhooks
 		copy.Experimental.Webhooks = &webhooks
+	}
+	if c.Experimental.PgDelta != nil {
+		pgDelta := *c.Experimental.PgDelta
+		copy.Experimental.PgDelta = &pgDelta
 	}
 	return copy
 }
@@ -772,6 +788,11 @@ func (c *baseConfig) resolve(builder pathBuilder, fsys fs.FS) error {
 			c.Db.Migrations.SchemaPaths[i] = path.Join(builder.SupabaseDirPath, pattern)
 		}
 	}
+	if c.Experimental.PgDelta != nil &&
+		len(c.Experimental.PgDelta.DeclarativeSchemaPath) > 0 &&
+		!filepath.IsAbs(c.Experimental.PgDelta.DeclarativeSchemaPath) {
+		c.Experimental.PgDelta.DeclarativeSchemaPath = path.Join(builder.SupabaseDirPath, c.Experimental.PgDelta.DeclarativeSchemaPath)
+	}
 	return nil
 }
 
@@ -898,6 +919,24 @@ func (c *config) Validate(fsys fs.FS) error {
 				return errors.Errorf("failed to read signing keys: %w", err)
 			} else if c.Auth.SigningKeys, err = fetcher.ParseJSON[[]JWK](f); err != nil {
 				return errors.Errorf("failed to decode signing keys: %w", err)
+			}
+		}
+		if c.Auth.Passkey != nil {
+			if c.Auth.Passkey.Enabled {
+				if len(c.Auth.Passkey.RpId) == 0 {
+					return errors.New("Missing required field in config: auth.passkey.rp_id")
+				}
+				if len(c.Auth.Passkey.RpOrigins) == 0 {
+					return errors.New("Missing required field in config: auth.passkey.rp_origins")
+				}
+				if err := assertEnvLoaded(c.Auth.Passkey.RpId); err != nil {
+					return errors.Errorf("Invalid config for auth.passkey.rp_id: %v", err)
+				}
+				for i, origin := range c.Auth.Passkey.RpOrigins {
+					if err := assertEnvLoaded(origin); err != nil {
+						return errors.Errorf("Invalid config for auth.passkey.rp_origins[%d]: %v", i, err)
+					}
+				}
 			}
 		}
 		if err := c.Auth.Hook.validate(); err != nil {
@@ -1613,6 +1652,9 @@ func ToTomlBytes(config any) ([]byte, error) {
 func (e *experimental) validate() error {
 	if e.Webhooks != nil && !e.Webhooks.Enabled {
 		return errors.Errorf("Webhooks cannot be deactivated. [experimental.webhooks] enabled can either be true or left undefined")
+	}
+	if e.PgDelta != nil && len(e.PgDelta.FormatOptions) > 0 && !json.Valid([]byte(e.PgDelta.FormatOptions)) {
+		return errors.Errorf("Invalid config for experimental.pgdelta.format_options: must be valid JSON")
 	}
 	return nil
 }

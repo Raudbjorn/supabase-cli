@@ -1,14 +1,16 @@
-# Supabase CLI (Fork — Full Native Sandbox)
+# Supabase CLI (Fork)
 
-Fork of the [Supabase CLI](https://github.com/supabase/cli) with an expanded `--sandbox` mode that runs **all 8 core services** natively — no Docker Compose at runtime.
+Fork of the [Supabase CLI](https://github.com/supabase/cli) with a full native sandbox mode, dependency optimizations, and targeted bug fixes.
 
-## Sandbox Mode
+## Fork Improvements
+
+### Full Native Sandbox (`--sandbox`)
+
+Expands the upstream `--sandbox` mode from 4 services to **all 8 core services** — no Docker Compose at runtime.
 
 ```bash
 supabase start --sandbox
 ```
-
-Starts a full local Supabase stack using native binaries and [process-compose](https://github.com/F1bonacc1/process-compose):
 
 | Service | Binary Source | Description |
 |---------|-------------|-------------|
@@ -21,48 +23,58 @@ Starts a full local Supabase stack using native binaries and [process-compose](h
 | **postgres-meta** | Docker extraction | Database introspection API |
 | **studio** | Docker extraction | Web-based admin dashboard |
 
-Plus a built-in **reverse proxy** that routes all traffic through a single API URL.
+#### Built-in Reverse Proxy
 
-### Prerequisites
+All traffic routes through a single API URL with automatic `apikey` header to JWT transformation for publishable keys. Realtime WebSocket connections pass through without transformation.
 
-- **Docker** (build-time only — used to extract service binaries, not at runtime)
-- **Node.js** (for storage, postgres-meta, and studio)
-- Standard Supabase project with `config.toml`
+#### Process-Compose Orchestration
 
-### How It Works
+Services are managed by [process-compose](https://github.com/F1bonacc1/process-compose) with:
+- Dynamic port allocation avoiding conflicts
+- Health checks and dependency ordering
+- Hot-reload via `--reload` flag
+- Full REST API for service introspection
 
-1. Downloads auth, postgrest, postgres, and process-compose from GitHub releases
-2. Extracts realtime, logflare, storage, pgmeta, and studio from official Docker images via `docker create` + `docker cp`
-3. Generates a `process-compose.yaml` from your project's `config.toml`
-4. Orchestrates all services with dynamic port allocation and health checks
+#### Docker Extraction (Build-Time Only)
 
-Binaries are cached at `~/.supabase/bin/` and reused across projects.
+Docker is used once to extract service binaries (`docker create` + `docker cp`), then never again at runtime. Image tags are read from `pkg/config/templates/Dockerfile` via `config.Images`, staying in sync with upstream automatically. Binaries are cached at `~/.supabase/bin/` and reused across projects.
 
-### Commands
+#### Sandbox Commands
 
 ```bash
 supabase start --sandbox          # Start all services
 supabase start --sandbox --reload # Hot-reload config without restart
 supabase stop                     # Stop all services
 supabase status                   # Show service URLs and ports
-supabase logs [service]           # Stream logs (db, auth, rest, realtime, storage, analytics, meta, studio)
+supabase logs [service]           # Stream logs (--follow for live streaming)
 supabase restart [service]        # Restart a specific service
 ```
 
-### Output
+#### Prerequisites
 
-```text
-APIs:
-  API URL:     http://127.0.0.1:{api}
-  REST:        http://127.0.0.1:{api}/rest/v1/
-  Auth:        http://127.0.0.1:{api}/auth/v1/
-  Realtime:    http://127.0.0.1:{api}/realtime/v1/
-  Storage:     http://127.0.0.1:{api}/storage/v1/
-  Studio:      http://127.0.0.1:{studio}
+- **Docker** (build-time only — for extracting service binaries)
+- **Node.js** (for storage, postgres-meta, and studio)
+- **Linux** (Docker-extracted services contain Linux binaries)
 
-Database:
-  URL:         postgresql://postgres:postgres@127.0.0.1:{db}/postgres
-```
+### Live Log Streaming (`supabase logs`)
+
+New `supabase logs` command with `--follow` flag for real-time log streaming via WebSocket. Supports filtering by service name (`db`, `auth`, `rest`, `realtime`, `storage`, `analytics`, `meta`, `studio`).
+
+### Dependency Optimizations
+
+Lightweight stub replacements that eliminate heavy transitive dependencies, significantly reducing build times and binary size:
+
+- **go-ethereum stub** — Replaces the full `go-ethereum` dependency (pulled transitively by `docker/compose/v2`) with a minimal `decred/dcrd/dcrec/secp256k1` stub that satisfies the `crypto/secp256k1` interface.
+- **containers/common stub** — Replaces the full `containers/common` package with a minimal `libnetwork/types` stub providing only the type definitions actually used.
+- **Direct Docker API** — Replaces `docker/compose/v2` with direct `docker/docker` client API calls, removing the Compose dependency entirely.
+
+### Bug Fixes (Not Yet Upstream)
+
+- **Kong worker exhaustion** — Removed hardcoded `KONG_NGINX_WORKER_PROCESSES=1` that caused Kong to stop responding under load. Kong now auto-detects the appropriate worker count.
+- **MCP Kong route matching** — Fixed route path matching in Kong configuration for MCP endpoints.
+- **`sslmode=disable` honored** — Database connections now correctly respect `sslmode=disable` in connection strings.
+- **Snippets pagination** — `supabase snippets list` now handles paginated responses from the API instead of returning only the first page.
+- **Masked secrets input** — `supabase secrets set` supports interactive masked input with proper non-ASCII byte handling.
 
 ## Building from Source
 
@@ -75,7 +87,7 @@ Requires Go >= 1.22.
 
 ## Upstream
 
-This fork tracks the upstream `develop` branch. The sandbox expansion lives on the `feature/full-sandbox` branch.
+This fork tracks the upstream `develop` branch.
 
 - Upstream: https://github.com/supabase/cli
 - Docs: https://supabase.com/docs/reference/cli/about
