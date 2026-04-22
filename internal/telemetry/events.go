@@ -1,5 +1,7 @@
 package telemetry
 
+import "context"
+
 // CLI telemetry catalog.
 //
 // This file is the single place to review what analytics events the CLI sends
@@ -32,7 +34,33 @@ const (
 	//     added directly by this event, but linked project groups may still be
 	//     attached when available.
 	EventStackStarted = "cli_stack_started"
+	//   - EventUpgradeSuggested: sent when a CLI command hits a plan-gated
+	//     feature and displays a billing upgrade link. This helps identify
+	//     which plan gates users encounter most often so we can improve
+	//     error messages and documentation. Event-specific properties are
+	//     PropFeatureKey (the entitlement key that was gated) and PropOrgSlug
+	//     (the organization slug, empty if lookup failed).
+	EventUpgradeSuggested = "cli_upgrade_suggested"
 )
+
+// Properties specific to EventUpgradeSuggested.
+const (
+	// PropFeatureKey is the entitlement key that triggered the upgrade suggestion.
+	PropFeatureKey = "feature_key"
+	// PropOrgSlug is the organization slug associated with the project.
+	PropOrgSlug = "org_slug"
+)
+
+// TrackUpgradeSuggested fires an EventUpgradeSuggested telemetry event.
+// Safe to call with any context; no-ops when telemetry is not configured.
+func TrackUpgradeSuggested(ctx context.Context, featureKey, orgSlug string) {
+	if svc := FromContext(ctx); svc != nil {
+		_ = svc.Capture(ctx, EventUpgradeSuggested, map[string]any{
+			PropFeatureKey: featureKey,
+			PropOrgSlug:    orgSlug,
+		}, nil)
+	}
+}
 
 // Shared event properties added to every captured event by Service.Capture.
 const (

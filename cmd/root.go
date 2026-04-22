@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/getsentry/sentry-go"
@@ -140,6 +141,18 @@ var (
 			} else {
 				ctx = telemetry.WithService(ctx, service)
 			}
+			if service != nil {
+				var stitchOnce sync.Once
+				utils.OnGotrueID = func(gotrueID string) {
+					if service.NeedsIdentityStitch() {
+						stitchOnce.Do(func() {
+							if err := service.StitchLogin(gotrueID); err != nil {
+								fmt.Fprintln(utils.GetDebugLogger(), err)
+							}
+						})
+					}
+				}
+			}
 			ctx = telemetry.WithCommandContext(ctx, commandAnalyticsContext(cmd))
 			cmd.SetContext(ctx)
 			// Setup sentry last to ignore errors from parsing cli flags
@@ -160,6 +173,7 @@ func Execute() {
 	executedCmd, err := rootCmd.ExecuteC()
 	if executedCmd != nil {
 		if service := telemetry.FromContext(executedCmd.Context()); service != nil {
+			ensureProjectGroupsCached(executedCmd.Context(), service)
 			_ = service.Capture(executedCmd.Context(), telemetry.EventCommandExecuted, map[string]any{
 				telemetry.PropExitCode:   exitCode(err),
 				telemetry.PropDurationMs: time.Since(startedAt).Milliseconds(),
@@ -185,6 +199,35 @@ func Execute() {
 	if len(utils.CmdSuggestion) > 0 {
 		fmt.Fprintln(os.Stderr, utils.CmdSuggestion)
 	}
+}
+
+// ensureProjectGroupsCached populates the telemetry linked-project cache when
+// a project ref is available but no cache exists. This ensures org/project
+// PostHog groups are attached to all CLI events, not just those after `supabase link`.
+//
+// Does not overwrite an existing cache — `supabase link` is the authoritative source.
+// Checks auth before calling the API to avoid the log.Fatalln in GetSupabase().
+func ensureProjectGroupsCached(ctx context.Context, service *telemetry.Service) {
+	ref := flags.ProjectRef
+	if ref == "" {
+		return
+	}
+	fsys := afero.NewOsFs()
+	if telemetry.HasLinkedProject(fsys) {
+		return
+	}
+	if _, err := utils.LoadAccessTokenFS(fsys); err != nil {
+		return
+	}
+	resp, err := utils.GetSupabase().V1GetProjectWithResponse(ctx, ref)
+	if err != nil {
+		fmt.Fprintln(utils.GetDebugLogger(), err)
+		return
+	}
+	if resp.JSON200 == nil {
+		return
+	}
+	telemetry.CacheProjectAndIdentifyGroups(*resp.JSON200, service, fsys)
 }
 
 func exitCode(err error) int {
