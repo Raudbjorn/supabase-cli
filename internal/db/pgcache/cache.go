@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-errors/errors"
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgx/v4"
 	"github.com/spf13/afero"
@@ -34,7 +35,7 @@ import {
   extractCatalog,
   serializeCatalog,
   stringifyCatalogSnapshot,
-} from "npm:@supabase/pg-delta@1.0.0-alpha.17";
+} from "npm:@supabase/pg-delta@1.0.0-alpha.20";
 const target = Deno.env.get("TARGET");
 const role = Deno.env.get("ROLE") ?? undefined;
 if (!target) {
@@ -255,5 +256,9 @@ func exportCatalog(ctx context.Context, targetRef string, options ...func(*pgx.C
 	if err := utils.RunEdgeRuntimeScript(ctx, env, pgDeltaCatalogExportTS, binds, "error exporting pg-delta catalog", &stdout, &stderr); err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(stdout.String()), nil
+	snapshot := strings.TrimSpace(stdout.String())
+	if len(snapshot) == 0 {
+		return "", errors.Errorf("error exporting pg-delta catalog: edge-runtime script produced no output:\n%s", stderr.String())
+	}
+	return snapshot, nil
 }
