@@ -1,15 +1,18 @@
 import { Layer } from "effect";
 import type * as HttpClient from "effect/unstable/http/HttpClient";
+import { FetchHttpClient } from "effect/unstable/http";
 
 import { LegacyCredentials } from "../auth/legacy-credentials.service.ts";
 import { legacyCredentialsLayer } from "../auth/legacy-credentials.layer.ts";
 import { legacyHttpClientLayer } from "../auth/legacy-http-debug.layer.ts";
+import { legacyPlatformApiFactoryFromApiLayer } from "../auth/legacy-platform-api-factory.layer.ts";
 import { LegacyPlatformApi } from "../auth/legacy-platform-api.service.ts";
 import { legacyPlatformApiLayer } from "../auth/legacy-platform-api.layer.ts";
 import { LegacyCliConfig } from "../config/legacy-cli-config.service.ts";
 import { legacyCliConfigLayer } from "../config/legacy-cli-config.layer.ts";
 import { LegacyProjectRefResolver } from "../config/legacy-project-ref.service.ts";
 import { legacyProjectRefLayer } from "../config/legacy-project-ref.layer.ts";
+import { legacyDebugLoggerLayer } from "./legacy-debug-logger.layer.ts";
 import { LegacyLinkedProjectCache } from "../telemetry/legacy-linked-project-cache.service.ts";
 import { legacyLinkedProjectCacheLayer } from "../telemetry/legacy-linked-project-cache.layer.ts";
 import { LegacyTelemetryState } from "../telemetry/legacy-telemetry-state.service.ts";
@@ -17,27 +20,18 @@ import { legacyTelemetryStateLayer } from "../telemetry/legacy-telemetry-state.l
 import { CommandRuntime } from "../../shared/runtime/command-runtime.service.ts";
 import { commandRuntimeLayer } from "../../shared/runtime/command-runtime.layer.ts";
 
-// Shared platform-API stack used by every Management-API legacy subcommand.
-// `legacyHttpClientLayer` wraps the default fetch transport with a debug logger when `--debug` is set.
-const legacyPlatformApiStack = legacyPlatformApiLayer.pipe(
-  Layer.provide(legacyCredentialsLayer),
-  Layer.provide(legacyCliConfigLayer),
-  Layer.provide(legacyHttpClientLayer),
-);
-
 /**
  * Composes the runtime layer for a Management-API-style `supabase <command> <subcommand>`
  * invocation.
  *
- * `legacyCliConfigLayer` must be piped to both `legacyPlatformApiStack` and
+ * `legacyCliConfigLayer` must be piped to both the platform API stack and
  * `legacyProjectRefLayer`. `Layer.provide` satisfies a requirement on the target layer;
  * it does not expose the provided service to siblings of a `Layer.mergeAll(...)`. The
  * project-ref layer reads `LegacyCliConfig` directly for workdir/projectId resolution,
  * so without an explicit provide here the bundled runtime panics with
  * `Service not found: supabase/legacy/CliConfig`. Handlers that yield `LegacyCliConfig`
  * directly (e.g. `branches get`, `legacySuggestUpgrade`) also need the service exposed
- * at the top level of the merged layer, hence the bare `legacyCliConfigLayer` entry
- * below.
+ * at the top level of the merged layer, hence the top-level `cliConfig` entry below.
  *
  * `legacyHttpClientLayer` and `LegacyCredentials` are exposed at the top level so
  * handlers / helpers that bypass the typed Management API client can read them
@@ -55,23 +49,37 @@ const legacyPlatformApiStack = legacyPlatformApiLayer.pipe(
  * @param subcommand - command path segments after `supabase`, e.g. `["backups", "list"]`.
  */
 export function legacyManagementApiRuntimeLayer(subcommand: ReadonlyArray<string>) {
-  // Memoise the credentials layer so the top-level surface and the linked-project
-  // cache pipeline share one keyring/file lookup. Same rationale applies to the
-  // HTTP client + CLI config layers below.
-  const credentials = legacyCredentialsLayer.pipe(Layer.provide(legacyCliConfigLayer));
+  // Memoise the shared layers so the platform API, top-level service surface,
+  // project resolver, and linked-project cache all reuse the same config /
+  // credentials / HTTP instances.
+  const cliConfig = legacyCliConfigLayer.pipe(Layer.provide(legacyDebugLoggerLayer));
+  const httpClient = legacyHttpClientLayer.pipe(Layer.provide(legacyDebugLoggerLayer));
+  const credentials = legacyCredentialsLayer.pipe(
+    Layer.provide(cliConfig),
+    Layer.provide(legacyDebugLoggerLayer),
+  );
+  // `legacyPlatformApiLayer` applies typed API debug logging after generated
+  // requests have been prefixed with the active profile's API URL.
+  const platformApiStack = legacyPlatformApiLayer.pipe(
+    Layer.provide(credentials),
+    Layer.provide(cliConfig),
+    Layer.provide(FetchHttpClient.layer),
+    Layer.provide(legacyDebugLoggerLayer),
+  );
+  const platformApiFactory = legacyPlatformApiFactoryFromApiLayer.pipe(
+    Layer.provide(platformApiStack),
+  );
   const built = Layer.mergeAll(
-    legacyPlatformApiStack,
-    legacyHttpClientLayer,
+    platformApiStack,
+    platformApiFactory,
+    httpClient,
     credentials,
-    legacyCliConfigLayer,
-    legacyProjectRefLayer.pipe(
-      Layer.provide(legacyPlatformApiStack),
-      Layer.provide(legacyCliConfigLayer),
-    ),
+    cliConfig,
+    legacyProjectRefLayer.pipe(Layer.provide(platformApiFactory), Layer.provide(cliConfig)),
     legacyLinkedProjectCacheLayer.pipe(
       Layer.provide(credentials),
-      Layer.provide(legacyCliConfigLayer),
-      Layer.provide(legacyHttpClientLayer),
+      Layer.provide(cliConfig),
+      Layer.provide(httpClient),
     ),
     legacyTelemetryStateLayer,
     commandRuntimeLayer([...subcommand]),
@@ -110,7 +118,7 @@ export function legacyManagementApiRuntimeLayer(subcommand: ReadonlyArray<string
  * provided by `runCli` / the shared `cliProgramFor`, not by this command-level
  * runtime layer.
  */
-export type LegacyManagementApiServices =
+type LegacyManagementApiServices =
   | LegacyPlatformApi
   | HttpClient.HttpClient
   | LegacyCredentials
@@ -119,3 +127,17 @@ export type LegacyManagementApiServices =
   | LegacyLinkedProjectCache
   | LegacyTelemetryState
   | CommandRuntime;
+
+/**
+ * The ambient services this runtime layer itself requires (global flags, root
+ * services, etc.) and the error it can fail with at build (access-token
+ * resolution). Exported as named types so consumers that provide this layer
+ * lazily (e.g. `legacy-db-config.layer.ts`'s `--linked` branch) can express
+ * their own requirement/error channels without re-deriving the structural
+ * inference at each call site.
+ */
+type LegacyManagementApiRuntime = ReturnType<typeof legacyManagementApiRuntimeLayer>;
+export type LegacyManagementApiRuntimeRequirements =
+  LegacyManagementApiRuntime extends Layer.Layer<infer _A, infer _E, infer R> ? R : never;
+export type LegacyManagementApiRuntimeError =
+  LegacyManagementApiRuntime extends Layer.Layer<infer _A, infer E, infer _R> ? E : never;
