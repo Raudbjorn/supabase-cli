@@ -51,7 +51,7 @@ func Run(ctx context.Context, fsys afero.Fs, excludedContainers []string, ignore
 		if err := utils.AssertSupabaseDbIsRunning(); err == nil {
 			fmt.Fprintln(os.Stderr, utils.Aqua("supabase start")+" is already running.")
 			names := status.CustomName{}
-			return status.Run(ctx, names, utils.OutputPretty, fsys)
+			return status.Run(ctx, names, utils.OutputPretty, fsys, ignoreHealthCheck, excludedContainers...)
 		} else if !errors.Is(err, utils.ErrNotRunning) {
 			return err
 		}
@@ -67,7 +67,7 @@ func Run(ctx context.Context, fsys afero.Fs, excludedContainers []string, ignore
 		Password: utils.Config.Db.Password,
 		Database: "postgres",
 	}
-	if err := run(ctx, fsys, excludedContainers, dbConfig); err != nil {
+	if err := run(ctx, fsys, excludedContainers, dbConfig, ignoreHealthCheck); err != nil {
 		if ignoreHealthCheck && start.IsUnhealthyError(err) {
 			fmt.Fprintln(os.Stderr, err)
 		} else {
@@ -169,7 +169,7 @@ func isPermanentError(err error) bool {
 // ImagePull wraps the Docker client's ImagePull with retry logic and registry auth
 func (cli *RetryClient) ImagePull(ctx context.Context, refStr string, options image.PullOptions) (io.ReadCloser, error) {
 	if len(options.RegistryAuth) == 0 {
-		options.RegistryAuth = utils.GetRegistryAuth()
+		options.RegistryAuth = utils.GetRegistryAuthForImage(refStr)
 	}
 	pull := func() (io.ReadCloser, error) {
 		resp, err := cli.Client.ImagePull(ctx, refStr, options)
@@ -221,7 +221,46 @@ func pullImages(ctx context.Context, project types.Project) error {
 	return nil
 }
 
-func run(ctx context.Context, fsys afero.Fs, excludedContainers []string, dbConfig pgconn.Config, options ...func(*pgx.ConnConfig)) error {
+// ensureImagesCached guarantees every image required by the project is present in
+// the local Docker cache before any container is started. The compose pre-pull is
+// best effort (PullOptions.IgnoreFailures) and only targets the primary registry,
+// so any image it skips would otherwise be pulled lazily by DockerStart while
+// containers are already starting. Resolving each image here, using the same
+// multi-registry fallback as DockerStart, keeps all pulls ahead of container start.
+//
+// project.Services[*].Image is the registry-normalized URL produced by GetServices
+// (via GetRegistryImageUrl), which DockerResolveImageIfNotCached expands back into
+// the same candidate set DockerStart later resolves against. On a warm cache this
+// is one ImageInspect per image (no pull, no output); that cost is intentional and
+// bounded by the fixed service count.
+func ensureImagesCached(ctx context.Context, project types.Project) error {
+	seen := make(map[string]struct{}, len(project.Services))
+	var images []string
+	for _, service := range project.Services {
+		if service.Image == "" {
+			continue
+		}
+		if _, ok := seen[service.Image]; ok {
+			continue
+		}
+		seen[service.Image] = struct{}{}
+		images = append(images, service.Image)
+	}
+	result := utils.WaitAll(images, func(image string) error {
+		_, err := utils.DockerResolveImageIfNotCached(ctx, image)
+		return err
+	})
+	// Set the install hint once, sequentially, after the concurrent resolve
+	// finishes, rather than from inside DockerResolveImageIfNotCached where the
+	// WaitAll goroutines would race on the CmdSuggestion global.
+	if err := errors.Join(result...); err != nil {
+		utils.SuggestDockerInstallIfConnectionFailed(err)
+		return err
+	}
+	return nil
+}
+
+func run(ctx context.Context, fsys afero.Fs, excludedContainers []string, dbConfig pgconn.Config, ignoreHealthCheck bool, options ...func(*pgx.ConnConfig)) error {
 	excluded := make(map[string]bool)
 	for _, name := range excludedContainers {
 		excluded[name] = true
@@ -242,6 +281,11 @@ func run(ctx context.Context, fsys afero.Fs, excludedContainers []string, dbConf
 		Services: utils.GetServices().Filter(notExcluded),
 	}
 	if err := pullImages(ctx, project); err != nil {
+		return err
+	}
+	// Pull any images the best-effort compose pre-pull skipped, so that all pulls
+	// finish before containers start (https://github.com/supabase/cli/issues/5068).
+	if err := ensureImagesCached(ctx, project); err != nil {
 		return err
 	}
 
@@ -532,6 +576,11 @@ vector --config /etc/vector/vector.yaml
 					// Ref: https://github.com/Kong/kong/issues/3974#issuecomment-482105126
 					"KONG_NGINX_PROXY_PROXY_BUFFER_SIZE=160k",
 					"KONG_NGINX_PROXY_PROXY_BUFFERS=64 160k",
+					// Default to a single nginx worker to minimize the local stack's
+					// memory usage (Ref: #1271). Operators who need more throughput can
+					// override this from their shell, e.g. KONG_NGINX_WORKER_PROCESSES=auto
+					// for one worker per CPU core.
+					envOrDefault("KONG_NGINX_WORKER_PROCESSES", "1"),
 					// Use modern TLS certificate
 					"KONG_SSL_CERT=/home/kong/localhost.crt",
 					"KONG_SSL_CERT_KEY=/home/kong/localhost.key",
@@ -1219,17 +1268,21 @@ EOF
 	}
 
 	fmt.Fprintln(os.Stderr, "Waiting for health checks...")
-	if utils.NoBackupVolume && slices.Contains(started, utils.StorageId) {
-		if err := start.WaitForHealthyService(ctx, serviceTimeout, utils.StorageId); err != nil {
-			return err
+	if err := start.WaitForHealthyService(ctx, serviceTimeout, started...); err != nil {
+		if ignoreHealthCheck && utils.NoBackupVolume && slices.Contains(started, utils.StorageId) {
+			if storageErr := start.WaitForHealthyService(ctx, serviceTimeout, utils.StorageId); storageErr == nil {
+				if seedErr := buckets.Run(ctx, "", false, fsys); seedErr != nil {
+					return seedErr
+				}
+			}
 		}
+		return err
+	}
+	if utils.NoBackupVolume && slices.Contains(started, utils.StorageId) {
 		// Disable prompts when seeding
 		if err := buckets.Run(ctx, "", false, fsys); err != nil {
 			return err
 		}
-	}
-	if err := start.WaitForHealthyService(ctx, serviceTimeout, started...); err != nil {
-		return err
 	}
 	_ = phtelemetry.FromContext(ctx).Capture(ctx, phtelemetry.EventStackStarted, nil, nil)
 	return nil
@@ -1408,6 +1461,15 @@ func appendGotrueExternalProviderEnv(env []string) []string {
 	return env
 }
 
+// envOrDefault formats a "KEY=value" container env entry, preferring the
+// operator's shell value for key when set and otherwise falling back to def.
+func envOrDefault(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return key + "=" + v
+	}
+	return key + "=" + def
+}
+
 // appendStorageVectorEnv wires the storage container with the vector-bucket
 // env contract from supabase/storage#1094. The CLI provides three CLI-owned
 // defaults that the operator can override from their shell environment:
@@ -1423,12 +1485,6 @@ func appendGotrueExternalProviderEnv(env []string) []string {
 //     credentials, but operators are expected to override this to reach an
 //     external postgres in self-hosted setups.
 func appendStorageVectorEnv(env []string, dbConfig pgconn.Config) []string {
-	envOrDefault := func(key, def string) string {
-		if v, ok := os.LookupEnv(key); ok {
-			return key + "=" + v
-		}
-		return key + "=" + def
-	}
 	defaultVectorURL := fmt.Sprintf(
 		"postgresql://postgres:%s@%s:%d/%s",
 		dbConfig.Password,

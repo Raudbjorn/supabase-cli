@@ -16,12 +16,34 @@ on:
         required: false
         type: string
         default: ""
+      runner:
+        description: Runner to use for building artifacts
+        required: false
+        type: string
+        default: blacksmith-32vcpu-ubuntu-2404
+      cache_key_suffix:
+        description: Suffix to distinguish build artifact cache producers
+        required: false
+        type: string
+        default: ""
+      timeout_minutes:
+        description: Maximum minutes to allow for the build job
+        required: false
+        type: number
+        default: 30
+      build_timeout_minutes:
+        description: Maximum minutes to allow for the artifact build step after setup
+        required: false
+        type: number
+        default: 4
     secrets:
       SENTRY_DSN:
         required: false
       POSTHOG_API_KEY:
         required: false
       POSTHOG_ENDPOINT:
+        required: false
+      DF_FIREWALL_TOKEN:
         required: false
 
 permissions:
@@ -30,22 +52,29 @@ permissions:
 jobs:
   build:
     name: Build CLI artifacts
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
     env:
       BUN_SHELL: ${{ inputs.shell }}
       VERSION: ${{ inputs.version }}
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
       POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
       POSTHOG_ENDPOINT: ${{ secrets.POSTHOG_ENDPOINT }}
+      # Fail the build if the macOS signing tool is missing — release artifacts
+      # must be signed (CLI-1621). Local builds without rcodesign degrade to a
+      # warning instead.
+      SUPABASE_CLI_REQUIRE_SIGNING: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs.ref }}
           persist-credentials: false
 
       - name: Setup
         uses: ./.github/actions/setup
+        with:
+          dependency-firewall-token: ${{ secrets.DF_FIREWALL_TOKEN }}
 
       - name: Setup Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
@@ -64,10 +93,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y nfpm
 
+      - name: Install rcodesign
+        env:
+          RCODESIGN_VERSION: "0.29.0"
+          RCODESIGN_SHA256: "dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002"
+        run: |
+          set -euo pipefail
+          asset="apple-codesign-${RCODESIGN_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL -o /tmp/rcodesign.tar.gz \
+            "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F${RCODESIGN_VERSION}/${asset}"
+          echo "${RCODESIGN_SHA256}  /tmp/rcodesign.tar.gz" | sha256sum -c
+          tar -xzf /tmp/rcodesign.tar.gz -C /tmp
+          sudo install -m 0755 "/tmp/apple-codesign-${RCODESIGN_VERSION}-x86_64-unknown-linux-musl/rcodesign" /usr/local/bin/rcodesign
+          rcodesign --version
+
       - name: Sync versions
         run: pnpm exec bun apps/cli/scripts/sync-versions.ts --version "${VERSION}"
 
       - name: Build selected shell
+        timeout-minutes: ${{ inputs.build_timeout_minutes }}
         run: pnpm exec bun apps/cli/scripts/build.ts --version "${VERSION}" --shell "${BUN_SHELL}"
 
       - name: Verify build artifacts
@@ -79,10 +123,24 @@ jobs:
           echo "Checking dist/..."
           ls -la dist/
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+
+      - name: Check existing build artifacts cache
+        id: build-artifacts-cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          name: cli-build-${{ inputs.shell }}-${{ inputs.version }}
           path: |
             packages/cli-*/bin/
             dist/
+          key: cli-build-${{ github.run_id }}-${{ inputs.shell }}-${{ inputs.version }}${{ inputs.cache_key_suffix }}-v1
+          enableCrossOsArchive: true
+          lookup-only: true
+
+      - name: Save build artifacts cache
+        if: steps.build-artifacts-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            packages/cli-*/bin/
+            dist/
+          key: cli-build-${{ github.run_id }}-${{ inputs.shell }}-${{ inputs.version }}${{ inputs.cache_key_suffix }}-v1
+          enableCrossOsArchive: true

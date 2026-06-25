@@ -4,21 +4,18 @@ import { RuntimeInfo } from "../../shared/runtime/runtime-info.service.ts";
 import { normalizeKeyringToken } from "../../shared/auth/keyring-token.ts";
 import { LegacyDebugLogger } from "../shared/legacy-debug-logger.service.ts";
 import { LegacyCliConfig } from "../config/legacy-cli-config.service.ts";
+import { legacySupabaseHome } from "../config/legacy-profile-file.ts";
+import { LEGACY_ACCESS_TOKEN_PATTERN, validateLegacyAccessToken } from "./legacy-access-token.ts";
 import { LegacyCredentials } from "./legacy-credentials.service.ts";
 import {
   LegacyCredentialDeleteError,
   LegacyDeleteTokenError,
-  LegacyInvalidAccessTokenError,
   LegacyNotLoggedInError,
 } from "./legacy-errors.ts";
 
 const KEYRING_SERVICE = "Supabase CLI";
 const LEGACY_KEYRING_ACCOUNT = "access-token";
 const WSL_OSRELEASE_PATH = "/proc/sys/kernel/osrelease";
-
-const ACCESS_TOKEN_PATTERN = /^sbp_(oauth_)?[a-f0-9]{40}$/;
-
-const INVALID_TOKEN_MESSAGE = "Invalid access token format. Must be like `sbp_0102...1920`.";
 
 // Go's `utils.ErrNotLoggedIn` (`access_token.go:19`).
 const NOT_LOGGED_IN_MESSAGE = "You were not logged in, nothing to do.";
@@ -128,7 +125,7 @@ function readGoWindowsTarget(module: KeyringModule, account: string): string | n
 
 function normalizeGoWindowsPassword(value: string): string {
   const direct = normalizeKeyringToken(value);
-  if (ACCESS_TOKEN_PATTERN.test(direct)) return direct;
+  if (LEGACY_ACCESS_TOKEN_PATTERN.test(direct)) return direct;
 
   // Go writes Windows CredentialBlob values as raw UTF-8 bytes. The TS keyring
   // search API can surface those bytes packed into UTF-16 code units, so unpack
@@ -322,8 +319,8 @@ const makeLegacyCredentials = Effect.gen(function* () {
   const debugLogger = yield* LegacyDebugLogger;
   const profileAccount = cliConfig.profile;
 
-  // ~/.supabase/access-token — fallback file path
-  const fallbackDir = path.join(runtimeInfo.homeDir, ".supabase");
+  // <SUPABASE_HOME or ~/.supabase>/access-token — fallback file path
+  const fallbackDir = legacySupabaseHome(runtimeInfo.homeDir);
   const fallbackPath = path.join(fallbackDir, "access-token");
 
   // `SUPABASE_NO_KEYRING=1` disables the OS keyring entirely (matches `next/`'s
@@ -336,11 +333,6 @@ const makeLegacyCredentials = Effect.gen(function* () {
     wsl || noKeyring
       ? Option.none<KeyringModule>()
       : yield* Effect.tryPromise(() => import("@napi-rs/keyring")).pipe(Effect.option);
-
-  const validate = (token: string): Effect.Effect<string, LegacyInvalidAccessTokenError> =>
-    ACCESS_TOKEN_PATTERN.test(token)
-      ? Effect.succeed(token)
-      : Effect.fail(new LegacyInvalidAccessTokenError({ message: INVALID_TOKEN_MESSAGE }));
 
   const readKeyring = Effect.gen(function* () {
     if (Option.isNone(keyringModule)) return Option.none<string>();
@@ -377,22 +369,22 @@ const makeLegacyCredentials = Effect.gen(function* () {
       // Env takes precedence (matches access_token.go:38).
       if (Option.isSome(cliConfig.accessToken)) {
         yield* debugLogger.debug("Using access token from env var...");
-        yield* validate(Redacted.value(cliConfig.accessToken.value));
+        yield* validateLegacyAccessToken(Redacted.value(cliConfig.accessToken.value));
         return Option.some(cliConfig.accessToken.value);
       }
 
       // Keyring (profile key, then legacy key). Skipped on WSL.
       const keyringValue = yield* readKeyring;
       if (Option.isSome(keyringValue)) {
-        yield* validate(keyringValue.value);
+        yield* validateLegacyAccessToken(keyringValue.value);
         return Option.some(Redacted.make(keyringValue.value));
       }
 
-      // Filesystem fallback at ~/.supabase/access-token.
+      // Filesystem fallback in the Supabase home directory.
       const fileValue = yield* readFile;
       if (Option.isSome(fileValue)) {
         yield* debugLogger.debug(`Using access token from file: ${fallbackPath}`);
-        yield* validate(fileValue.value);
+        yield* validateLegacyAccessToken(fileValue.value);
         return Option.some(Redacted.make(fileValue.value));
       }
 
@@ -401,7 +393,7 @@ const makeLegacyCredentials = Effect.gen(function* () {
 
     saveAccessToken: (token: string) =>
       Effect.gen(function* () {
-        yield* validate(token);
+        yield* validateLegacyAccessToken(token);
         if (Option.isSome(keyringModule)) {
           const ok = yield* tryKeyringWrite(
             keyringModule.value,

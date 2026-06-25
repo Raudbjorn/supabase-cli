@@ -189,7 +189,7 @@ export const FunctionResponse = Schema.Struct({
   verify_jwt: Schema.optionalKey(Schema.Boolean),
   import_map: Schema.optionalKey(Schema.Boolean),
   entrypoint_path: Schema.optionalKey(Schema.String),
-  import_map_path: Schema.optionalKey(Schema.String),
+  import_map_path: Schema.optionalKey(Schema.Union([Schema.String, Schema.Null])),
   ezbr_sha256: Schema.optionalKey(Schema.String),
 });
 export const V1StorageBucketResponse = Schema.Struct({
@@ -220,6 +220,7 @@ export const V1OrganizationMemberResponse = Schema.Struct({
   email: Schema.optionalKey(Schema.String),
   role_name: Schema.String,
   mfa_enabled: Schema.Boolean,
+  avatar_url: Schema.Union([Schema.String, Schema.Null]),
 });
 // binary input helpers
 export const BinaryInput = Schema.Union([
@@ -228,6 +229,37 @@ export const BinaryInput = Schema.Union([
   Schema.instanceOf(globalThis.Blob, { expected: "Blob" }),
 ]);
 // operation schemas
+export const V1AcceptInviteExternalJitAccessInput = Schema.Struct({
+  ref: Schema.String.check(Schema.isMinLength(20))
+    .check(Schema.isMaxLength(20))
+    .check(Schema.isPattern(new RegExp("^[a-z]+$"))),
+  email: Schema.String.annotate({ format: "email" }).check(Schema.isMinLength(1)),
+  token: Schema.String.check(Schema.isMinLength(1)),
+});
+export const V1AcceptInviteExternalJitAccessOutput = Schema.Struct({
+  user_id: Schema.optionalKey(
+    Schema.String.annotate({ format: "uuid" }).check(
+      Schema.isPattern(
+        new RegExp("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"),
+      ),
+    ),
+  ),
+  user_roles: Schema.Array(
+    Schema.Struct({
+      role: Schema.String.check(Schema.isMinLength(1)),
+      expires_at: Schema.optionalKey(Schema.Number.check(Schema.isFinite())),
+      allowed_networks: Schema.optionalKey(
+        Schema.Struct({
+          allowed_cidrs: Schema.optionalKey(Schema.Array(Schema.Struct({ cidr: Schema.String }))),
+          allowed_cidrs_v6: Schema.optionalKey(
+            Schema.Array(Schema.Struct({ cidr: Schema.String })),
+          ),
+        }),
+      ),
+      branches_only: Schema.optionalKey(Schema.Boolean),
+    }),
+  ),
+});
 export const V1ActivateCustomHostnameInput = Schema.Struct({
   ref: Schema.String.check(Schema.isMinLength(20))
     .check(Schema.isMaxLength(20))
@@ -327,6 +359,7 @@ export const V1ApplyProjectAddonInput = Schema.Struct({
     "auth_mfa_phone",
     "auth_mfa_web_authn",
     "log_drain",
+    "etl_pipeline",
   ]),
 });
 export const V1AuthorizeJitAccessInput = Schema.Struct({
@@ -370,6 +403,7 @@ export const V1AuthorizeUserInput = Schema.Struct({
   organization_slug: Schema.optionalKey(
     Schema.String.check(Schema.isPattern(new RegExp("^[\\w-]+$"))),
   ),
+  target_flow: Schema.optionalKey(Schema.String),
   resource: Schema.optionalKey(Schema.String.annotate({ format: "uri" })),
 });
 export const V1BulkCreateSecretsInput = Schema.Struct({
@@ -428,7 +462,7 @@ export const V1BulkUpdateFunctionsOutput = Schema.Struct({
       verify_jwt: Schema.optionalKey(Schema.Boolean),
       import_map: Schema.optionalKey(Schema.Boolean),
       entrypoint_path: Schema.optionalKey(Schema.String),
-      import_map_path: Schema.optionalKey(Schema.String),
+      import_map_path: Schema.optionalKey(Schema.Union([Schema.String, Schema.Null])),
       ezbr_sha256: Schema.optionalKey(Schema.String),
     }),
   ),
@@ -586,7 +620,7 @@ export const V1CreateAFunctionOutput = Schema.Struct({
   verify_jwt: Schema.optionalKey(Schema.Boolean),
   import_map: Schema.optionalKey(Schema.Boolean),
   entrypoint_path: Schema.optionalKey(Schema.String),
-  import_map_path: Schema.optionalKey(Schema.String),
+  import_map_path: Schema.optionalKey(Schema.Union([Schema.String, Schema.Null])),
   ezbr_sha256: Schema.optionalKey(Schema.String),
 });
 export const V1CreateAProjectInput = Schema.Struct({
@@ -711,7 +745,7 @@ export const V1CreateAProjectInput = Schema.Struct({
   ),
   high_availability: Schema.optionalKey(
     Schema.Boolean.annotate({
-      description: "Whether to enable high availability for the project.",
+      description: "[Experimental] Whether to enable high availability for the project.",
     }),
   ),
 });
@@ -798,24 +832,26 @@ export const V1CreateASsoProviderOutput = Schema.Struct({
       metadata_xml: Schema.optionalKey(Schema.String),
       attribute_mapping: Schema.optionalKey(
         Schema.Struct({
-          keys: Schema.Record(
-            Schema.String,
-            Schema.Struct({
-              name: Schema.optionalKey(Schema.String),
-              names: Schema.optionalKey(Schema.Array(Schema.String)),
-              default: Schema.optionalKey(
-                Schema.Union(
-                  [
-                    Schema.Struct({}),
-                    Schema.Number.check(Schema.isFinite()),
-                    Schema.String,
-                    Schema.Boolean,
-                  ],
-                  { mode: "oneOf" },
+          keys: Schema.optionalKey(
+            Schema.Record(
+              Schema.String,
+              Schema.Struct({
+                name: Schema.optionalKey(Schema.String),
+                names: Schema.optionalKey(Schema.Array(Schema.String)),
+                default: Schema.optionalKey(
+                  Schema.Union(
+                    [
+                      Schema.Struct({}),
+                      Schema.Number.check(Schema.isFinite()),
+                      Schema.String,
+                      Schema.Boolean,
+                    ],
+                    { mode: "oneOf" },
+                  ),
                 ),
-              ),
-              array: Schema.optionalKey(Schema.Boolean),
-            }),
+                array: Schema.optionalKey(Schema.Boolean),
+              }),
+            ),
           ),
         }),
       ),
@@ -1158,24 +1194,26 @@ export const V1DeleteASsoProviderOutput = Schema.Struct({
       metadata_xml: Schema.optionalKey(Schema.String),
       attribute_mapping: Schema.optionalKey(
         Schema.Struct({
-          keys: Schema.Record(
-            Schema.String,
-            Schema.Struct({
-              name: Schema.optionalKey(Schema.String),
-              names: Schema.optionalKey(Schema.Array(Schema.String)),
-              default: Schema.optionalKey(
-                Schema.Union(
-                  [
-                    Schema.Struct({}),
-                    Schema.Number.check(Schema.isFinite()),
-                    Schema.String,
-                    Schema.Boolean,
-                  ],
-                  { mode: "oneOf" },
+          keys: Schema.optionalKey(
+            Schema.Record(
+              Schema.String,
+              Schema.Struct({
+                name: Schema.optionalKey(Schema.String),
+                names: Schema.optionalKey(Schema.Array(Schema.String)),
+                default: Schema.optionalKey(
+                  Schema.Union(
+                    [
+                      Schema.Struct({}),
+                      Schema.Number.check(Schema.isFinite()),
+                      Schema.String,
+                      Schema.Boolean,
+                    ],
+                    { mode: "oneOf" },
+                  ),
                 ),
-              ),
-              array: Schema.optionalKey(Schema.Boolean),
-            }),
+                array: Schema.optionalKey(Schema.Boolean),
+              }),
+            ),
           ),
         }),
       ),
@@ -1201,6 +1239,16 @@ export const V1DeleteASsoProviderOutput = Schema.Struct({
   ),
   created_at: Schema.optionalKey(Schema.String),
   updated_at: Schema.optionalKey(Schema.String),
+});
+export const V1DeleteInviteExternalJitAccessInput = Schema.Struct({
+  ref: Schema.String.check(Schema.isMinLength(20))
+    .check(Schema.isMaxLength(20))
+    .check(Schema.isPattern(new RegExp("^[a-z]+$"))),
+  invite_id: Schema.String.annotate({ format: "uuid" }).check(
+    Schema.isPattern(
+      new RegExp("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"),
+    ),
+  ),
 });
 export const V1DeleteJitAccessInput = Schema.Struct({
   ref: Schema.String.check(Schema.isMinLength(20))
@@ -1328,7 +1376,7 @@ export const V1DeployAFunctionOutput = Schema.Struct({
   verify_jwt: Schema.optionalKey(Schema.Boolean),
   import_map: Schema.optionalKey(Schema.Boolean),
   entrypoint_path: Schema.optionalKey(Schema.String),
-  import_map_path: Schema.optionalKey(Schema.String),
+  import_map_path: Schema.optionalKey(Schema.Union([Schema.String, Schema.Null])),
   ezbr_sha256: Schema.optionalKey(Schema.String),
 });
 export const V1DiffABranchInput = Schema.Struct({
@@ -1546,7 +1594,7 @@ export const V1GetAFunctionOutput = Schema.Struct({
   verify_jwt: Schema.optionalKey(Schema.Boolean),
   import_map: Schema.optionalKey(Schema.Boolean),
   entrypoint_path: Schema.optionalKey(Schema.String),
-  import_map_path: Schema.optionalKey(Schema.String),
+  import_map_path: Schema.optionalKey(Schema.Union([Schema.String, Schema.Null])),
   ezbr_sha256: Schema.optionalKey(Schema.String),
 });
 export const V1GetAFunctionBodyInput = Schema.Struct({
@@ -1616,30 +1664,32 @@ export const V1GetASsoProviderOutput = Schema.Struct({
   id: Schema.String,
   saml: Schema.optionalKey(
     Schema.Struct({
-      id: Schema.String,
+      id: Schema.optionalKey(Schema.String),
       entity_id: Schema.String,
       metadata_url: Schema.optionalKey(Schema.String),
       metadata_xml: Schema.optionalKey(Schema.String),
       attribute_mapping: Schema.optionalKey(
         Schema.Struct({
-          keys: Schema.Record(
-            Schema.String,
-            Schema.Struct({
-              name: Schema.optionalKey(Schema.String),
-              names: Schema.optionalKey(Schema.Array(Schema.String)),
-              default: Schema.optionalKey(
-                Schema.Union(
-                  [
-                    Schema.Struct({}),
-                    Schema.Number.check(Schema.isFinite()),
-                    Schema.String,
-                    Schema.Boolean,
-                  ],
-                  { mode: "oneOf" },
+          keys: Schema.optionalKey(
+            Schema.Record(
+              Schema.String,
+              Schema.Struct({
+                name: Schema.optionalKey(Schema.String),
+                names: Schema.optionalKey(Schema.Array(Schema.String)),
+                default: Schema.optionalKey(
+                  Schema.Union(
+                    [
+                      Schema.Struct({}),
+                      Schema.Number.check(Schema.isFinite()),
+                      Schema.String,
+                      Schema.Boolean,
+                    ],
+                    { mode: "oneOf" },
+                  ),
                 ),
-              ),
-              array: Schema.optionalKey(Schema.Boolean),
-            }),
+                array: Schema.optionalKey(Schema.Boolean),
+              }),
+            ),
           ),
         }),
       ),
@@ -2335,9 +2385,11 @@ export const V1GetJitAccessInput = Schema.Struct({
     .check(Schema.isPattern(new RegExp("^[a-z]+$"))),
 });
 export const V1GetJitAccessOutput = Schema.Struct({
-  user_id: Schema.String.annotate({ format: "uuid" }).check(
-    Schema.isPattern(
-      new RegExp("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"),
+  user_id: Schema.optionalKey(
+    Schema.String.annotate({ format: "uuid" }).check(
+      Schema.isPattern(
+        new RegExp("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"),
+      ),
     ),
   ),
   user_roles: Schema.Array(
@@ -2786,9 +2838,14 @@ export const V1GetPostgresUpgradeEligibilityOutput = Schema.Struct({
     ),
   ),
   warnings: Schema.Array(
-    Schema.Union([Schema.Struct({ type: Schema.Literal("pg_graphql_introspection_change") })], {
-      mode: "oneOf",
-    }),
+    Schema.Union(
+      [
+        Schema.Struct({ type: Schema.Literal("pg_graphql_introspection_change") }),
+        Schema.Struct({ type: Schema.Literal("ltree_reindex_required") }),
+        Schema.Struct({ type: Schema.Literal("operator_estimator_gate") }),
+      ],
+      { mode: "oneOf" },
+    ),
   ),
 });
 export const V1GetPostgresUpgradeStatusInput = Schema.Struct({
@@ -3449,6 +3506,50 @@ export const V1GetVanitySubdomainConfigOutput = Schema.Struct({
   status: Schema.Literals(["not-used", "custom-domain-used", "active"]),
   custom_domain: Schema.optionalKey(Schema.String.check(Schema.isMinLength(1))),
 });
+export const V1InviteExternalJitAccessInput = Schema.Struct({
+  ref: Schema.String.check(Schema.isMinLength(20))
+    .check(Schema.isMaxLength(20))
+    .check(Schema.isPattern(new RegExp("^[a-z]+$"))),
+  email: Schema.String.annotate({ format: "email" }).check(Schema.isMinLength(1)),
+  roles: Schema.Array(
+    Schema.Struct({
+      role: Schema.String.check(Schema.isMinLength(1)),
+      expires_at: Schema.optionalKey(Schema.Number.check(Schema.isFinite())),
+      allowed_networks: Schema.optionalKey(
+        Schema.Struct({
+          allowed_cidrs: Schema.optionalKey(Schema.Array(Schema.Struct({ cidr: Schema.String }))),
+          allowed_cidrs_v6: Schema.optionalKey(
+            Schema.Array(Schema.Struct({ cidr: Schema.String })),
+          ),
+        }),
+      ),
+      branches_only: Schema.optionalKey(Schema.Boolean),
+    }),
+  ),
+});
+export const V1InviteExternalJitAccessOutput = Schema.Struct({
+  email: Schema.String.annotate({ format: "email" }),
+  invite_id: Schema.String.annotate({ format: "uuid" }).check(
+    Schema.isPattern(
+      new RegExp("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"),
+    ),
+  ),
+  user_roles: Schema.Array(
+    Schema.Struct({
+      role: Schema.String.check(Schema.isMinLength(1)),
+      expires_at: Schema.optionalKey(Schema.Number.check(Schema.isFinite())),
+      allowed_networks: Schema.optionalKey(
+        Schema.Struct({
+          allowed_cidrs: Schema.optionalKey(Schema.Array(Schema.Struct({ cidr: Schema.String }))),
+          allowed_cidrs_v6: Schema.optionalKey(
+            Schema.Array(Schema.Struct({ cidr: Schema.String })),
+          ),
+        }),
+      ),
+      branches_only: Schema.optionalKey(Schema.Boolean),
+    }),
+  ),
+});
 export const V1ListActionRunsInput = Schema.Struct({
   ref: Schema.String.check(Schema.isMinLength(20))
     .check(Schema.isMaxLength(20))
@@ -3623,24 +3724,26 @@ export const V1ListAllSsoProviderOutput = Schema.Struct({
           metadata_xml: Schema.optionalKey(Schema.String),
           attribute_mapping: Schema.optionalKey(
             Schema.Struct({
-              keys: Schema.Record(
-                Schema.String,
-                Schema.Struct({
-                  name: Schema.optionalKey(Schema.String),
-                  names: Schema.optionalKey(Schema.Array(Schema.String)),
-                  default: Schema.optionalKey(
-                    Schema.Union(
-                      [
-                        Schema.Struct({}),
-                        Schema.Number.check(Schema.isFinite()),
-                        Schema.String,
-                        Schema.Boolean,
-                      ],
-                      { mode: "oneOf" },
+              keys: Schema.optionalKey(
+                Schema.Record(
+                  Schema.String,
+                  Schema.Struct({
+                    name: Schema.optionalKey(Schema.String),
+                    names: Schema.optionalKey(Schema.Array(Schema.String)),
+                    default: Schema.optionalKey(
+                      Schema.Union(
+                        [
+                          Schema.Struct({}),
+                          Schema.Number.check(Schema.isFinite()),
+                          Schema.String,
+                          Schema.Boolean,
+                        ],
+                        { mode: "oneOf" },
+                      ),
                     ),
-                  ),
-                  array: Schema.optionalKey(Schema.Boolean),
-                }),
+                    array: Schema.optionalKey(Schema.Boolean),
+                  }),
+                ),
               ),
             }),
           ),
@@ -3690,32 +3793,69 @@ export const V1ListJitAccessInput = Schema.Struct({
 });
 export const V1ListJitAccessOutput = Schema.Struct({
   items: Schema.Array(
-    Schema.Struct({
-      user_id: Schema.String.annotate({ format: "uuid" }).check(
-        Schema.isPattern(
-          new RegExp(
-            "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
-          ),
-        ),
-      ),
-      user_roles: Schema.Array(
+    Schema.Union(
+      [
         Schema.Struct({
-          role: Schema.String.check(Schema.isMinLength(1)),
-          expires_at: Schema.optionalKey(Schema.Number.check(Schema.isFinite())),
-          allowed_networks: Schema.optionalKey(
+          user_id: Schema.String.annotate({ format: "uuid" }).check(
+            Schema.isPattern(
+              new RegExp(
+                "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+              ),
+            ),
+          ),
+          primary_email: Schema.Union([Schema.String, Schema.Null]),
+          invite_id: Schema.Null,
+          expires_at: Schema.Null,
+          user_roles: Schema.Array(
             Schema.Struct({
-              allowed_cidrs: Schema.optionalKey(
-                Schema.Array(Schema.Struct({ cidr: Schema.String })),
+              role: Schema.String.check(Schema.isMinLength(1)),
+              expires_at: Schema.optionalKey(Schema.Number.check(Schema.isFinite())),
+              allowed_networks: Schema.optionalKey(
+                Schema.Struct({
+                  allowed_cidrs: Schema.optionalKey(
+                    Schema.Array(Schema.Struct({ cidr: Schema.String })),
+                  ),
+                  allowed_cidrs_v6: Schema.optionalKey(
+                    Schema.Array(Schema.Struct({ cidr: Schema.String })),
+                  ),
+                }),
               ),
-              allowed_cidrs_v6: Schema.optionalKey(
-                Schema.Array(Schema.Struct({ cidr: Schema.String })),
-              ),
+              branches_only: Schema.optionalKey(Schema.Boolean),
             }),
           ),
-          branches_only: Schema.optionalKey(Schema.Boolean),
         }),
-      ),
-    }),
+        Schema.Struct({
+          user_id: Schema.Null,
+          primary_email: Schema.String,
+          invite_id: Schema.String.annotate({ format: "uuid" }).check(
+            Schema.isPattern(
+              new RegExp(
+                "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+              ),
+            ),
+          ),
+          expires_at: Schema.String,
+          user_roles: Schema.Array(
+            Schema.Struct({
+              role: Schema.String.check(Schema.isMinLength(1)),
+              expires_at: Schema.optionalKey(Schema.Number.check(Schema.isFinite())),
+              allowed_networks: Schema.optionalKey(
+                Schema.Struct({
+                  allowed_cidrs: Schema.optionalKey(
+                    Schema.Array(Schema.Struct({ cidr: Schema.String })),
+                  ),
+                  allowed_cidrs_v6: Schema.optionalKey(
+                    Schema.Array(Schema.Struct({ cidr: Schema.String })),
+                  ),
+                }),
+              ),
+              branches_only: Schema.optionalKey(Schema.Boolean),
+            }),
+          ),
+        }),
+      ],
+      { mode: "oneOf" },
+    ),
   ),
 });
 export const V1ListMigrationHistoryInput = Schema.Struct({
@@ -3749,6 +3889,7 @@ export const V1ListProjectAddonsOutput = Schema.Struct({
         "auth_mfa_phone",
         "auth_mfa_web_authn",
         "log_drain",
+        "etl_pipeline",
       ]),
       variant: Schema.Struct({
         id: Schema.Union(
@@ -3779,6 +3920,7 @@ export const V1ListProjectAddonsOutput = Schema.Struct({
             Schema.Literal("auth_mfa_phone_default"),
             Schema.Literal("auth_mfa_web_authn_default"),
             Schema.Literal("log_drain_default"),
+            Schema.Literal("etl_pipeline_default"),
           ],
           { mode: "oneOf" },
         ),
@@ -3805,6 +3947,7 @@ export const V1ListProjectAddonsOutput = Schema.Struct({
         "auth_mfa_phone",
         "auth_mfa_web_authn",
         "log_drain",
+        "etl_pipeline",
       ]),
       name: Schema.String,
       variants: Schema.Array(
@@ -3837,6 +3980,7 @@ export const V1ListProjectAddonsOutput = Schema.Struct({
               Schema.Literal("auth_mfa_phone_default"),
               Schema.Literal("auth_mfa_web_authn_default"),
               Schema.Literal("log_drain_default"),
+              Schema.Literal("etl_pipeline_default"),
             ],
             { mode: "oneOf" },
           ),
@@ -4320,7 +4464,7 @@ export const V1UpdateAFunctionOutput = Schema.Struct({
   verify_jwt: Schema.optionalKey(Schema.Boolean),
   import_map: Schema.optionalKey(Schema.Boolean),
   entrypoint_path: Schema.optionalKey(Schema.String),
-  import_map_path: Schema.optionalKey(Schema.String),
+  import_map_path: Schema.optionalKey(Schema.Union([Schema.String, Schema.Null])),
   ezbr_sha256: Schema.optionalKey(Schema.String),
 });
 export const V1UpdateAProjectInput = Schema.Struct({
@@ -4388,24 +4532,26 @@ export const V1UpdateASsoProviderOutput = Schema.Struct({
       metadata_xml: Schema.optionalKey(Schema.String),
       attribute_mapping: Schema.optionalKey(
         Schema.Struct({
-          keys: Schema.Record(
-            Schema.String,
-            Schema.Struct({
-              name: Schema.optionalKey(Schema.String),
-              names: Schema.optionalKey(Schema.Array(Schema.String)),
-              default: Schema.optionalKey(
-                Schema.Union(
-                  [
-                    Schema.Struct({}),
-                    Schema.Number.check(Schema.isFinite()),
-                    Schema.String,
-                    Schema.Boolean,
-                  ],
-                  { mode: "oneOf" },
+          keys: Schema.optionalKey(
+            Schema.Record(
+              Schema.String,
+              Schema.Struct({
+                name: Schema.optionalKey(Schema.String),
+                names: Schema.optionalKey(Schema.Array(Schema.String)),
+                default: Schema.optionalKey(
+                  Schema.Union(
+                    [
+                      Schema.Struct({}),
+                      Schema.Number.check(Schema.isFinite()),
+                      Schema.String,
+                      Schema.Boolean,
+                    ],
+                    { mode: "oneOf" },
+                  ),
                 ),
-              ),
-              array: Schema.optionalKey(Schema.Boolean),
-            }),
+                array: Schema.optionalKey(Schema.Boolean),
+              }),
+            ),
           ),
         }),
       ),
@@ -5327,9 +5473,11 @@ export const V1UpdateJitAccessInput = Schema.Struct({
   ),
 });
 export const V1UpdateJitAccessOutput = Schema.Struct({
-  user_id: Schema.String.annotate({ format: "uuid" }).check(
-    Schema.isPattern(
-      new RegExp("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"),
+  user_id: Schema.optionalKey(
+    Schema.String.annotate({ format: "uuid" }).check(
+      Schema.isPattern(
+        new RegExp("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"),
+      ),
     ),
   ),
   user_roles: Schema.Array(
@@ -5887,6 +6035,7 @@ export const V1CountActionRunsOutput = Schema.Void;
 export const V1DeactivateVanitySubdomainConfigOutput = Schema.Void;
 export const V1DeleteHostnameConfigOutput = Schema.Void;
 export const V1DeleteAFunctionOutput = Schema.Void;
+export const V1DeleteInviteExternalJitAccessOutput = Schema.Void;
 export const V1DeleteJitAccessOutput = Schema.Void;
 export const V1DeleteNetworkBansOutput = Schema.Void;
 export const V1DeleteProjectClaimTokenOutput = Schema.Void;
@@ -5915,6 +6064,7 @@ export const V1UpdateStorageConfigOutput = Schema.Void;
 export const V1UpsertAMigrationOutput = Schema.Void;
 
 export const openApiOperationIdMap = {
+  "v1-accept-invite-external-jit-access": "v1AcceptInviteExternalJitAccess",
   "v1-activate-custom-hostname": "v1ActivateCustomHostname",
   "v1-activate-vanity-subdomain-config": "v1ActivateVanitySubdomainConfig",
   "v1-apply-a-migration": "v1ApplyAMigration",
@@ -5946,6 +6096,7 @@ export const openApiOperationIdMap = {
   "v1-delete-a-function": "v1DeleteAFunction",
   "v1-delete-a-project": "v1DeleteAProject",
   "v1-delete-a-sso-provider": "v1DeleteASsoProvider",
+  "v1-delete-invite-external-jit-access": "v1DeleteInviteExternalJitAccess",
   "v1-delete-jit-access": "v1DeleteJitAccess",
   "v1-delete-login-roles": "v1DeleteLoginRoles",
   "v1-delete-network-bans": "v1DeleteNetworkBans",
@@ -6014,6 +6165,7 @@ export const openApiOperationIdMap = {
   "v1-get-ssl-enforcement-config": "v1GetSslEnforcementConfig",
   "v1-get-storage-config": "v1GetStorageConfig",
   "v1-get-vanity-subdomain-config": "v1GetVanitySubdomainConfig",
+  "v1-invite-external-jit-access": "v1InviteExternalJitAccess",
   "v1-list-action-runs": "v1ListActionRuns",
   "v1-list-all-backups": "v1ListAllBackups",
   "v1-list-all-branches": "v1ListAllBranches",
@@ -6083,6 +6235,19 @@ export const openApiOperationIdMap = {
 } as const;
 
 export const operationDefinitions = {
+  v1AcceptInviteExternalJitAccess: {
+    id: "v1AcceptInviteExternalJitAccess",
+    description: "Accepts the invitation to JIT database access",
+    method: "POST",
+    path: "/v1/projects/{ref}/database/jit/invite/accept",
+    pathParams: ["ref"],
+    queryParams: [],
+    headerParams: [],
+    requestBody: { kind: "json", contentType: "application/json", fields: ["email", "token"] },
+    response: { kind: "json" },
+    inputSchema: V1AcceptInviteExternalJitAccessInput,
+    outputSchema: V1AcceptInviteExternalJitAccessOutput,
+  },
   v1ActivateCustomHostname: {
     id: "v1ActivateCustomHostname",
     description: "[Beta] Activates a custom hostname for a project.",
@@ -6173,6 +6338,7 @@ export const operationDefinitions = {
       "code_challenge",
       "code_challenge_method",
       "organization_slug",
+      "target_flow",
       "resource",
     ],
     headerParams: [],
@@ -6572,6 +6738,19 @@ export const operationDefinitions = {
     response: { kind: "json" },
     inputSchema: V1DeleteASsoProviderInput,
     outputSchema: V1DeleteASsoProviderOutput,
+  },
+  v1DeleteInviteExternalJitAccess: {
+    id: "v1DeleteInviteExternalJitAccess",
+    description: "Revokes and deletes the invitation",
+    method: "DELETE",
+    path: "/v1/projects/{ref}/database/jit/invite/{invite_id}",
+    pathParams: ["ref", "invite_id"],
+    queryParams: [],
+    headerParams: [],
+    requestBody: { kind: "none" },
+    response: { kind: "void" },
+    inputSchema: V1DeleteInviteExternalJitAccessInput,
+    outputSchema: V1DeleteInviteExternalJitAccessOutput,
   },
   v1DeleteJitAccess: {
     id: "v1DeleteJitAccess",
@@ -7470,6 +7649,20 @@ export const operationDefinitions = {
     response: { kind: "json" },
     inputSchema: V1GetVanitySubdomainConfigInput,
     outputSchema: V1GetVanitySubdomainConfigOutput,
+  },
+  v1InviteExternalJitAccess: {
+    id: "v1InviteExternalJitAccess",
+    description:
+      "Invites the external user and sets initial roles that can be assumed and for how long",
+    method: "POST",
+    path: "/v1/projects/{ref}/database/jit/invite",
+    pathParams: ["ref"],
+    queryParams: [],
+    headerParams: [],
+    requestBody: { kind: "json", contentType: "application/json", fields: ["email", "roles"] },
+    response: { kind: "json" },
+    inputSchema: V1InviteExternalJitAccessInput,
+    outputSchema: V1InviteExternalJitAccessOutput,
   },
   v1ListActionRuns: {
     id: "v1ListActionRuns",

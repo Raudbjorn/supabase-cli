@@ -148,19 +148,54 @@ describe("legacy config push integration", () => {
     }).pipe(Effect.provide(layer));
   });
 
-  it.live("aborts when a [remotes.*] block targets the project, before any network call", () => {
-    const { layer, api } = setup({
-      toml: `${API_ONLY_TOML}[remotes.staging]
+  it.live("merges a matching [remotes.*] block over the base and pushes it", () => {
+    const { layer, out, api } = setup({
+      toml: `${API_ONLY_TOML}[api]
+enabled = true
+schemas = ["public"]
+
+[remotes.staging]
 project_id = "abcdefghijklmnopqrst"
 [remotes.staging.api]
-enabled = true
+schemas = ["public", "remote_schema"]
+`,
+      yes: true,
+      routes: {
+        postgrestGet: { status: 200, body: POSTGREST_DISABLED },
+        postgresGet: { status: 200, body: {} },
+      },
+    });
+    return Effect.gen(function* () {
+      yield* legacyConfigPush({ projectRef: Option.none() });
+      // Go prints the override line, before the "Pushing config to project" line.
+      expect(out.stderrText).toContain("Loading config override: [remotes.staging]");
+      expect(out.stderrText.indexOf("Loading config override: [remotes.staging]")).toBeLessThan(
+        out.stderrText.indexOf("Pushing config to project:"),
+      );
+      // The remote's schema override is what gets pushed (proving the merge).
+      const patch = api.requests.find((r) => r.method === "PATCH" && r.url.includes("/postgrest"));
+      expect(patch).toBeDefined();
+      expect(patch?.body).toMatchObject({ db_schema: "public,remote_schema" });
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.live("aborts when two [remotes.*] blocks share the target project_id", () => {
+    const { layer, api } = setup({
+      toml: `${API_ONLY_TOML}[remotes.a]
+project_id = "abcdefghijklmnopqrst"
+[remotes.b]
+project_id = "abcdefghijklmnopqrst"
 `,
       yes: true,
     });
     return Effect.gen(function* () {
-      const exit = yield* legacyConfigPush({ projectRef: Option.none() }).pipe(Effect.exit);
-      expect(Exit.isFailure(exit)).toBe(true);
-      // No network call should have fired (guard runs before the cost matrix).
+      const message = yield* legacyConfigPush({ projectRef: Option.none() }).pipe(
+        Effect.catchTag("LegacyConfigPushLoadConfigError", (error) =>
+          Effect.succeed(error.message),
+        ),
+      );
+      expect(message).toContain("duplicate project_id for [remotes.");
+      // The guard runs during config load, before any network call.
       expect(api.requests).toHaveLength(0);
     }).pipe(Effect.provide(layer));
   });
@@ -364,6 +399,7 @@ function setupService(opts: {
   readonly v1: Record<string, (input: unknown) => Effect.Effect<unknown, unknown>>;
   readonly yes?: boolean;
   readonly confirm?: ReadonlyArray<boolean>;
+  readonly runtimeCwd?: string;
 }) {
   writeConfig(opts.toml);
   const out = mockOutput({ format: "text", promptConfirmResponses: opts.confirm });
@@ -375,7 +411,7 @@ function setupService(opts: {
       out,
       api: { layer: apiMock.layer, httpClientLayer: addonsHttpLayer() },
       cliConfig: mockLegacyCliConfig({ workdir: tempRoot.current }),
-      runtimeInfo: mockRuntimeInfo({ cwd: tempRoot.current }),
+      runtimeInfo: mockRuntimeInfo({ cwd: opts.runtimeCwd ?? tempRoot.current }),
       telemetry: telemetry.layer,
       linkedProjectCache: linkedProjectCache.layer,
     }),
@@ -389,6 +425,111 @@ function methodsOf(apiMock: ReturnType<typeof setupService>["apiMock"]): Array<s
 }
 
 describe("legacy config push gated services", () => {
+  it.live("pushes auth email HTML loaded from content_path", () => {
+    const templateDir = join(tempRoot.current, "templates");
+    const notificationDir = join(tempRoot.current, "supabase", "templates");
+    mkdirSync(templateDir, { recursive: true });
+    mkdirSync(notificationDir, { recursive: true });
+    writeFileSync(join(templateDir, "invite.html"), "<h1>Invite</h1>");
+    writeFileSync(join(notificationDir, "password_changed.html"), "<p>Password changed</p>");
+
+    const toml = `project_id = "test"
+[storage]
+enabled = false
+[auth]
+enabled = true
+site_url = "http://localhost:3000"
+[auth.email.template.invite]
+subject = "You are invited"
+content_path = "./templates/invite.html"
+[auth.email.notification.password_changed]
+enabled = true
+subject = "Password changed"
+content_path = "./templates/password_changed.html"
+`;
+    const { layer, apiMock } = setupService({
+      toml,
+      yes: true,
+      v1: {
+        getAuthServiceConfig: () => Effect.succeed({}),
+        updateAuthServiceConfig: () => Effect.succeed({}),
+      },
+    });
+    return Effect.gen(function* () {
+      yield* legacyConfigPush({ projectRef: Option.none() });
+      const update = apiMock.requests.find((r) => r.method === "updateAuthServiceConfig");
+      expect(update).toBeDefined();
+      const input = update?.input as Record<string, unknown>;
+      expect(input["mailer_subjects_invite"]).toBe("You are invited");
+      expect(input["mailer_templates_invite_content"]).toBe("<h1>Invite</h1>");
+      expect(input["mailer_subjects_password_changed_notification"]).toBe("Password changed");
+      expect(input["mailer_templates_password_changed_notification_content"]).toBe(
+        "<p>Password changed</p>",
+      );
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.live("aborts before network I/O when auth email content_path is unreadable", () => {
+    const toml = `project_id = "test"
+[storage]
+enabled = false
+[auth]
+enabled = true
+site_url = "http://localhost:3000"
+[auth.email.template.invite]
+subject = "You are invited"
+content_path = "./templates/missing.html"
+`;
+    const { layer, apiMock } = setupService({
+      toml,
+      yes: true,
+      v1: {
+        getAuthServiceConfig: () => Effect.succeed({}),
+        updateAuthServiceConfig: () => Effect.succeed({}),
+      },
+    });
+    return Effect.gen(function* () {
+      const exit = yield* legacyConfigPush({ projectRef: Option.none() }).pipe(Effect.exit);
+      expect(Exit.isFailure(exit)).toBe(true);
+      expect(apiMock.requests).toHaveLength(0);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.live("resolves auth template paths from the discovered project root", () => {
+    const nestedCwd = join(tempRoot.current, "packages", "app");
+    const templateDir = join(tempRoot.current, "templates");
+    mkdirSync(nestedCwd, { recursive: true });
+    mkdirSync(templateDir, { recursive: true });
+    writeFileSync(join(templateDir, "invite.html"), "<h1>Nested invite</h1>");
+
+    const toml = `project_id = "test"
+[storage]
+enabled = false
+[auth]
+enabled = true
+site_url = "http://localhost:3000"
+[auth.email.template.invite]
+subject = "Nested invite"
+content_path = "./templates/invite.html"
+`;
+    const { layer, apiMock } = setupService({
+      toml,
+      yes: true,
+      runtimeCwd: nestedCwd,
+      v1: {
+        getAuthServiceConfig: () => Effect.succeed({}),
+        updateAuthServiceConfig: () => Effect.succeed({}),
+      },
+    });
+    return Effect.gen(function* () {
+      yield* legacyConfigPush({ projectRef: Option.none() });
+      const update = apiMock.requests.find((r) => r.method === "updateAuthServiceConfig");
+      expect(update).toBeDefined();
+      const input = update?.input as Record<string, unknown>;
+      expect(input["mailer_templates_invite_content"]).toBe("<h1>Nested invite</h1>");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.live(
     "sends the raw captcha secret (not the hash) when pushing auth (security regression)",
     () => {

@@ -27,6 +27,8 @@ on:
         required: true
       GH_APP_PRIVATE_KEY:
         required: true
+      DF_FIREWALL_TOKEN:
+        required: false
   workflow_dispatch:
     inputs:
       tag:
@@ -43,6 +45,7 @@ jobs:
     # allow any tag so reviewers can opt in for beta/alpha from the Actions tab.
     if: ${{ github.event_name == 'workflow_dispatch' || (!contains(inputs.tag, '-beta.') && !contains(inputs.tag, '-alpha.')) }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     continue-on-error: ${{ inputs.non_blocking || false }}
     permissions:
       contents: write
@@ -68,6 +71,8 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
 
       - uses: ./.github/actions/setup
+        with:
+          dependency-firewall-token: ${{ secrets.DF_FIREWALL_TOKEN }}
 
       - name: Configure git identity
         run: |

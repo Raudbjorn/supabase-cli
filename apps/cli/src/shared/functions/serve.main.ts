@@ -1,14 +1,16 @@
-import { STATUS_CODE, STATUS_TEXT } from "https://deno.land/std/http/status.ts";
-import * as posix from "https://deno.land/std/path/posix/mod.ts";
+// @ts-nocheck
+declare const Deno: any;
+declare const EdgeRuntime: any;
 
-import * as jose from "jsr:@panva/jose@6";
+import { dirname, join, STATUS_CODE, STATUS_TEXT, toFileUrl } from "./serve-main-deps.ts";
+
+import * as jose from "jose";
 
 const SB_SPECIFIC_ERROR_CODE = {
-  BootError:
-    STATUS_CODE.ServiceUnavailable, /** Service Unavailable (RFC 7231, 6.6.4) */
+  BootError: STATUS_CODE.ServiceUnavailable /** Service Unavailable (RFC 7231, 6.6.4) */,
   InvalidWorkerResponse:
-    STATUS_CODE.InternalServerError, /** Internal Server Error (RFC 7231, 6.6.1) */
-  WorkerLimit: 546, /** Extended */
+    STATUS_CODE.InternalServerError /** Internal Server Error (RFC 7231, 6.6.1) */,
+  WorkerLimit: 546 /** Extended */,
 };
 
 const SB_SPECIFIC_ERROR_TEXT = {
@@ -18,8 +20,7 @@ const SB_SPECIFIC_ERROR_TEXT = {
 };
 
 const SB_SPECIFIC_ERROR_REASON = {
-  [SB_SPECIFIC_ERROR_CODE.BootError]:
-    "Worker failed to boot (please check logs)",
+  [SB_SPECIFIC_ERROR_CODE.BootError]: "Worker failed to boot (please check logs)",
   [SB_SPECIFIC_ERROR_CODE.InvalidWorkerResponse]:
     "Function exited due to an error (please check logs)",
   [SB_SPECIFIC_ERROR_CODE.WorkerLimit]:
@@ -30,34 +31,28 @@ const SB_SPECIFIC_ERROR_REASON = {
 const EXCLUDED_ENVS = ["HOME", "HOSTNAME", "PATH", "PWD"];
 const HOST_PORT = Deno.env.get("SUPABASE_INTERNAL_HOST_PORT")!;
 const JWT_SECRET = Deno.env.get("SUPABASE_INTERNAL_JWT_SECRET")!;
-const JWKS_ENDPOINT = new URL('/auth/v1/.well-known/jwks.json', Deno.env.get("SUPABASE_URL")!)
+const JWKS_ENDPOINT = new URL("/auth/v1/.well-known/jwks.json", Deno.env.get("SUPABASE_URL")!);
 const DEBUG = Deno.env.get("SUPABASE_INTERNAL_DEBUG") === "true";
-const FUNCTIONS_CONFIG_STRING = Deno.env.get(
-  "SUPABASE_INTERNAL_FUNCTIONS_CONFIG",
-)!;
+const FUNCTIONS_CONFIG_STRING = Deno.env.get("SUPABASE_INTERNAL_FUNCTIONS_CONFIG")!;
 
-const SUPABASE_PUBLISHABLE_KEY = Deno.env.get('SUPABASE_INTERNAL_PUBLISHABLE_KEY')
-const SUPABASE_SECRET_KEY = Deno.env.get('SUPABASE_INTERNAL_SECRET_KEY')
+const SUPABASE_PUBLISHABLE_KEY = Deno.env.get("SUPABASE_INTERNAL_PUBLISHABLE_KEY");
+const SUPABASE_SECRET_KEY = Deno.env.get("SUPABASE_INTERNAL_SECRET_KEY");
 
-const WALLCLOCK_LIMIT_SEC = parseInt(
-  Deno.env.get("SUPABASE_INTERNAL_WALLCLOCK_LIMIT_SEC"),
-);
+const WALLCLOCK_LIMIT_SEC = parseInt(Deno.env.get("SUPABASE_INTERNAL_WALLCLOCK_LIMIT_SEC"));
 
 const DENO_SB_ERROR_MAP = new Map([
   [Deno.errors.InvalidWorkerCreation, SB_SPECIFIC_ERROR_CODE.BootError],
   [Deno.errors.InvalidWorkerResponse, SB_SPECIFIC_ERROR_CODE.InvalidWorkerResponse],
-  [
-    Deno.errors.WorkerRequestCancelled,
-    SB_SPECIFIC_ERROR_CODE.WorkerLimit,
-  ],
+  [Deno.errors.WorkerRequestCancelled, SB_SPECIFIC_ERROR_CODE.WorkerLimit],
 ]);
-const GENERIC_FUNCTION_SERVE_MESSAGE = `Serving functions on http://127.0.0.1:${HOST_PORT}/functions/v1/<function-name>`
+const GENERIC_FUNCTION_SERVE_MESSAGE = `Serving functions on http://127.0.0.1:${HOST_PORT}/functions/v1/<function-name>`;
 
 interface FunctionConfig {
   entrypointPath: string;
   importMapPath: string;
   staticFiles: string[];
   verifyJWT: boolean;
+  env?: Record<string, string>;
 }
 
 function getResponse(payload: any, status: number, customHeaders = {}) {
@@ -84,10 +79,7 @@ const functionsConfig: Record<string, FunctionConfig> = (() => {
     const functionsConfig = JSON.parse(FUNCTIONS_CONFIG_STRING);
 
     if (DEBUG) {
-      console.log(
-        "Functions config:",
-        JSON.stringify(functionsConfig, null, 2),
-      );
+      console.log("Functions config:", JSON.stringify(functionsConfig, null, 2));
     }
 
     return functionsConfig;
@@ -98,21 +90,21 @@ const functionsConfig: Record<string, FunctionConfig> = (() => {
 
 /* --- JWT verification --- */
 export function extractBearerToken(rawToken: string) {
-  const tokenParts = rawToken.split(' ')
-  const [bearer, token] = tokenParts
-  if (bearer !== 'Bearer' || tokenParts.length !== 2) {
-    return null
+  const tokenParts = rawToken.split(" ");
+  const [bearer, token] = tokenParts;
+  if (bearer !== "Bearer" || tokenParts.length !== 2) {
+    return null;
   }
 
-  return token
+  return token;
 }
 
 function getAuthToken(req: Request) {
   const authHeader = req.headers.get("authorization");
-  const sbApiKeyCompatibilityToken = req.headers.get("sb-api-key")
+  const sbApiKeyCompatibilityToken = req.headers.get("sb-api-key");
 
   // NOTE:(kallebysantos) Kong on legacy CLI stack pass it down as 'Bearer Token' format
-  const cleanSbApiKeyCompatibilityToken = sbApiKeyCompatibilityToken?.replace('Bearer', '')?.trim()
+  const cleanSbApiKeyCompatibilityToken = sbApiKeyCompatibilityToken?.replace("Bearer", "")?.trim();
 
   if (!authHeader && !cleanSbApiKeyCompatibilityToken) {
     throw new Error("Missing authorization header");
@@ -121,10 +113,9 @@ function getAuthToken(req: Request) {
   // NOTE:(kallebysantos) Compatibility mode is triggered when all conditions match:
   // - API proxy mints a temp token
   // - Original bearer is not present or is ApiKey
-  const bearerToken = extractBearerToken(authHeader ?? '')
-  const token = (!bearerToken || bearerToken.startsWith('sb_'))
-    ? cleanSbApiKeyCompatibilityToken
-    : bearerToken
+  const bearerToken = extractBearerToken(authHeader ?? "");
+  const token =
+    !bearerToken || bearerToken.startsWith("sb_") ? cleanSbApiKeyCompatibilityToken : bearerToken;
 
   if (!token) {
     throw new Error(`Auth header is not 'Bearer {token}'`);
@@ -139,7 +130,7 @@ async function isValidLegacyJWT(jwtSecret: string, jwt: string): Promise<boolean
   try {
     await jose.jwtVerify(jwt, secretKey);
   } catch (e) {
-    console.error('Symmetric Legacy JWT verification error', e);
+    console.error("Symmetric Legacy JWT verification error", e);
     return false;
   }
   return true;
@@ -149,9 +140,9 @@ async function isValidLegacyJWT(jwtSecret: string, jwt: string): Promise<boolean
 let jwks = (() => {
   try {
     // using injected JWKS from cli
-    return jose.createLocalJWKSet(JSON.parse(Deno.env.get('SUPABASE_JWKS')));
-  } catch (error) {
-    return null
+    return jose.createLocalJWKSet(JSON.parse(Deno.env.get("SUPABASE_JWKS")));
+  } catch {
+    return null;
   }
 })();
 
@@ -163,7 +154,7 @@ async function isValidJWT(jwksUrl: URL, jwt: string): Promise<boolean> {
     }
     await jose.jwtVerify(jwt, jwks);
   } catch (e) {
-    console.error('Asymmetric JWT verification error', e);
+    console.error("Asymmetric JWT verification error", e);
     return false;
   }
   return true;
@@ -173,49 +164,56 @@ async function isValidJWT(jwksUrl: URL, jwt: string): Promise<boolean> {
  * Applies hybrid JWT verification, using JWK as primary and Legacy Secret as fallback.
  * Use only during 'New JWT Keys' migration period, while `JWT_SECRET` is still available.
  */
-export async function verifyHybridJWT(jwtSecret: string, jwksUrl: URL, jwt: string): Promise<boolean> {
-  const { alg: jwtAlgorithm } = jose.decodeProtectedHeader(jwt)
+export async function verifyHybridJWT(
+  jwtSecret: string,
+  jwksUrl: URL,
+  jwt: string,
+): Promise<boolean> {
+  const { alg: jwtAlgorithm } = jose.decodeProtectedHeader(jwt);
 
-  if (jwtAlgorithm === 'HS256') {
-    console.log(`Legacy token type detected, attempting ${jwtAlgorithm} verification.`)
+  if (jwtAlgorithm === "HS256") {
+    console.log(`Legacy token type detected, attempting ${jwtAlgorithm} verification.`);
 
-    return await isValidLegacyJWT(jwtSecret, jwt)
+    return await isValidLegacyJWT(jwtSecret, jwt);
   }
 
-  if (jwtAlgorithm === 'ES256' || jwtAlgorithm === 'RS256') {
-    return await isValidJWT(jwksUrl, jwt)
+  if (jwtAlgorithm === "ES256" || jwtAlgorithm === "RS256") {
+    return await isValidJWT(jwksUrl, jwt);
   }
 
   return false;
 }
 
 // Ref: https://docs.deno.com/examples/checking_file_existence/
-async function shouldUsePackageJsonDiscovery({ entrypointPath, importMapPath }: FunctionConfig): Promise<boolean> {
+async function shouldUsePackageJsonDiscovery({
+  entrypointPath,
+  importMapPath,
+}: FunctionConfig): Promise<boolean> {
   if (importMapPath) {
-    return false
+    return false;
   }
-  const packageJsonPath = posix.join(posix.dirname(entrypointPath), "package.json")
+  const packageJsonPath = join(dirname(entrypointPath), "package.json");
   try {
     await Deno.lstat(packageJsonPath);
   } catch (err) {
     if (err instanceof Deno.errors.NotFound) {
-      return false
+      return false;
     }
   }
-  return true
+  return true;
 }
 
 export function prepareUserRequest(req: Request): Request {
-  const clonedURL = new URL(req.url)
-  const forwardedHost = req.headers.get('x-forwarded-host')
-  clonedURL.hostname = forwardedHost ?? clonedURL.hostname
-  const clonedReq = new Request(clonedURL, req.clone())
+  const clonedURL = new URL(req.url);
+  const forwardedHost = req.headers.get("x-forwarded-host");
+  clonedURL.hostname = forwardedHost ?? clonedURL.hostname;
+  const clonedReq = new Request(clonedURL, req.clone());
 
   // remove custom api headers
-  clonedReq.headers.delete('sb-api-key')
-  EdgeRuntime.applySupabaseTag(req, clonedReq)
+  clonedReq.headers.delete("sb-api-key");
+  EdgeRuntime.applySupabaseTag(req, clonedReq);
 
-  return clonedReq
+  return clonedReq;
 }
 
 Deno.serve({
@@ -229,7 +227,7 @@ Deno.serve({
     }
 
     // handle metrics
-    if (pathname === '/_internal/metric') {
+    if (pathname === "/_internal/metric") {
       const metric = await EdgeRuntime.getRuntimeMetrics();
       return Response.json(metric);
     }
@@ -255,29 +253,35 @@ Deno.serve({
       }
     }
 
-    const servicePath = posix.dirname(functionsConfig[functionName].entrypointPath);
+    const servicePath = dirname(functionsConfig[functionName].entrypointPath);
     console.error(`serving the request with ${servicePath}`);
 
     // Ref: https://supabase.com/docs/guides/functions/limits
     const memoryLimitMb = 256;
     const workerTimeoutMs = isFinite(WALLCLOCK_LIMIT_SEC) ? WALLCLOCK_LIMIT_SEC * 1000 : 400 * 1000;
     const noModuleCache = false;
-    const envVarsObj = Deno.env.toObject();
+    const envVarsObj = {
+      ...Deno.env.toObject(),
+      ...Object.fromEntries(
+        Object.entries(functionsConfig[functionName].env ?? {}).filter(
+          ([name, _]) => !name.startsWith("SUPABASE_"),
+        ),
+      ),
+    };
     if (SUPABASE_PUBLISHABLE_KEY) {
-      envVarsObj['SUPABASE_PUBLISHABLE_KEYS'] = JSON.stringify({
-        default: SUPABASE_PUBLISHABLE_KEY
-      })
+      envVarsObj["SUPABASE_PUBLISHABLE_KEYS"] = JSON.stringify({
+        default: SUPABASE_PUBLISHABLE_KEY,
+      });
     }
     if (SUPABASE_SECRET_KEY) {
-      envVarsObj['SUPABASE_SECRET_KEYS'] = JSON.stringify({
-        default: SUPABASE_SECRET_KEY
-      })
+      envVarsObj["SUPABASE_SECRET_KEYS"] = JSON.stringify({
+        default: SUPABASE_SECRET_KEY,
+      });
     }
 
-    const envVars = Object.entries(envVarsObj)
-      .filter(([name, _]) =>
-        !EXCLUDED_ENVS.includes(name) && !name.startsWith("SUPABASE_INTERNAL_")
-      );
+    const envVars = Object.entries(envVarsObj).filter(
+      ([name, _]) => !EXCLUDED_ENVS.includes(name) && !name.startsWith("SUPABASE_INTERNAL_"),
+    );
 
     const forceCreate = false;
     const customModuleRoot = ""; // empty string to allow any local path
@@ -290,8 +294,8 @@ Deno.serve({
     // This need to be kept for Deno 1 compatibility.
     const decoratorType = "tc39";
 
-    const absEntrypoint = posix.join(Deno.cwd(), functionsConfig[functionName].entrypointPath);
-    const maybeEntrypoint = posix.toFileUrl(absEntrypoint).href;
+    const absEntrypoint = join(Deno.cwd(), functionsConfig[functionName].entrypointPath);
+    const maybeEntrypoint = toFileUrl(absEntrypoint).href;
     const usePackageJson = await shouldUsePackageJsonDiscovery(functionsConfig[functionName]);
 
     const staticPatterns = functionsConfig[functionName].staticFiles;
@@ -317,7 +321,7 @@ Deno.serve({
         staticPatterns,
       });
 
-      const userReq = prepareUserRequest(req)
+      const userReq = prepareUserRequest(req);
       return await worker.fetch(userReq);
     } catch (e) {
       console.error(e);
@@ -329,7 +333,7 @@ Deno.serve({
               code: SB_SPECIFIC_ERROR_TEXT[sbCode],
               message: SB_SPECIFIC_ERROR_REASON[sbCode],
             },
-            sbCode
+            sbCode,
           );
         }
       }
@@ -338,7 +342,7 @@ Deno.serve({
         {
           code: STATUS_TEXT[STATUS_CODE.InternalServerError],
           message: "Request failed due to an internal server error",
-          trace: JSON.stringify(e.stack)
+          trace: JSON.stringify(e.stack),
         },
         STATUS_CODE.InternalServerError,
       );
@@ -347,45 +351,40 @@ Deno.serve({
 
   onListen: () => {
     try {
-      const functionsConfigString = Deno.env.get(
-        "SUPABASE_INTERNAL_FUNCTIONS_CONFIG"
-      );
+      const functionsConfigString = Deno.env.get("SUPABASE_INTERNAL_FUNCTIONS_CONFIG");
       if (functionsConfigString) {
-        const MAX_FUNCTIONS_URL_EXAMPLES = 5
-        const functionsConfig = JSON.parse(functionsConfigString) as Record<
-          string,
-          unknown
-        >;
+        const MAX_FUNCTIONS_URL_EXAMPLES = 5;
+        const functionsConfig = JSON.parse(functionsConfigString) as Record<string, unknown>;
         const functionNames = Object.keys(functionsConfig);
         const exampleFunctions = functionNames.slice(0, MAX_FUNCTIONS_URL_EXAMPLES);
         const functionsUrls = exampleFunctions.map(
-          (fname) => ` - http://127.0.0.1:${HOST_PORT}/functions/v1/${fname}`
+          (fname) => ` - http://127.0.0.1:${HOST_PORT}/functions/v1/${fname}`,
         );
-        const functionsExamplesMessages = functionNames.length > 0
-          // Show some functions urls examples
-          ? `\n${functionsUrls.join(`\n`)}${functionNames.length > MAX_FUNCTIONS_URL_EXAMPLES
-            // If we have more than 10 functions to serve, then show examples for first 10
-            // and a count for the remaining ones
-            ? `\n... and ${functionNames.length - MAX_FUNCTIONS_URL_EXAMPLES} more functions`
-            : ''}`
-          : ''
-        console.log(`${GENERIC_FUNCTION_SERVE_MESSAGE}${functionsExamplesMessages}\nUsing ${Deno.version.deno}`);
+        const functionsExamplesMessages =
+          functionNames.length > 0
+            ? `\n${functionsUrls.join(`\n`)}${
+                functionNames.length > MAX_FUNCTIONS_URL_EXAMPLES
+                  ? `\n... and ${functionNames.length - MAX_FUNCTIONS_URL_EXAMPLES} more functions`
+                  : ""
+              }`
+            : "";
+        console.log(
+          `${GENERIC_FUNCTION_SERVE_MESSAGE}${functionsExamplesMessages}\nUsing ${Deno.version.deno}`,
+        );
       }
-    } catch (e) {
-      console.log(
-        `${GENERIC_FUNCTION_SERVE_MESSAGE}\nUsing ${Deno.version.deno}`
-      );
+    } catch {
+      console.log(`${GENERIC_FUNCTION_SERVE_MESSAGE}\nUsing ${Deno.version.deno}`);
     }
   },
 
-  onError: e => {
+  onError: (e) => {
     return getResponse(
       {
         code: STATUS_TEXT[STATUS_CODE.InternalServerError],
         message: "Request failed due to an internal server error",
-        trace: JSON.stringify(e.stack)
+        trace: JSON.stringify(e.stack),
       },
-      STATUS_CODE.InternalServerError
-    )
-  }
+      STATUS_CODE.InternalServerError,
+    );
+  },
 });

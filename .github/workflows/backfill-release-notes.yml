@@ -17,6 +17,9 @@ on:
         required: false
         type: boolean
         default: false
+    secrets:
+      DF_FIREWALL_TOKEN:
+        required: false
   workflow_dispatch:
     inputs:
       tag:
@@ -35,6 +38,7 @@ permissions:
 jobs:
   backfill:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     continue-on-error: ${{ inputs.non_blocking }}
     permissions:
       contents: write
@@ -48,6 +52,8 @@ jobs:
           persist-credentials: false
 
       - uses: ./.github/actions/setup
+        with:
+          dependency-firewall-token: ${{ secrets.DF_FIREWALL_TOKEN }}
 
       - name: Backfill release notes
         run: |
