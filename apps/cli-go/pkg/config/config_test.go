@@ -676,6 +676,78 @@ func TestGlobFiles(t *testing.T) {
 		// Validate files
 		assert.Empty(t, files)
 	})
+
+	t.Run("skips empty globs when configured", func(t *testing.T) {
+		fsys := fs.MapFS{
+			"supabase/schemas/tables/players.sql": &fs.MapFile{},
+		}
+		g := Glob{
+			"supabase/schemas/tables/*.sql",
+			"supabase/schemas/materialized_views/*.sql",
+		}
+
+		files, err := g.Files(fsys, WithSkipEmptyGlobs())
+
+		assert.NoError(t, err)
+		assert.Equal(t, []string{"supabase/schemas/tables/players.sql"}, files)
+	})
+
+	t.Run("errors when all skipped globs are empty and configured to fail", func(t *testing.T) {
+		fsys := fs.MapFS{}
+		g := Glob{
+			"supabase/schemas/tables/*.sql",
+			"supabase/schemas/materialized_views/*.sql",
+		}
+
+		files, err := g.Files(fsys, WithSkipEmptyGlobs(), WithErrorOnAllSkippedGlobs())
+
+		assert.ErrorContains(t, err, "no files matched pattern")
+		assert.Empty(t, files)
+	})
+}
+
+func TestGlobSQLFiles(t *testing.T) {
+	t.Run("expands directory entries in declared order", func(t *testing.T) {
+		fsys := fs.MapFS{
+			"supabase/schemas/z_function.sql":            &fs.MapFile{Data: []byte("select 1;")},
+			"supabase/schemas/tables/a_table.sql":        &fs.MapFile{Data: []byte("select 2;")},
+			"supabase/schemas/tables/nested/b_table.sql": &fs.MapFile{Data: []byte("select 3;")},
+			"supabase/schemas/tables/readme.md":          &fs.MapFile{Data: []byte("ignored")},
+		}
+		g := Glob{
+			"supabase/schemas/z_function.sql",
+			"supabase/schemas/tables",
+		}
+
+		files, err := g.SQLFiles(fsys)
+
+		assert.NoError(t, err)
+		assert.Equal(t, []string{
+			"supabase/schemas/z_function.sql",
+			"supabase/schemas/tables/a_table.sql",
+			"supabase/schemas/tables/nested/b_table.sql",
+		}, files)
+	})
+
+	t.Run("deduplicates explicit files and directory matches", func(t *testing.T) {
+		fsys := fs.MapFS{
+			"supabase/database/a.sql": &fs.MapFile{Data: []byte("select 1;")},
+			"supabase/database/b.sql": &fs.MapFile{Data: []byte("select 2;")},
+		}
+		g := Glob{
+			"supabase/database/a.sql",
+			"supabase/database",
+			"supabase/database/*.sql",
+		}
+
+		files, err := g.SQLFiles(fsys)
+
+		assert.NoError(t, err)
+		assert.Equal(t, []string{
+			"supabase/database/a.sql",
+			"supabase/database/b.sql",
+		}, files)
+	})
 }
 
 func TestLoadFunctionImportMap(t *testing.T) {

@@ -29,6 +29,7 @@ function mockSeam(paths: Record<LegacyCatalogMode, string>) {
     },
     execInherit: () => Effect.succeed(0),
     ensureLocalDatabaseStarted: () => Effect.void,
+    ensureLocalPostgresImageCurrent: () => Effect.void,
     provisionShadow: () => Effect.die("provisionShadow not used in declarative tests"),
     removeShadowContainer: () => Effect.void,
   });
@@ -50,6 +51,7 @@ function mockEdge(stdout: string) {
 // reports "not required", so no CA bundle/SSL env is injected.
 const probe = Layer.succeed(LegacyPgDeltaSslProbe, {
   requireSsl: () => Effect.succeed(false),
+  requireSslForHost: () => Effect.succeed(false),
 });
 
 const ctx = (declarativeDir: string): LegacyDeclarativeRunContext => ({

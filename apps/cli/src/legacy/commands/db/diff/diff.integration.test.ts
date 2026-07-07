@@ -63,6 +63,7 @@ function setup(workdir: string, opts: SetupOpts = {}) {
     },
     execInherit: () => Effect.succeed(0),
     ensureLocalDatabaseStarted: () => Effect.void,
+    ensureLocalPostgresImageCurrent: () => Effect.void,
     provisionShadow: ({ mode, targetLocal, usePgDelta, projectRef }) => {
       provisionCalls.push({ mode, targetLocal, usePgDelta, projectRef });
       return Effect.succeed({
@@ -156,7 +157,10 @@ function setup(workdir: string, opts: SetupOpts = {}) {
       LegacyNetworkIdFlag,
       opts.networkId === undefined ? Option.none() : Option.some(opts.networkId),
     ),
-    Layer.succeed(LegacyPgDeltaSslProbe, { requireSsl: () => Effect.succeed(false) }),
+    Layer.succeed(LegacyPgDeltaSslProbe, {
+      requireSsl: () => Effect.succeed(false),
+      requireSslForHost: () => Effect.succeed(false),
+    }),
     mockRuntimeInfo(),
     BunServices.layer,
   );

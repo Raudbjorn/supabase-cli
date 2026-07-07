@@ -1,9 +1,10 @@
-import { Effect } from "effect";
+import { Effect, Layer } from "effect";
 import { Argument, Command, Flag } from "effect/unstable/cli";
 
 import { CliArgs } from "../../../../shared/cli/cli-args.service.ts";
 import { withJsonErrorHandling } from "../../../../shared/output/json-error-handling.ts";
 import { withLegacyCommandInstrumentation } from "../../../telemetry/legacy-command-instrumentation.ts";
+import { stdinLayer } from "../../../../shared/runtime/stdin.layer.ts";
 import { legacyRequireExperimental } from "../../../shared/legacy-experimental-gate.ts";
 import { legacyStorageGatewayRuntimeLayer } from "../../../shared/legacy-storage-runtime.layer.ts";
 import {
@@ -41,11 +42,11 @@ export const legacyStorageRmCommand = Command.make("rm", config).pipe(
   ]),
   Command.withHandler((flags) =>
     Effect.gen(function* () {
+      // Gate before the mutex check below — order matters; see
+      // legacyRequireExperimental's doc comment for why.
+      yield* legacyRequireExperimental;
       const cliArgs = yield* CliArgs;
       yield* legacyAssertStorageTargetsExclusive(cliArgs.args);
-      // Go gates `storageCmd` behind `--experimental` in PersistentPreRunE
-      // (root.go:91-96), after flag-group validation and before RunE/PostRun.
-      yield* legacyRequireExperimental;
       const telemetryFlags = {
         recursive: flags.recursive,
         linked: flags.linked,
@@ -59,5 +60,5 @@ export const legacyStorageRmCommand = Command.make("rm", config).pipe(
       }).pipe(withLegacyCommandInstrumentation({ flags: telemetryFlags }));
     }).pipe(withJsonErrorHandling),
   ),
-  Command.provide(legacyStorageGatewayRuntimeLayer(["storage", "rm"])),
+  Command.provide(Layer.mergeAll(legacyStorageGatewayRuntimeLayer(["storage", "rm"]), stdinLayer)),
 );

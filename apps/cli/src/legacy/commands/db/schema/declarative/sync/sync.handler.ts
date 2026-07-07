@@ -16,6 +16,7 @@ import {
   legacyReadDbToml,
   legacyResolveDeclarativeDir,
 } from "../../../../../shared/legacy-db-config.toml-read.ts";
+import { legacyMakeDir } from "../../../../../shared/legacy-make-dir.ts";
 import { legacyApplyMigrationFile } from "../../../../../shared/legacy-migration-apply.ts";
 import { legacyReadProjectRefFile } from "../../../../../shared/legacy-temp-paths.ts";
 import { LegacyLinkedProjectCache } from "../../../../../telemetry/legacy-linked-project-cache.service.ts";
@@ -109,7 +110,6 @@ export const legacyDbSchemaDeclarativeSync = Effect.fn("legacy.db.schema.declara
         pgDeltaEnabled: toml.pgDelta.enabled,
         configPath: path.join("supabase", "config.toml"),
       });
-
       // `path.resolve` (not `path.join`) so an absolute `declarative_schema_path` is
       // used as-is, matching Go's `config.resolve` (which only prefixes the workdir onto
       // a relative path). `path.join(workdir, abs)` would mangle the absolute path.
@@ -131,6 +131,8 @@ export const legacyDbSchemaDeclarativeSync = Effect.fn("legacy.db.schema.declara
         schema: flags.schema,
         noCache: flags.noCache,
       };
+      const ensureLocalPostgresImageCurrent = seam.ensureLocalPostgresImageCurrent();
+      const declarativeFilesExist = yield* declarativeDirHasFiles(fs, declarativeDir);
 
       // Go's `saveApplyDebugBundle`: warn (rather than masking the apply error) and
       // treat the bundle path as empty when the debug directory cannot be created, so
@@ -148,7 +150,7 @@ export const legacyDbSchemaDeclarativeSync = Effect.fn("legacy.db.schema.declara
         );
 
       // Step 1: declarative files must exist; in a TTY, offer to generate them.
-      if (!(yield* declarativeDirHasFiles(fs, declarativeDir))) {
+      if (!declarativeFilesExist) {
         const noFiles = new LegacyDeclarativeNonInteractiveError({
           message: "no declarative schema found. Run supabase db schema declarative generate first",
         });
@@ -207,6 +209,7 @@ export const legacyDbSchemaDeclarativeSync = Effect.fn("legacy.db.schema.declara
           path,
           cliConfig.workdir,
           linkedRef,
+          ensureLocalPostgresImageCurrent,
         );
         const generated = yield* legacyGenerateDeclarativeOutput(run, targetUrl);
         yield* legacyWriteDeclarativeSchemas(fs, path, declarativeDir, generated);
@@ -274,7 +277,7 @@ export const legacyDbSchemaDeclarativeSync = Effect.fn("legacy.db.schema.declara
       // Step 5: write the timestamped migration file.
       const timestamp = formatTimestamp(yield* Clock.currentTimeMillis);
       const migrationPath = path.join(migrationsDir, `${timestamp}_${migrationName}.sql`);
-      yield* fs.makeDirectory(migrationsDir, { recursive: true });
+      yield* legacyMakeDir(fs, migrationsDir);
       yield* fs.writeFileString(migrationPath, result.diffSQL);
       yield* output.raw(`Created new migration at ${legacyBold(migrationPath)}\n`, "stderr");
 
@@ -307,6 +310,7 @@ export const legacyDbSchemaDeclarativeSync = Effect.fn("legacy.db.schema.declara
       if (!shouldApply) return;
 
       // Step 8: apply the migration to the local database (native).
+      yield* ensureLocalPostgresImageCurrent;
       const applyExit = yield* applyMigrationToLocal(
         { port: toml.port, password: toml.password, dnsResolver },
         migrationPath,

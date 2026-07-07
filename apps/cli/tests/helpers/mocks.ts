@@ -100,14 +100,35 @@ export function mockStdin(isTTY: boolean, pipedInput?: string | Uint8Array): Lay
           typeof pipedInput === "string" ? new TextEncoder().encode(pipedInput) : pipedInput,
         );
 
+  const pipedText = Option.isSome(pipedBytes)
+    ? Option.some(new TextDecoder().decode(pipedBytes.value))
+    : Option.none<string>();
+
+  // Split the piped input into lines, dropping the trailing empty element left by a
+  // final newline (production `Stream.splitLines` emits no line after the terminating
+  // newline); interior blank lines are preserved.
+  const lines = Option.isSome(pipedText) ? pipedText.value.split(/\r?\n/u) : [];
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  let lineIndex = 0;
+
   return Layer.succeed(Stdin, {
     isTTY,
     readPipedBytes: Effect.succeed(pipedBytes),
-    readPipedText: Effect.succeed(
-      Option.isSome(pipedBytes)
-        ? Option.some(new TextDecoder().decode(pipedBytes.value))
-        : Option.none<string>(),
-    ),
+    pipedBytesStream: Option.isSome(pipedBytes)
+      ? Stream.fromIterable([pipedBytes.value])
+      : Stream.empty,
+    readPipedText: Effect.succeed(pipedText),
+    // Dispenses the piped lines one per call (trimmed), then None once exhausted —
+    // the timeout is irrelevant to a fixed mock. Mirrors the production persistent
+    // reader so a command issuing several prompts reads successive lines.
+    readLine: () =>
+      Effect.sync(() => {
+        if (lineIndex >= lines.length) {
+          return Option.none<string>();
+        }
+        const line = (lines[lineIndex++] ?? "").trim();
+        return line.length > 0 ? Option.some(line) : Option.none<string>();
+      }),
   });
 }
 

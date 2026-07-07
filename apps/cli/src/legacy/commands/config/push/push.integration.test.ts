@@ -17,7 +17,7 @@ import {
   mockLegacyTelemetryStateTracked,
   useLegacyTempWorkdir,
 } from "../../../../../tests/helpers/legacy-mocks.ts";
-import { mockRuntimeInfo } from "../../../../../tests/helpers/mocks.ts";
+import { mockRuntimeInfo, mockStdin, mockTty } from "../../../../../tests/helpers/mocks.ts";
 import { LegacyYesFlag } from "../../../../shared/legacy/global-flags.ts";
 import { legacyConfigPush } from "./push.handler.ts";
 
@@ -37,6 +37,7 @@ const POSTGREST_DISABLED = {
   db_extra_search_path: "",
   max_rows: 0,
   db_pool: null,
+  db_pool_acquisition_timeout: null,
 };
 
 /** Routes mock HTTP responses by URL path so a single handler serves every endpoint. */
@@ -46,6 +47,8 @@ interface RouteOpts {
   readonly postgrestPatch?: { status: number; body: unknown } | "fail";
   readonly postgresGet?: { status: number; body: unknown };
   readonly postgresPut?: { status: number; body: unknown };
+  readonly storageGet?: { status: number; body: unknown };
+  readonly storagePatch?: { status: number; body: unknown };
 }
 
 function setup(opts: {
@@ -55,6 +58,12 @@ function setup(opts: {
   readonly yes?: boolean;
   readonly confirm?: ReadonlyArray<boolean>;
   readonly promptFail?: boolean;
+  /** stdin interactivity; defaults to a TTY so prompt-driven tests reach the confirm. */
+  readonly stdinIsTty?: boolean;
+  /** Piped (non-TTY) stdin answers, one consumed per confirmation prompt. */
+  readonly pipedAnswers?: ReadonlyArray<string>;
+  /** Working directory the handler runs from; defaults to the temp project root. */
+  readonly runtimeCwd?: string;
 }) {
   writeConfig(opts.toml);
   const routes = opts.routes ?? {};
@@ -89,6 +98,14 @@ function setup(opts: {
         const p = routes.postgresPut ?? { status: 200, body: {} };
         return Effect.succeed(legacyJsonResponse(request, p.status, p.body));
       }
+      if (url.includes("/config/storage")) {
+        if (request.method === "GET") {
+          const g = routes.storageGet ?? { status: 200, body: {} };
+          return Effect.succeed(legacyJsonResponse(request, g.status, g.body));
+        }
+        const p = routes.storagePatch ?? { status: 200, body: {} };
+        return Effect.succeed(legacyJsonResponse(request, p.status, p.body));
+      }
       // Anything else (auth/storage/etc.) — succeed with empty so unconfigured
       // gated services don't hang if a test enables them.
       return Effect.succeed(legacyJsonResponse(request, 200, {}));
@@ -101,10 +118,15 @@ function setup(opts: {
       out,
       api,
       cliConfig: mockLegacyCliConfig({ workdir: tempRoot.current }),
-      runtimeInfo: mockRuntimeInfo({ cwd: tempRoot.current }),
+      runtimeInfo: mockRuntimeInfo({ cwd: opts.runtimeCwd ?? tempRoot.current }),
       telemetry: telemetry.layer,
       linkedProjectCache: linkedProjectCache.layer,
+      tty: mockTty({ stdinIsTty: opts.stdinIsTty ?? true, stdoutIsTty: false }),
     }),
+    mockStdin(
+      opts.stdinIsTty ?? true,
+      opts.pipedAnswers ? `${opts.pipedAnswers.join("\n")}\n` : undefined,
+    ),
     Layer.succeed(LegacyYesFlag, opts.yes ?? false),
   );
   return { layer, out, api, telemetry, linkedProjectCache };
@@ -118,6 +140,20 @@ enabled = false
 [storage]
 enabled = false
 `;
+
+const STORAGE_CONFIG_WITHOUT_POOL_MODE = {
+  fileSizeLimit: 52428800,
+  features: {
+    imageTransformation: { enabled: false },
+    s3Protocol: { enabled: false },
+    purgeCache: { enabled: false },
+    icebergCatalog: { enabled: false, maxNamespaces: 0, maxTables: 0, maxCatalogs: 0 },
+    vectorBuckets: { enabled: false, maxBuckets: 0, maxIndexes: 0 },
+  },
+  capabilities: { list_v2: true, iceberg_catalog: false },
+  external: { upstreamTarget: "main" },
+  migrationVersion: "20240701",
+};
 
 describe("legacy config push integration", () => {
   it.live("pushes local config (text, Go parity) and surfaces a PATCH failure", () => {
@@ -224,6 +260,7 @@ project_id = "abcdefghijklmnopqrst"
             db_extra_search_path: "public,extensions",
             max_rows: 1000,
             db_pool: null,
+            db_pool_acquisition_timeout: null,
             jwt_secret: "x",
           },
         },
@@ -272,10 +309,13 @@ project_id = "abcdefghijklmnopqrst"
     }).pipe(Effect.provide(layer));
   });
 
-  it.live("defaults to yes in non-TTY text without --yes", () => {
-    const { layer, api } = setup({
+  it.live("defaults to yes on empty non-TTY stdin, echoing the prompt", () => {
+    // Go's `PromptYesNo(..., true)` (`push.go:36`) prints the label and scans
+    // stdin even on a non-terminal (`console.go:96-102`); with no piped input the
+    // scan is empty and it falls back to the default (`true`), so the push proceeds.
+    const { layer, api, out } = setup({
       toml: API_ONLY_TOML,
-      promptFail: true,
+      stdinIsTty: false,
       routes: {
         postgrestGet: { status: 200, body: POSTGREST_DISABLED },
         postgresGet: { status: 200, body: {} },
@@ -286,7 +326,100 @@ project_id = "abcdefghijklmnopqrst"
       expect(api.requests.some((r) => r.method === "PATCH" && r.url.includes("/postgrest"))).toBe(
         true,
       );
+      // Label printed + empty answer echoed (Go's non-TTY `PromptText`).
+      expect(out.stderrText).toContain("Do you want to push api config to remote? [Y/n] \n");
     }).pipe(Effect.provide(layer));
+  });
+
+  it.live("honors a piped 'n' decline on non-TTY stdin (no update)", () => {
+    // Regression: Go scans piped stdin before defaulting (`console.go:74-82`), so a
+    // piped `n` cancels the push even on a non-terminal — it must not silently apply.
+    const { layer, api, out } = setup({
+      toml: API_ONLY_TOML,
+      stdinIsTty: false,
+      pipedAnswers: ["n"],
+      routes: {
+        postgrestGet: { status: 200, body: POSTGREST_DISABLED },
+        postgresGet: { status: 200, body: {} },
+      },
+    });
+    return Effect.gen(function* () {
+      yield* legacyConfigPush({ projectRef: Option.none() });
+      expect(api.requests.some((r) => r.method === "PATCH" && r.url.includes("/postgrest"))).toBe(
+        false,
+      );
+      // The consumed answer is echoed to stderr (Go's non-TTY `PromptText`).
+      expect(out.stderrText).toContain("Do you want to push api config to remote? [Y/n] n");
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.live("honors SUPABASE_YES from supabase/.env even against a piped 'n'", () => {
+    // Go's config push runs `flags.LoadConfig`, importing `supabase/.env` before
+    // `PromptYesNo`, so a project-local `SUPABASE_YES=true` auto-confirms before
+    // stdin is read — the push proceeds despite the piped `n`.
+    const prev = process.env["SUPABASE_YES"];
+    delete process.env["SUPABASE_YES"];
+    const { layer, api } = setup({
+      toml: API_ONLY_TOML,
+      stdinIsTty: false,
+      pipedAnswers: ["n"],
+      routes: {
+        postgrestGet: { status: 200, body: POSTGREST_DISABLED },
+        postgresGet: { status: 200, body: {} },
+      },
+    });
+    // Written after setup()'s writeConfig created supabase/.
+    writeFileSync(join(tempRoot.current, "supabase", ".env"), "SUPABASE_YES=true\n");
+    return Effect.gen(function* () {
+      yield* legacyConfigPush({ projectRef: Option.none() });
+      expect(api.requests.some((r) => r.method === "PATCH" && r.url.includes("/postgrest"))).toBe(
+        true,
+      );
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (prev === undefined) delete process.env["SUPABASE_YES"];
+          else process.env["SUPABASE_YES"] = prev;
+        }),
+      ),
+      Effect.provide(layer),
+    );
+  });
+
+  it.live("loads config-push env from the project root when run from a subdirectory", () => {
+    // Go's ChangeWorkDir moves to the project root before flags.LoadConfig, so a
+    // SUPABASE_YES in <root>/supabase/.env auto-confirms even when invoked from a
+    // subdir. The env load must walk up like loadProjectConfig, not use the raw cwd.
+    const prev = process.env["SUPABASE_YES"];
+    delete process.env["SUPABASE_YES"];
+    const sub = join(tempRoot.current, "nested", "dir");
+    mkdirSync(sub, { recursive: true });
+    const { layer, api } = setup({
+      toml: API_ONLY_TOML,
+      stdinIsTty: false,
+      pipedAnswers: ["n"],
+      runtimeCwd: sub,
+      routes: {
+        postgrestGet: { status: 200, body: POSTGREST_DISABLED },
+        postgresGet: { status: 200, body: {} },
+      },
+    });
+    // `.env` lives at the project ROOT (setup's writeConfig wrote config.toml there).
+    writeFileSync(join(tempRoot.current, "supabase", ".env"), "SUPABASE_YES=true\n");
+    return Effect.gen(function* () {
+      yield* legacyConfigPush({ projectRef: Option.none() });
+      expect(api.requests.some((r) => r.method === "PATCH" && r.url.includes("/postgrest"))).toBe(
+        true,
+      );
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (prev === undefined) delete process.env["SUPABASE_YES"];
+          else process.env["SUPABASE_YES"] = prev;
+        }),
+      ),
+      Effect.provide(layer),
+    );
   });
 
   it.live("emits a structured summary in json mode without prompts", () => {
@@ -304,6 +437,30 @@ project_id = "abcdefghijklmnopqrst"
       expect(success).toBeDefined();
       expect(success?.data?.project_ref).toBe("abcdefghijklmnopqrst");
       expect(Array.isArray(success?.data?.services)).toBe(true);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.live("pushes storage when the remote response omits databasePoolMode", () => {
+    const { layer, api } = setup({
+      toml: `project_id = "test"
+[auth]
+enabled = false
+[storage]
+enabled = true
+file_size_limit = "50MiB"
+`,
+      yes: true,
+      routes: {
+        postgrestGet: { status: 200, body: POSTGREST_DISABLED },
+        postgresGet: { status: 200, body: {} },
+        storageGet: { status: 200, body: STORAGE_CONFIG_WITHOUT_POOL_MODE },
+      },
+    });
+    return Effect.gen(function* () {
+      yield* legacyConfigPush({ projectRef: Option.none() });
+      expect(
+        api.requests.some((r) => r.method === "GET" && r.url.includes("/config/storage")),
+      ).toBe(true);
     }).pipe(Effect.provide(layer));
   });
 
@@ -346,6 +503,7 @@ project_id = "abcdefghijklmnopqrst"
         cliConfig: mockLegacyCliConfig({ workdir: tempRoot.current }),
         runtimeInfo: mockRuntimeInfo({ cwd: tempRoot.current }),
       }),
+      mockStdin(true),
       Layer.succeed(LegacyYesFlag, true),
     );
     return Effect.gen(function* () {
@@ -414,7 +572,10 @@ function setupService(opts: {
       runtimeInfo: mockRuntimeInfo({ cwd: opts.runtimeCwd ?? tempRoot.current }),
       telemetry: telemetry.layer,
       linkedProjectCache: linkedProjectCache.layer,
+      // Gated-service prompts model an interactive user answering via `confirm`.
+      tty: mockTty({ stdinIsTty: true, stdoutIsTty: false }),
     }),
+    mockStdin(true),
     Layer.succeed(LegacyYesFlag, opts.yes ?? false),
   );
   return { layer, out, apiMock };

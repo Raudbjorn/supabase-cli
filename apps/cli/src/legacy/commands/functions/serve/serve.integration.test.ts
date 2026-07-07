@@ -477,6 +477,14 @@ describe("legacy functions serve integration", () => {
         expect(dockerRun.args).toContain("--add-host");
         expect(dockerRun.args).toContain("host.docker.internal:host-gateway");
         expect(dockerRun.args).toContain("public.ecr.aws/supabase/edge-runtime:v1.73.13");
+        expect(
+          extractFlagValues(dockerRun.args, "-v").some((value) =>
+            value.endsWith(":/root/index.ts:ro"),
+          ),
+        ).toBe(true);
+        expect(dockerRun.args[dockerRun.args.length - 1]).toBe(
+          "edge-runtime start --main-service=/root --port=8081 --policy=per_worker\n",
+        );
 
         const envs = yield* Effect.promise(() => extractDockerEnvEntries(dockerRun));
         expect(envs).toContain("HELLO=WORLD");
@@ -851,6 +859,103 @@ describe("legacy functions serve integration", () => {
     });
   });
 
+  it.live("binds git-root workspace imports for serve", () => {
+    deployMockState.runHandler = (command, args) => {
+      if (command !== "docker") {
+        throw new Error(`unexpected process: ${command}`);
+      }
+      if (args[0] === "container" && args[1] === "inspect") {
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "rm") {
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "run") {
+        return { exitCode: 0, stdout: "edge-runtime-id\n", stderr: "" };
+      }
+      if (args[0] === "exec") {
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      throw new Error(`unexpected docker args: ${args.join(" ")}`);
+    };
+
+    const childSpawner = mockDockerLogSpawner([
+      {
+        exitCode: 1,
+        stderr: "workspace import logs failed",
+      },
+    ]);
+
+    return Effect.gen(function* () {
+      const sharedPath = join(tempRoot.current, "packages", "shared", "src", "index.ts");
+
+      yield* Effect.promise(() => mkdir(join(tempRoot.current, ".git"), { recursive: true }));
+      yield* Effect.promise(() =>
+        writeProjectConfig(
+          [
+            'project_id = "test-project"',
+            "[functions.hello]",
+            'entrypoint = "./functions/hello/index.ts"',
+            'import_map = "./functions/hello/deno.json"',
+            "",
+          ].join("\n"),
+        ),
+      );
+      yield* Effect.promise(() =>
+        writeProjectFile("packages/shared/src/index.ts", 'export const shared = "hello"\n'),
+      );
+      yield* Effect.promise(() =>
+        writeFunctionFile(
+          "hello",
+          "index.ts",
+          [
+            'import { shared } from "@repo/shared"',
+            "Deno.serve(() => new Response(shared))",
+            "",
+          ].join("\n"),
+        ),
+      );
+      yield* Effect.promise(() =>
+        writeFunctionFile(
+          "hello",
+          "deno.json",
+          JSON.stringify({
+            imports: {
+              "@repo/shared": "../../../packages/shared/src/index.ts",
+            },
+          }),
+        ),
+      );
+
+      const { layer } = setupServe({ childSpawner });
+      const error = yield* legacyFunctionsServe(baseFlags()).pipe(
+        Effect.provide(layer),
+        Effect.flip,
+      );
+
+      expect(error).toBeInstanceOf(Error);
+      if (error instanceof Error) {
+        expect(error.message).toContain("workspace import logs failed");
+      }
+
+      const dockerRun = deployMockState.runCalls.find(
+        (call) => call.command === "docker" && call.args[0] === "run",
+      );
+      expect(dockerRun).toBeDefined();
+      if (dockerRun === undefined) {
+        throw new Error("expected docker run invocation");
+      }
+      const resolvedSharedPath = realpathSync(sharedPath);
+      expect(
+        extractFlagValues(dockerRun.args, "-v").some(
+          (value) =>
+            value.startsWith(`${resolvedSharedPath}:`) &&
+            value.endsWith("/packages/shared/src/index.ts:ro"),
+        ),
+      ).toBe(true);
+    });
+  });
+
   it.live("restarts the runtime when watched files change", () => {
     deployMockState.runHandler = (command, args) => {
       if (command !== "docker") {
@@ -1147,7 +1252,14 @@ describe("legacy functions serve integration", () => {
       }
 
       const commandScript = dockerRun.args[dockerRun.args.length - 1] ?? "";
-      expect(commandScript).toContain("cat <<'EOF' > /root/index.ts");
+      expect(commandScript).toBe(
+        "edge-runtime start --main-service=/root --port=8081 --policy=per_worker\n",
+      );
+      expect(
+        extractFlagValues(dockerRun.args, "-v").some((value) =>
+          value.endsWith(":/root/index.ts:ro"),
+        ),
+      ).toBe(true);
       expect(commandScript).not.toContain("@ts-nocheck");
       expect(commandScript).not.toContain("declare const Deno");
       expect(commandScript).not.toContain("declare const EdgeRuntime");
