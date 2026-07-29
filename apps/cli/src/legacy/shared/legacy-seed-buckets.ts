@@ -1,6 +1,7 @@
 import {
   loadProjectConfig,
   type LoadProjectConfigOptions,
+  type ProjectConfig,
   ProjectConfigSchema,
 } from "@supabase/config";
 import { Effect, FileSystem, Path, Schema } from "effect";
@@ -8,10 +9,11 @@ import { FetchHttpClient } from "effect/unstable/http";
 import type { PlatformError } from "effect/PlatformError";
 
 import { Output } from "../../shared/output/output.service.ts";
-import { legacyResolveYes } from "../../shared/legacy/global-flags.ts";
+import { legacyResolveYesWithProjectEnv } from "../../shared/legacy/global-flags.ts";
 import { LegacyCliConfig } from "../config/legacy-cli-config.service.ts";
 import { legacyBold, legacyYellow } from "./legacy-colors.ts";
-import { legacyPromptYesNo } from "./legacy-prompt-yes-no.ts";
+import { legacyLoadProjectEnv } from "./legacy-db-config.toml-read.ts";
+import { legacyPromptYesNo } from "../../shared/legacy/legacy-prompt-yes-no.ts";
 import {
   legacyResolveStorageCredentials,
   legacyStorageGatewayFetch,
@@ -36,6 +38,14 @@ import { legacyBucketObjectKey } from "../commands/seed/buckets/buckets.upload.t
 
 const CONFIG_PATH = "supabase/config.toml";
 const UPLOAD_CONCURRENCY = 5;
+
+/**
+ * Well-known OS metadata files (macOS Finder, Windows Explorer) that must
+ * never be uploaded as seeded objects — see CLI-1950. Go has no equivalent
+ * skip; this is an intentional TS-only improvement over Go's current (also
+ * buggy) behavior.
+ */
+const osJunkFileNames = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
 
 /**
  * Mirrors Go's `ValidateBucketName` regex (`apps/cli-go/pkg/config/config.go:1382`).
@@ -127,40 +137,76 @@ export const legacySeedBucketsRun = Effect.fnUntraced(function* (opts: {
   /**
    * Pre-resolved auto-confirm value. `db reset` resolves `yes` with the nested project
    * `.env` loaded (Go's `loadNestedEnv` runs before `buckets.Run`), so pass it through here
-   * — the internal `legacyResolveYes` only sees the shell env and would skip the
-   * bucket/vector/analytics prune that a `SUPABASE_YES` in `supabase/.env` should confirm.
-   * When omitted (the standalone `seed buckets` command), fall back to `legacyResolveYes`.
+   * — the internal fallback below only loads whatever THIS command's own project would
+   * supply. When omitted (the standalone `seed buckets` command), fall back to
+   * `legacyResolveYesWithProjectEnv`, loading the project env ourselves — `seed buckets`
+   * defaults to `--local` (Go's `seedFlags.Bool("local", true, ...)`, `cmd/seed.go:31`),
+   * and root's `ParseDatabaseConfig` calls `LoadConfig` — loading the project `.env` files
+   * — before `buckets.Run`'s overwrite/prune prompts (`root.go:118`), so a `SUPABASE_YES`
+   * set only in `supabase/.env` must auto-confirm here too.
    */
   readonly yes?: boolean;
+  /**
+   * Skips this function's own `loadProjectConfig` reload in favor of a config
+   * the caller already resolved (and may have folded env overrides into —
+   * see `start.handler.ts`'s `effectiveLocalStorageConfig`). Go's `buckets.Run`
+   * never reloads config itself: it reads the single process-wide `utils.Config`
+   * populated once by `Config.Load()` at CLI startup, so any `SUPABASE_*`
+   * override already in effect for the rest of that process (e.g. an
+   * env-overridden `api.port`/`api.tls.enabled` that actually brought Kong up
+   * differently) is automatically visible here too. `start` is a long-running
+   * process that resolves its own config/env once up front and must reuse
+   * that SAME resolution for bucket seeding to match — an independent reload
+   * from disk would silently drop any override that exists only in the
+   * shell/dotenv, not literally in config.toml. Only `start` passes this;
+   * the standalone `seed buckets` command's own single load already IS Go's
+   * one-shot `Config.Load()` for that process, so it keeps reloading below.
+   */
+  readonly resolvedConfig?: {
+    readonly config: ProjectConfig;
+    readonly document: Record<string, unknown> | undefined;
+  };
 }) {
   const output = yield* Output;
   const cliConfig = yield* LegacyCliConfig;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   // `--yes` OR `SUPABASE_YES` (Go's viper AutomaticEnv, root.go:318-320).
-  const yes = opts.yes ?? (yield* legacyResolveYes);
+  const yes =
+    opts.yes ??
+    (yield* legacyResolveYesWithProjectEnv(
+      yield* legacyLoadProjectEnv(fs, path, cliConfig.workdir),
+    ));
   const { projectRef, emitSummary } = opts;
   const interactive = opts.interactive ?? true;
 
   // Load config.toml, passing projectRef so `[remotes.*]` overrides are merged for
-  // --linked. A parse failure aborts before any network call.
-  const loadOptions: LoadProjectConfigOptions | undefined =
-    projectRef !== "" ? { projectRef } : undefined;
-  const loaded = yield* loadProjectConfig(cliConfig.workdir, loadOptions).pipe(
-    Effect.catchTag(
-      "ProjectConfigParseError",
-      (cause) =>
-        new LegacySeedConfigLoadError({
-          message: `failed to parse supabase/config.toml: ${String(cause.cause)}`,
-        }),
-    ),
-  );
+  // --linked. A parse failure aborts before any network call. Skipped entirely
+  // when the caller already supplied `resolvedConfig` — see that option's doc
+  // comment above.
+  const loadOptions: LoadProjectConfigOptions =
+    projectRef !== "" ? { projectRef, goViperCompat: true } : { goViperCompat: true };
+  const loaded =
+    opts.resolvedConfig !== undefined
+      ? null
+      : yield* loadProjectConfig(cliConfig.workdir, loadOptions).pipe(
+          Effect.catchTag(
+            "ProjectConfigParseError",
+            (cause) =>
+              new LegacySeedConfigLoadError({
+                message: `failed to parse supabase/config.toml: ${String(cause.cause)}`,
+              }),
+          ),
+        );
   // A missing config file is NOT an early exit: Go uses embedded defaults and
   // still gates the no-op on `len(projectRef) == 0`. So local + no-config falls
   // into the no-op short-circuit; `--linked` + no-config falls through to the
-  // remote path so auth/project/API failures surface.
-  const config = loaded === null ? legacyDecodeDefaultProjectConfig({}) : loaded.config;
-  const document = loaded === null ? undefined : loaded.document;
+  // remote path so auth/project/API failures surface. `resolvedConfig` (when
+  // given) always wins over a `null` `loaded` — see that option's doc comment.
+  const config =
+    opts.resolvedConfig?.config ??
+    (loaded === null ? legacyDecodeDefaultProjectConfig({}) : loaded.config);
+  const document = opts.resolvedConfig?.document ?? (loaded === null ? undefined : loaded.document);
 
   // Go prints this from inside config load (`config.go:513`) whenever a
   // `[remotes.*]` block matched the linked ref. stderr in all output modes.
@@ -528,6 +574,10 @@ const collectFiles = (
       return yield* collectDir(fs, path, output, absRoot, displayRoot);
     }
     if (info.type === "File") {
+      if (osJunkFileNames.has(path.basename(displayRoot))) {
+        yield* output.raw(`Skipping OS metadata file: ${displayRoot}\n`, "stderr");
+        return [];
+      }
       return [{ absPath: absRoot, displayPath: displayRoot }];
     }
     yield* output.raw(`Skipping non-regular file: ${displayRoot}\n`, "stderr");
@@ -547,6 +597,10 @@ const collectDir = (
     for (const name of names) {
       const absChild = path.join(absDir, name);
       const displayChild = path.join(displayDir, name);
+      if (osJunkFileNames.has(name)) {
+        yield* output.raw(`Skipping OS metadata file: ${displayChild}\n`, "stderr");
+        continue;
+      }
       // `readLink` succeeds only on a symlink — our no-follow detector (Effect's
       // `stat` follows symlinks and has no `lstat`).
       const isSymlink = yield* fs.readLink(absChild).pipe(

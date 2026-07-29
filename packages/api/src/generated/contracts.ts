@@ -419,7 +419,7 @@ export const V1BulkCreateSecretsInput = Schema.Struct({
         .check(Schema.isPattern(new RegExp("^(?!SUPABASE_).*"))),
       value: Schema.String.check(Schema.isMaxLength(24576)),
     }),
-  ),
+  ).check(Schema.isMaxLength(100)),
 });
 export const V1BulkDeleteSecretsInput = Schema.Struct({
   ref: Schema.String.check(Schema.isMinLength(20))
@@ -2421,7 +2421,11 @@ export const V1GetJitAccessConfigOutput = Schema.Union(
     }),
     Schema.Struct({
       state: Schema.Literal("unavailable"),
-      unavailableReason: Schema.Literals(["postgres_upgrade_required", "temporarily_unavailable"]),
+      unavailableReason: Schema.Literals([
+        "postgres_upgrade_required",
+        "ssl_enforcement_required",
+        "temporarily_unavailable",
+      ]),
     }),
   ],
   { mode: "oneOf" },
@@ -2657,7 +2661,11 @@ export const V1GetPgsodiumConfigInput = Schema.Struct({
     .check(Schema.isMaxLength(20))
     .check(Schema.isPattern(new RegExp("^[a-z]+$"))),
 });
-export const V1GetPgsodiumConfigOutput = Schema.Struct({ root_key: Schema.String });
+export const V1GetPgsodiumConfigOutput = Schema.Struct({
+  root_key: Schema.String.annotate({
+    description: "The pgsodium root key: 32 bytes, hex-encoded (64 characters).",
+  }),
+});
 export const V1GetPoolerConfigInput = Schema.Struct({
   ref: Schema.String.check(Schema.isMinLength(20))
     .check(Schema.isMaxLength(20))
@@ -2703,6 +2711,11 @@ export const V1GetPostgresConfigOutput = Schema.Struct({
       .check(Schema.isGreaterThanOrEqualTo(10))
       .check(Schema.isLessThanOrEqualTo(2147483640)),
   ),
+  max_logical_replication_workers: Schema.optionalKey(
+    Schema.Number.check(Schema.isInt())
+      .check(Schema.isGreaterThanOrEqualTo(0))
+      .check(Schema.isLessThanOrEqualTo(262143)),
+  ),
   max_parallel_maintenance_workers: Schema.optionalKey(
     Schema.Number.check(Schema.isInt())
       .check(Schema.isGreaterThanOrEqualTo(0))
@@ -2722,6 +2735,11 @@ export const V1GetPostgresConfigOutput = Schema.Struct({
   max_slot_wal_keep_size: Schema.optionalKey(Schema.String),
   max_standby_archive_delay: Schema.optionalKey(Schema.String),
   max_standby_streaming_delay: Schema.optionalKey(Schema.String),
+  max_sync_workers_per_subscription: Schema.optionalKey(
+    Schema.Number.check(Schema.isInt())
+      .check(Schema.isGreaterThanOrEqualTo(0))
+      .check(Schema.isLessThanOrEqualTo(262143)),
+  ),
   max_wal_size: Schema.optionalKey(Schema.String),
   max_wal_senders: Schema.optionalKey(Schema.Number.check(Schema.isInt())),
   max_worker_processes: Schema.optionalKey(
@@ -4344,6 +4362,12 @@ export const V1RunAQueryInput = Schema.Struct({
   parameters: Schema.optionalKey(Schema.Array(Schema.Json)),
   read_only: Schema.optionalKey(Schema.Boolean),
 });
+export const V1ScrapeProjectMetricsInput = Schema.Struct({
+  ref: Schema.String.check(Schema.isMinLength(20))
+    .check(Schema.isMaxLength(20))
+    .check(Schema.isPattern(new RegExp("^[a-z]+$"))),
+});
+export const V1ScrapeProjectMetricsOutput = Schema.String;
 export const V1SetupAReadReplicaInput = Schema.Struct({
   ref: Schema.String.check(Schema.isMinLength(20))
     .check(Schema.isMaxLength(20))
@@ -5549,7 +5573,11 @@ export const V1UpdateJitAccessConfigOutput = Schema.Union(
     }),
     Schema.Struct({
       state: Schema.Literal("unavailable"),
-      unavailableReason: Schema.Literals(["postgres_upgrade_required", "temporarily_unavailable"]),
+      unavailableReason: Schema.Literals([
+        "postgres_upgrade_required",
+        "ssl_enforcement_required",
+        "temporarily_unavailable",
+      ]),
     }),
   ],
   { mode: "oneOf" },
@@ -5587,9 +5615,15 @@ export const V1UpdatePgsodiumConfigInput = Schema.Struct({
   ref: Schema.String.check(Schema.isMinLength(20))
     .check(Schema.isMaxLength(20))
     .check(Schema.isPattern(new RegExp("^[a-z]+$"))),
-  root_key: Schema.String,
+  root_key: Schema.String.annotate({
+    description: "The pgsodium root key: 32 bytes, hex-encoded (64 characters).",
+  }),
 });
-export const V1UpdatePgsodiumConfigOutput = Schema.Struct({ root_key: Schema.String });
+export const V1UpdatePgsodiumConfigOutput = Schema.Struct({
+  root_key: Schema.String.annotate({
+    description: "The pgsodium root key: 32 bytes, hex-encoded (64 characters).",
+  }),
+});
 export const V1UpdatePoolerConfigInput = Schema.Struct({
   ref: Schema.String.check(Schema.isMinLength(20))
     .check(Schema.isMaxLength(20))
@@ -5649,6 +5683,11 @@ export const V1UpdatePostgresConfigInput = Schema.Struct({
       .check(Schema.isGreaterThanOrEqualTo(10))
       .check(Schema.isLessThanOrEqualTo(2147483640)),
   ),
+  max_logical_replication_workers: Schema.optionalKey(
+    Schema.Number.check(Schema.isInt())
+      .check(Schema.isGreaterThanOrEqualTo(0))
+      .check(Schema.isLessThanOrEqualTo(262143)),
+  ),
   max_parallel_maintenance_workers: Schema.optionalKey(
     Schema.Number.check(Schema.isInt())
       .check(Schema.isGreaterThanOrEqualTo(0))
@@ -5668,6 +5707,11 @@ export const V1UpdatePostgresConfigInput = Schema.Struct({
   max_slot_wal_keep_size: Schema.optionalKey(Schema.String),
   max_standby_archive_delay: Schema.optionalKey(Schema.String),
   max_standby_streaming_delay: Schema.optionalKey(Schema.String),
+  max_sync_workers_per_subscription: Schema.optionalKey(
+    Schema.Number.check(Schema.isInt())
+      .check(Schema.isGreaterThanOrEqualTo(0))
+      .check(Schema.isLessThanOrEqualTo(262143)),
+  ),
   max_wal_size: Schema.optionalKey(Schema.String),
   max_wal_senders: Schema.optionalKey(Schema.Number.check(Schema.isInt())),
   max_worker_processes: Schema.optionalKey(
@@ -5732,6 +5776,11 @@ export const V1UpdatePostgresConfigOutput = Schema.Struct({
       .check(Schema.isGreaterThanOrEqualTo(10))
       .check(Schema.isLessThanOrEqualTo(2147483640)),
   ),
+  max_logical_replication_workers: Schema.optionalKey(
+    Schema.Number.check(Schema.isInt())
+      .check(Schema.isGreaterThanOrEqualTo(0))
+      .check(Schema.isLessThanOrEqualTo(262143)),
+  ),
   max_parallel_maintenance_workers: Schema.optionalKey(
     Schema.Number.check(Schema.isInt())
       .check(Schema.isGreaterThanOrEqualTo(0))
@@ -5751,6 +5800,11 @@ export const V1UpdatePostgresConfigOutput = Schema.Struct({
   max_slot_wal_keep_size: Schema.optionalKey(Schema.String),
   max_standby_archive_delay: Schema.optionalKey(Schema.String),
   max_standby_streaming_delay: Schema.optionalKey(Schema.String),
+  max_sync_workers_per_subscription: Schema.optionalKey(
+    Schema.Number.check(Schema.isInt())
+      .check(Schema.isGreaterThanOrEqualTo(0))
+      .check(Schema.isLessThanOrEqualTo(262143)),
+  ),
   max_wal_size: Schema.optionalKey(Schema.String),
   max_wal_senders: Schema.optionalKey(Schema.Number.check(Schema.isInt())),
   max_worker_processes: Schema.optionalKey(
@@ -6252,6 +6306,7 @@ export const openApiOperationIdMap = {
   "v1-revoke-token": "v1RevokeToken",
   "v1-rollback-migrations": "v1RollbackMigrations",
   "v1-run-a-query": "v1RunAQuery",
+  "v1-scrape-project-metrics": "v1ScrapeProjectMetrics",
   "v1-setup-a-read-replica": "v1SetupAReadReplica",
   "v1-shutdown-realtime": "v1ShutdownRealtime",
   "v1-undo": "v1Undo",
@@ -8246,6 +8301,20 @@ export const operationDefinitions = {
     inputSchema: V1RunAQueryInput,
     outputSchema: V1RunAQueryOutput,
   },
+  v1ScrapeProjectMetrics: {
+    id: "v1ScrapeProjectMetrics",
+    description:
+      "Prometheus scrape endpoint. Returns metrics of a customer project in the Prometheus open exposition format.",
+    method: "GET",
+    path: "/v1/projects/{ref}/analytics/endpoints/metrics",
+    pathParams: ["ref"],
+    queryParams: [],
+    headerParams: [],
+    requestBody: { kind: "none" },
+    response: { kind: "text" },
+    inputSchema: V1ScrapeProjectMetricsInput,
+    outputSchema: V1ScrapeProjectMetricsOutput,
+  },
   v1SetupAReadReplica: {
     id: "v1SetupAReadReplica",
     description: "[Beta] Set up a read replica",
@@ -8773,6 +8842,7 @@ export const operationDefinitions = {
         "track_activity_query_size",
         "max_connections",
         "max_locks_per_transaction",
+        "max_logical_replication_workers",
         "max_parallel_maintenance_workers",
         "max_parallel_workers",
         "max_parallel_workers_per_gather",
@@ -8780,6 +8850,7 @@ export const operationDefinitions = {
         "max_slot_wal_keep_size",
         "max_standby_archive_delay",
         "max_standby_streaming_delay",
+        "max_sync_workers_per_subscription",
         "max_wal_size",
         "max_wal_senders",
         "max_worker_processes",

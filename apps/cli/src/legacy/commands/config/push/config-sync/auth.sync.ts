@@ -13,10 +13,11 @@ import type { ProjectConfig } from "@supabase/config";
 
 import { diff } from "./config-sync.diff.ts";
 import { type TomlField, type TomlValue, encodeToml } from "./config-sync.toml.ts";
+import { legacyStrToArr } from "../../../../shared/legacy-local-config-values.ts";
 import { intToUint } from "../../../../shared/legacy-size-units.ts";
 import { durationString, parseDuration, secondsToDurationString } from "./config-sync.duration.ts";
 import type { AuthEmailContent } from "./config-sync.auth-email-content.ts";
-import { secretHash } from "./config-sync.secret.ts";
+import { secretHash, secretPlaintext } from "./config-sync.secret.ts";
 
 // ---------------------------------------------------------------------------
 // Sub-types
@@ -838,11 +839,6 @@ const AUTH_FIELDS: ReadonlyArray<TomlField> = [
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Go `strToArr`: empty string → `[]`, else comma-split. */
-function strToArr(v: string): Array<string> {
-  return v.length === 0 ? [] : v.split(",");
-}
-
 /** Go `cast.IntToUint`: clamp negatives to 0. */
 function valOrDefault<T>(v: T | null | undefined, def: T): T {
   return v == null ? def : v;
@@ -858,9 +854,13 @@ function normalizeDurationStr(s: string | undefined): string {
   }
 }
 
-function projectSecret(projectId: string, value: string | undefined): string {
+function projectSecret(
+  projectId: string,
+  value: string | undefined,
+  dotenvPrivateKeys: ReadonlyArray<string>,
+): string {
   if (!value) return "";
-  return secretHash(projectId, value);
+  return secretHash(projectId, value, dotenvPrivateKeys);
 }
 
 /**
@@ -908,12 +908,21 @@ export interface AuthPresence {
  * Projects `config.auth` into the push subset, pre-computing all duration and
  * secret fields.  `projectId` is the HMAC key for secret hashing. `presence`
  * carries raw-config presence for the optional sub-sections Go skips when nil.
+ * `dotenvPrivateKeys` (Go's `DOTENV_PRIVATE_KEY`/`DOTENV_PRIVATE_KEY_*` values)
+ * decrypt any `encrypted:` (dotenvx) secret before it's hashed or copied into
+ * {@link AuthSubset.rawSecrets} — see `config-sync.secret.ts`.
+ *
+ * @throws When an `encrypted:` secret cannot be decrypted with any key. The
+ *   handler's document-wide pre-check (`legacyAssertDecryptableSecrets`) runs
+ *   before this and is expected to have already aborted in that case, so this
+ *   throw is a defensive backstop, not the primary abort path.
  */
 export function authSubsetFromConfig(
   config: ProjectConfig,
   projectId: string,
   presence: AuthPresence,
   emailContent: AuthEmailContent = { template: {}, notification: {} },
+  dotenvPrivateKeys: ReadonlyArray<string> = [],
 ): AuthSubset {
   const a = config.auth;
 
@@ -947,7 +956,7 @@ export function authSubsetFromConfig(
       : {
           enabled: captchaConfig.enabled ?? false,
           provider: captchaConfig.provider ?? "",
-          secret: projectSecret(projectId, captchaConfig.secret ?? ""),
+          secret: projectSecret(projectId, captchaConfig.secret ?? "", dotenvPrivateKeys),
         };
 
   // Hooks — Go gates each on `hook.<name> != nil`; absent in raw config → skip.
@@ -960,7 +969,7 @@ export function authSubsetFromConfig(
     return {
       enabled: hc.enabled,
       uri: hc.uri ?? "",
-      secrets: projectSecret(projectId, hc.secrets ?? ""),
+      secrets: projectSecret(projectId, hc.secrets ?? "", dotenvPrivateKeys),
     };
   }
   const hook: AuthSubset["hook"] = {
@@ -1047,7 +1056,7 @@ export function authSubsetFromConfig(
           host: smtpConfig.host ?? "",
           port: smtpConfig.port ?? 0,
           user: smtpConfig.user ?? "",
-          pass: projectSecret(projectId, smtpConfig.pass ?? ""),
+          pass: projectSecret(projectId, smtpConfig.pass ?? "", dotenvPrivateKeys),
           admin_email: smtpConfig.admin_email ?? "",
           sender_name: smtpConfig.sender_name ?? "",
         };
@@ -1064,7 +1073,7 @@ export function authSubsetFromConfig(
       enabled: tc.enabled,
       account_sid: tc.account_sid ?? "",
       message_service_sid: tc.message_service_sid ?? "",
-      auth_token: projectSecret(projectId, tc.auth_token ?? ""),
+      auth_token: projectSecret(projectId, tc.auth_token ?? "", dotenvPrivateKeys),
     };
   }
   const sms: AuthSubset["sms"] = {
@@ -1077,18 +1086,18 @@ export function authSubsetFromConfig(
     messagebird: {
       enabled: s.messagebird.enabled,
       originator: s.messagebird.originator ?? "",
-      access_key: projectSecret(projectId, s.messagebird.access_key ?? ""),
+      access_key: projectSecret(projectId, s.messagebird.access_key ?? "", dotenvPrivateKeys),
     },
     textlocal: {
       enabled: s.textlocal.enabled,
       sender: s.textlocal.sender ?? "",
-      api_key: projectSecret(projectId, s.textlocal.api_key ?? ""),
+      api_key: projectSecret(projectId, s.textlocal.api_key ?? "", dotenvPrivateKeys),
     },
     vonage: {
       enabled: s.vonage.enabled,
       from: s.vonage.from ?? "",
       api_key: s.vonage.api_key ?? "",
-      api_secret: projectSecret(projectId, s.vonage.api_secret ?? ""),
+      api_secret: projectSecret(projectId, s.vonage.api_secret ?? "", dotenvPrivateKeys),
     },
     test_otp: s.test_otp ?? {},
   };
@@ -1105,7 +1114,7 @@ export function authSubsetFromConfig(
     external[k] = {
       enabled: p.enabled,
       client_id: p.client_id ?? "",
-      secret: projectSecret(projectId, p.secret ?? ""),
+      secret: projectSecret(projectId, p.secret ?? "", dotenvPrivateKeys),
       url: p.url ?? "",
       redirect_uri: p.redirect_uri ?? "",
       skip_nonce_check: p.skip_nonce_check ?? false,
@@ -1193,33 +1202,52 @@ export function authSubsetFromConfig(
       allow_dynamic_registration: a.oauth_server.allow_dynamic_registration,
       authorization_url_path: a.oauth_server.authorization_url_path,
     },
-    publishable_key: projectSecret(projectId, a.publishable_key ?? ""),
-    secret_key: projectSecret(projectId, a.secret_key ?? ""),
-    jwt_secret: projectSecret(projectId, a.jwt_secret ?? ""),
-    anon_key: projectSecret(projectId, a.anon_key ?? ""),
-    service_role_key: projectSecret(projectId, a.service_role_key ?? ""),
+    publishable_key: projectSecret(projectId, a.publishable_key ?? "", dotenvPrivateKeys),
+    secret_key: projectSecret(projectId, a.secret_key ?? "", dotenvPrivateKeys),
+    jwt_secret: projectSecret(projectId, a.jwt_secret ?? "", dotenvPrivateKeys),
+    anon_key: projectSecret(projectId, a.anon_key ?? "", dotenvPrivateKeys),
+    service_role_key: projectSecret(projectId, a.service_role_key ?? "", dotenvPrivateKeys),
     third_party,
     // Raw plaintext secrets for the update body (see AuthRawSecrets). Sourced
-    // from the same config accessors used for hashing above.
+    // from the same config accessors used for hashing above, decrypted the
+    // same way (`secretPlaintext`) so an `encrypted:` value is never sent
+    // as-is — Go always pushes `Secret.Value` (plaintext), never the ciphertext.
     rawSecrets: {
-      captcha: captchaConfig?.secret ?? "",
+      captcha: secretPlaintext(captchaConfig?.secret ?? "", dotenvPrivateKeys),
       hooks: {
-        mfa_verification_attempt: h.mfa_verification_attempt?.secrets ?? "",
-        password_verification_attempt: h.password_verification_attempt?.secrets ?? "",
-        custom_access_token: h.custom_access_token?.secrets ?? "",
-        send_sms: h.send_sms?.secrets ?? "",
-        send_email: h.send_email?.secrets ?? "",
-        before_user_created: h.before_user_created?.secrets ?? "",
+        mfa_verification_attempt: secretPlaintext(
+          h.mfa_verification_attempt?.secrets ?? "",
+          dotenvPrivateKeys,
+        ),
+        password_verification_attempt: secretPlaintext(
+          h.password_verification_attempt?.secrets ?? "",
+          dotenvPrivateKeys,
+        ),
+        custom_access_token: secretPlaintext(
+          h.custom_access_token?.secrets ?? "",
+          dotenvPrivateKeys,
+        ),
+        send_sms: secretPlaintext(h.send_sms?.secrets ?? "", dotenvPrivateKeys),
+        send_email: secretPlaintext(h.send_email?.secrets ?? "", dotenvPrivateKeys),
+        before_user_created: secretPlaintext(
+          h.before_user_created?.secrets ?? "",
+          dotenvPrivateKeys,
+        ),
       },
-      smtp_pass: smtpConfig?.pass ?? "",
+      smtp_pass: secretPlaintext(smtpConfig?.pass ?? "", dotenvPrivateKeys),
       sms: {
-        twilio: s.twilio.auth_token ?? "",
-        twilio_verify: s.twilio_verify.auth_token ?? "",
-        messagebird: s.messagebird.access_key ?? "",
-        textlocal: s.textlocal.api_key ?? "",
-        vonage: s.vonage.api_secret ?? "",
+        twilio: secretPlaintext(s.twilio.auth_token ?? "", dotenvPrivateKeys),
+        twilio_verify: secretPlaintext(s.twilio_verify.auth_token ?? "", dotenvPrivateKeys),
+        messagebird: secretPlaintext(s.messagebird.access_key ?? "", dotenvPrivateKeys),
+        textlocal: secretPlaintext(s.textlocal.api_key ?? "", dotenvPrivateKeys),
+        vonage: secretPlaintext(s.vonage.api_secret ?? "", dotenvPrivateKeys),
       },
-      providers: Object.fromEntries(Object.entries(ext ?? {}).map(([k, p]) => [k, p.secret ?? ""])),
+      providers: Object.fromEntries(
+        Object.entries(ext ?? {}).map(([k, p]) => [
+          k,
+          secretPlaintext(p.secret ?? "", dotenvPrivateKeys),
+        ]),
+      ),
     },
   };
 }
@@ -1267,7 +1295,7 @@ export function applyRemoteAuthConfig(local: AuthSubset, remote: RemoteAuthConfi
 
   // Base scalar fields
   const siteUrl = valOrDefault(remote.site_url, "");
-  const additionalRedirectUrls = strToArr(valOrDefault(remote.uri_allow_list, ""));
+  const additionalRedirectUrls = legacyStrToArr(valOrDefault(remote.uri_allow_list, ""));
   const jwtExpiry = intToUint(valOrDefault(remote.jwt_exp, 0));
   const enableRefreshTokenRotation = valOrDefault(remote.refresh_token_rotation_enabled, false);
   const refreshTokenReuseInterval = intToUint(
@@ -1290,7 +1318,7 @@ export function applyRemoteAuthConfig(local: AuthSubset, remote: RemoteAuthConfi
     webauthn = {
       rp_display_name: valOrDefault(remote.webauthn_rp_display_name, ""),
       rp_id: valOrDefault(remote.webauthn_rp_id, ""),
-      rp_origins: strToArr(valOrDefault(remote.webauthn_rp_origins, "")),
+      rp_origins: legacyStrToArr(valOrDefault(remote.webauthn_rp_origins, "")),
     };
   }
 
@@ -1754,7 +1782,7 @@ export function applyRemoteAuthConfig(local: AuthSubset, remote: RemoteAuthConfi
 
 /** Port of Go `sms.fromAuthConfig` → `envToMap`. */
 function envToMap(input: string): Record<string, string> {
-  const env = strToArr(input);
+  const env = legacyStrToArr(input);
   const result: Record<string, string> = {};
   for (const kv of env) {
     const eqIdx = kv.indexOf("=");

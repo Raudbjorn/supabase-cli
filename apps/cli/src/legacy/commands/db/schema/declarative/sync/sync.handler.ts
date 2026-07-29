@@ -2,10 +2,11 @@ import { Cause, Clock, Effect, Exit, FileSystem, Option, Path } from "effect";
 
 import {
   LegacyDnsResolverFlag,
-  LegacyExperimentalFlag,
   LegacyNetworkIdFlag,
-  LegacyYesFlag,
+  legacyResolveExperimentalWithProjectEnv,
+  legacyResolveYesWithProjectEnv,
 } from "../../../../../../shared/legacy/global-flags.ts";
+import { legacyPromptYesNo } from "../../../../../../shared/legacy/legacy-prompt-yes-no.ts";
 import { Output } from "../../../../../../shared/output/output.service.ts";
 import { Tty } from "../../../../../../shared/runtime/tty.service.ts";
 import { LegacyCliConfig } from "../../../../../config/legacy-cli-config.service.ts";
@@ -13,6 +14,7 @@ import { legacyBold, legacyRed, legacyYellow } from "../../../../../shared/legac
 import { LegacyDbConnection } from "../../../../../shared/legacy-db-connection.service.ts";
 import { legacyGetHostname } from "../../../../../shared/legacy-hostname.ts";
 import {
+  legacyLoadProjectEnv,
   legacyReadDbToml,
   legacyResolveDeclarativeDir,
 } from "../../../../../shared/legacy-db-config.toml-read.ts";
@@ -51,7 +53,10 @@ import {
   legacyGenerateDeclarativeOutput,
 } from "../declarative.orchestrate.ts";
 import { LegacyDeclarativeSeam } from "../../../shared/legacy-pgdelta.seam.service.ts";
-import { legacyWriteDeclarativeSchemas } from "../../../shared/legacy-pgdelta.write.ts";
+import {
+  legacyDeclarativeSchemaWrittenLine,
+  legacyWriteDeclarativeSchemas,
+} from "../../../shared/legacy-pgdelta.write.ts";
 import type { LegacyDbSchemaDeclarativeSyncFlags } from "./sync.command.ts";
 
 const DEFAULT_SYNC_NAME = "declarative_sync";
@@ -72,8 +77,18 @@ export const legacyDbSchemaDeclarativeSync = Effect.fn("legacy.db.schema.declara
     const path = yield* Path.Path;
     const cliConfig = yield* LegacyCliConfig;
     const telemetryState = yield* LegacyTelemetryState;
-    const experimental = yield* LegacyExperimentalFlag;
-    const yes = yield* LegacyYesFlag;
+    // Go's `dbDeclarativeCmd.PersistentPreRunE` calls `flags.LoadConfig` — which runs
+    // `loadNestedEnv` and `os.Setenv`s each project-.env key — BEFORE reading
+    // `viper.GetBool("EXPERIMENTAL")` for the gate below (`apps/cli-go/cmd/
+    // db_schema_declarative.go:73-78`, `pkg/config/config.go:789`). Load the project env
+    // first and resolve against it, as `db reset` does for its own experimental gate, so a
+    // `SUPABASE_EXPERIMENTAL` set only in `supabase/.env` opens the gate too.
+    const projectEnv = yield* legacyLoadProjectEnv(fs, path, cliConfig.workdir);
+    const experimental = yield* legacyResolveExperimentalWithProjectEnv(projectEnv);
+    // `--yes` OR `SUPABASE_YES` (shell env or project `.env`): Go's prompts here
+    // read `viper.GetBool("YES")` after `loadNestedEnv`, so the env var must
+    // auto-confirm too, not just the flag (CLI-1974).
+    const yes = yield* legacyResolveYesWithProjectEnv(projectEnv);
     const networkId = yield* LegacyNetworkIdFlag;
     const dnsResolver = yield* LegacyDnsResolverFlag;
     const seam = yield* LegacyDeclarativeSeam;
@@ -89,10 +104,21 @@ export const legacyDbSchemaDeclarativeSync = Effect.fn("legacy.db.schema.declara
     let linkedProjectRef: string | undefined;
 
     yield* Effect.gen(function* () {
+      const toml = yield* legacyReadDbToml(fs, path, cliConfig.workdir);
+      // Gate before the mutex check below — order matters; see
+      // legacyRequirePgDelta's doc comment for why.
+      yield* legacyRequirePgDelta({
+        experimental,
+        pgDeltaEnabled: toml.pgDelta.enabled,
+        configPath: path.join("supabase", "config.toml"),
+      });
+
       // cobra `MarkFlagsMutuallyExclusive("apply", "no-apply")`
-      // (`apps/cli-go/cmd/db_schema_declarative.go:490`) runs before PreRunE/RunE,
-      // so reject the conflict before reading config or the pg-delta gate, rather
-      // than letting `--no-apply` silently win in the apply-decision helper.
+      // (`apps/cli-go/cmd/db_schema_declarative.go:561`) runs via
+      // `ValidateFlagGroups()`, which cobra invokes AFTER `PersistentPreRunE` (the
+      // gate above) — see legacyRequirePgDelta's doc comment for the full ordering.
+      // Reject the conflict here rather than letting `--no-apply` silently win in
+      // the apply-decision helper.
       const exclusive: Array<string> = [];
       if (Option.isSome(flags.apply)) exclusive.push("apply");
       if (Option.isSome(flags.noApply)) exclusive.push("no-apply");
@@ -104,19 +130,15 @@ export const legacyDbSchemaDeclarativeSync = Effect.fn("legacy.db.schema.declara
         );
       }
 
-      const toml = yield* legacyReadDbToml(fs, path, cliConfig.workdir);
-      yield* legacyRequirePgDelta({
-        experimental,
-        pgDeltaEnabled: toml.pgDelta.enabled,
-        configPath: path.join("supabase", "config.toml"),
-      });
+      // Go's `utils.GetDeclarativeDir()` — the config value verbatim (already
+      // `supabase/`-prefixed when relative) or the relative `supabase/database`
+      // default. Printed verbatim in the bootstrap's written-to line below, exactly
+      // as Go prints it (Go chdirs into the workdir, so its paths stay relative).
+      const declarativeDirRel = legacyResolveDeclarativeDir(path, toml.pgDelta);
       // `path.resolve` (not `path.join`) so an absolute `declarative_schema_path` is
       // used as-is, matching Go's `config.resolve` (which only prefixes the workdir onto
       // a relative path). `path.join(workdir, abs)` would mangle the absolute path.
-      const declarativeDir = path.resolve(
-        cliConfig.workdir,
-        legacyResolveDeclarativeDir(path, toml.pgDelta),
-      );
+      const declarativeDir = path.resolve(cliConfig.workdir, declarativeDirRel);
       const migrationsDir = path.join(cliConfig.workdir, "supabase", "migrations");
       const tempDir = legacyPgDeltaTempPath(path, cliConfig.workdir);
       const run: LegacyDeclarativeRunContext = {
@@ -155,14 +177,16 @@ export const legacyDbSchemaDeclarativeSync = Effect.fn("legacy.db.schema.declara
           message: "no declarative schema found. Run supabase db schema declarative generate first",
         });
         if (!tty.stdinIsTty && !yes) return yield* Effect.fail(noFiles);
-        // Go's Console.PromptYesNo auto-returns true when the global YES flag is set
-        // (`apps/cli-go/internal/utils/console.go:70-73`), so --yes must skip this
-        // prompt rather than block/fail.
-        const ok = yes
-          ? true
-          : yield* output.promptConfirm("No declarative schema found. Generate a new one ?", {
-              defaultValue: true,
-            });
+        // Go asks via Console.PromptYesNo (db_schema_declarative.go:381, default
+        // true): --yes/SUPABASE_YES auto-confirms WITH the `<label> [Y/n] y`
+        // stderr echo (console.go:70-72) — routed through `legacyPromptYesNo`
+        // so the echo is not skipped (CLI-1974).
+        const ok = yield* legacyPromptYesNo(
+          output,
+          yes,
+          "No declarative schema found. Generate a new one ?",
+          true,
+        );
         if (!ok) return yield* Effect.fail(noFiles);
         // Go delegates to the full smart-generate flow (`runDeclarativeGenerate`,
         // db_schema_declarative.go:321): with migrations present it offers the
@@ -230,6 +254,15 @@ export const legacyDbSchemaDeclarativeSync = Effect.fn("legacy.db.schema.declara
         if (!run.noCache) {
           yield* seam.exportCatalog({ mode: "declarative", noCache: run.noCache });
         }
+        // Go's delegated `declarative.Generate` prints the written-to line to stderr
+        // after the write and the catalog warm (`declarative.go:133→138-155→156`), on
+        // both the interactive-accept and --yes/SUPABASE_YES bootstrap paths, and
+        // regardless of --no-cache (the warm is skipped, the line is not). It prints
+        // `utils.GetDeclarativeDir()` — the relative dir above, never a resolved
+        // absolute path, because Go chdirs into the workdir (CLI-1980). NOTE:
+        // `generate`'s port of this same Go line still prints the absolute dir
+        // today — a follow-up candidate for the same relative-dir treatment.
+        yield* output.raw(legacyDeclarativeSchemaWrittenLine(declarativeDirRel), "stderr");
       }
 
       // Step 2: diff migrations state vs declarative; on error, save a debug bundle.

@@ -6,7 +6,7 @@ import { deployFunctions } from "../../../../shared/functions/deploy.ts";
 import { LegacyPlatformApi } from "../../../auth/legacy-platform-api.service.ts";
 import { LegacyCliConfig } from "../../../config/legacy-cli-config.service.ts";
 import { LegacyProjectRefResolver } from "../../../config/legacy-project-ref.service.ts";
-import { LegacyYesFlag } from "../../../../shared/legacy/global-flags.ts";
+import { legacyResolveYes } from "../../../../shared/legacy/global-flags.ts";
 import { legacyDashboardUrl } from "../../../shared/legacy-profile.ts";
 import { LegacyLinkedProjectCache } from "../../../telemetry/legacy-linked-project-cache.service.ts";
 import { LegacyTelemetryState } from "../../../telemetry/legacy-telemetry-state.service.ts";
@@ -19,7 +19,10 @@ export const legacyFunctionsDeploy = Effect.fn("legacy.functions.deploy")(functi
   const api = yield* LegacyPlatformApi;
   const cliConfig = yield* LegacyCliConfig;
   const resolver = yield* LegacyProjectRefResolver;
-  const yes = yield* LegacyYesFlag;
+  // `--yes` OR `SUPABASE_YES` (Go's `viper.GetBool("YES")` inside the `--prune`
+  // confirm, `deploy.go:190` + root.go:318-320) — the env var must auto-confirm
+  // too, not just the flag (CLI-1974).
+  const yes = yield* legacyResolveYes;
   const linkedProjectCache = yield* LegacyLinkedProjectCache;
   const telemetryState = yield* LegacyTelemetryState;
   const runtimeInfo = yield* RuntimeInfo;
@@ -41,6 +44,7 @@ export const legacyFunctionsDeploy = Effect.fn("legacy.functions.deploy")(functi
     projectRoot: cliConfig.workdir,
     supabaseDir: join(cliConfig.workdir, "supabase"),
     dashboardUrl: legacyDashboardUrl(cliConfig.profile),
+    goViperCompat: true,
     yes,
     rawArgs,
     edgeRuntimeVersion,

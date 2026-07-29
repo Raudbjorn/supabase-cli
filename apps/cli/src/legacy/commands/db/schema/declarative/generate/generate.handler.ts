@@ -1,15 +1,17 @@
 import { Effect, FileSystem, Option, Path } from "effect";
 
 import {
-  LegacyExperimentalFlag,
-  LegacyYesFlag,
+  legacyResolveExperimentalWithProjectEnv,
+  legacyResolveYesWithProjectEnv,
 } from "../../../../../../shared/legacy/global-flags.ts";
+import { legacyPromptYesNo } from "../../../../../../shared/legacy/legacy-prompt-yes-no.ts";
 import { Output } from "../../../../../../shared/output/output.service.ts";
 import { Tty } from "../../../../../../shared/runtime/tty.service.ts";
 import { LegacyCliConfig } from "../../../../../config/legacy-cli-config.service.ts";
 import { legacyBold } from "../../../../../shared/legacy-colors.ts";
 import { legacyReadProjectRefFile } from "../../../../../shared/legacy-temp-paths.ts";
 import {
+  legacyLoadProjectEnv,
   legacyReadDbToml,
   legacyResolveDeclarativeDir,
 } from "../../../../../shared/legacy-db-config.toml-read.ts";
@@ -44,17 +46,41 @@ export const legacyDbSchemaDeclarativeGenerate = Effect.fn("legacy.db.schema.dec
     const cliConfig = yield* LegacyCliConfig;
     const telemetryState = yield* LegacyTelemetryState;
     const linkedProjectCache = yield* LegacyLinkedProjectCache;
-    const experimental = yield* LegacyExperimentalFlag;
-    const yes = yield* LegacyYesFlag;
+    // Go's `dbDeclarativeCmd.PersistentPreRunE` calls `flags.LoadConfig` — which runs
+    // `loadNestedEnv` and `os.Setenv`s each project-.env key — BEFORE reading
+    // `viper.GetBool("EXPERIMENTAL")` for the gate below (`apps/cli-go/cmd/
+    // db_schema_declarative.go:73-78`, `pkg/config/config.go:789`). Load the project env
+    // first and resolve against it, as `db reset` does for its own experimental gate, so a
+    // `SUPABASE_EXPERIMENTAL` set only in `supabase/.env` opens the gate too.
+    const projectEnv = yield* legacyLoadProjectEnv(fs, path, cliConfig.workdir);
+    const experimental = yield* legacyResolveExperimentalWithProjectEnv(projectEnv);
+    // `--yes` OR `SUPABASE_YES` (shell env or project `.env`): Go's prompts here
+    // read `viper.GetBool("YES")` after `loadNestedEnv`, so the env var must
+    // auto-confirm too, not just the flag (CLI-1974).
+    const yes = yield* legacyResolveYesWithProjectEnv(projectEnv);
 
     // The resolved linked ref (explicit `--linked` only), hoisted so the post-run
     // linked-project cache finalizer can read it after the body resolves it.
     let linkedProjectRef: string | undefined;
 
     yield* Effect.gen(function* () {
+      const baseToml = yield* legacyReadDbToml(fs, path, cliConfig.workdir);
+      // Gate before the mutex check below — order matters; see
+      // legacyRequirePgDelta's doc comment for why. The pg-delta gate also runs on
+      // the BASE config: Go's declarative `PersistentPreRunE` gates before the root
+      // `ParseDatabaseConfig` reloads any `[remotes.<ref>]` block, so a remote
+      // `experimental.pgdelta.enabled = true` must NOT enable a base-disabled
+      // command without `--experimental`.
+      yield* legacyRequirePgDelta({
+        experimental,
+        pgDeltaEnabled: baseToml.pgDelta.enabled,
+        configPath: path.join("supabase", "config.toml"),
+      });
+
       // cobra `MarkFlagsMutuallyExclusive("db-url", "linked", "local")`
-      // (`apps/cli-go/cmd/db_schema_declarative.go:499`) runs before PreRunE/RunE,
-      // so reject conflicting targets before reading config or the pg-delta gate.
+      // (`apps/cli-go/cmd/db_schema_declarative.go:570`) runs via
+      // `ValidateFlagGroups()`, which cobra invokes AFTER `PersistentPreRunE` (the
+      // gate above) — see legacyRequirePgDelta's doc comment for the full ordering.
       // "Set" follows cobra's `Changed`: Option set when `Some`, boolean when `true`.
       const exclusive: Array<string> = [];
       if (Option.isSome(flags.dbUrl)) exclusive.push("db-url");
@@ -67,17 +93,6 @@ export const legacyDbSchemaDeclarativeGenerate = Effect.fn("legacy.db.schema.dec
           }),
         );
       }
-
-      const baseToml = yield* legacyReadDbToml(fs, path, cliConfig.workdir);
-      // The pg-delta gate runs on the BASE config: Go's declarative `PersistentPreRunE`
-      // gates before the root `ParseDatabaseConfig` reloads any `[remotes.<ref>]` block,
-      // so a remote `experimental.pgdelta.enabled = true` must NOT enable a
-      // base-disabled command without `--experimental`.
-      yield* legacyRequirePgDelta({
-        experimental,
-        pgDeltaEnabled: baseToml.pgDelta.enabled,
-        configPath: path.join("supabase", "config.toml"),
-      });
 
       // Explicit `--linked`: Go re-loads config with the resolved ref (root
       // `ParseDatabaseConfig` linked branch), so a matching `[remotes.<ref>]` block
@@ -157,17 +172,18 @@ export const legacyDbSchemaDeclarativeGenerate = Effect.fn("legacy.db.schema.dec
           );
         }
         if ((yield* hasDeclarativeFiles(fs, declarativeDir)) && !flags.overwrite) {
-          // Go asks via Console.PromptYesNo (db_schema_declarative.go:208, default
-          // false), which auto-returns true under the global --yes flag, so --yes
-          // regenerates without prompting instead of blocking in non-interactive mode.
-          const ok = yes
-            ? true
-            : yield* output.promptConfirm(
-                `Declarative schema already exists at ${legacyBold(
-                  declarativeDir,
-                )}. Regenerate from database? This will overwrite existing files.`,
-                { defaultValue: false },
-              );
+          // Go asks via Console.PromptYesNo (db_schema_declarative.go:268-270,
+          // default false): --yes/SUPABASE_YES auto-confirms WITH the
+          // `<label> [y/N] y` stderr echo (console.go:70-72) — routed through
+          // `legacyPromptYesNo` so the echo is not skipped (CLI-1974).
+          const ok = yield* legacyPromptYesNo(
+            output,
+            yes,
+            `Declarative schema already exists at ${legacyBold(
+              declarativeDir,
+            )}. Regenerate from database? This will overwrite existing files.`,
+            false,
+          );
           if (!ok) {
             yield* output.raw("Skipped generating declarative schema.\n", "stderr");
             return;
@@ -216,16 +232,17 @@ export const legacyDbSchemaDeclarativeGenerate = Effect.fn("legacy.db.schema.dec
       const result = yield* legacyGenerateDeclarativeOutput(run, targetUrl);
 
       if (!overwrite && (yield* confirmOverwriteHasFiles(fs, declarativeDir))) {
-        // Go's confirmOverwrite goes through Console.PromptYesNo, which returns true
-        // immediately when the global YES flag is set (`apps/cli-go/internal/utils/
-        // console.go:70-73`). Honor --yes here too, or non-interactive/JSON runs
-        // would error on the prompt and a TTY would block despite --yes.
-        const ok = yes
-          ? true
-          : yield* output.promptConfirm(
-              "Overwrite declarative schema? Existing files may be deleted.",
-              { defaultValue: false },
-            );
+        // Go's confirmOverwrite goes through Console.PromptYesNo (`internal/db/
+        // declarative/declarative.go:234`, default false): --yes/SUPABASE_YES
+        // auto-confirms WITH the `<label> [y/N] y` stderr echo (console.go:70-72)
+        // — routed through `legacyPromptYesNo` so the echo is not skipped
+        // (CLI-1974).
+        const ok = yield* legacyPromptYesNo(
+          output,
+          yes,
+          "Overwrite declarative schema? Existing files may be deleted.",
+          false,
+        );
         if (!ok) {
           yield* output.raw("Skipped writing declarative schema.\n", "stderr");
           return;

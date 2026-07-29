@@ -4,13 +4,15 @@ import { BunServices } from "@effect/platform-bun";
 import { describe, expect, it } from "@effect/vitest";
 import { Cause, Effect, Exit, Layer, Option } from "effect";
 
-import { mockOutput, mockTty } from "../../../../../../../tests/helpers/mocks.ts";
+import { stripAnsi } from "../../../../../../../tests/helpers/ansi.ts";
+import { mockOutput, mockStdin, mockTty } from "../../../../../../../tests/helpers/mocks.ts";
 import {
   mockLegacyCliConfig,
   mockLegacyLinkedProjectCacheTracked,
   mockLegacyTelemetryStateTracked,
   useLegacyTempWorkdir,
 } from "../../../../../../../tests/helpers/legacy-mocks.ts";
+import { CliArgs } from "../../../../../../shared/cli/cli-args.service.ts";
 import {
   LegacyDnsResolverFlag,
   LegacyExperimentalFlag,
@@ -44,6 +46,7 @@ const EXPORT_JSON = JSON.stringify({
 
 interface SetupOpts {
   experimental?: boolean;
+  args?: ReadonlyArray<string>;
   yes?: boolean;
   stdinIsTty?: boolean;
   diffSql?: string;
@@ -68,8 +71,16 @@ function setup(workdir: string, opts: SetupOpts = {}) {
   const cache = mockLegacyLinkedProjectCacheTracked();
   const execInheritCalls: ReadonlyArray<string>[] = [];
   const localPostgresImageChecks: Array<true> = [];
+  // Each catalog export records how many raw chunks had been emitted when it fired,
+  // so tests can assert output ordering relative to the exports (e.g. the bootstrap's
+  // written-to line lands after the declarative warm, before the diff's exports).
+  const exportCatalogCalls: Array<{ mode: string; rawChunksAt: number }> = [];
   const seam = Layer.succeed(LegacyDeclarativeSeam, {
-    exportCatalog: ({ mode }) => Effect.succeed(`supabase/.temp/pgdelta/${mode}.json`),
+    exportCatalog: ({ mode }) =>
+      Effect.sync(() => {
+        exportCatalogCalls.push({ mode, rawChunksAt: out.rawChunks.length });
+        return `supabase/.temp/pgdelta/${mode}.json`;
+      }),
     execInherit: (args) =>
       Effect.sync(() => {
         execInheritCalls.push(args);
@@ -94,15 +105,33 @@ function setup(workdir: string, opts: SetupOpts = {}) {
     removeShadowContainer: () => Effect.void,
   });
   const edge = Layer.succeed(LegacyEdgeRuntimeScript, {
-    run: (runOpts: LegacyEdgeRuntimeRunOpts) =>
-      Effect.succeed({
-        stdout:
-          opts.exportJson !== undefined &&
-          runOpts.errPrefix === "error exporting declarative schema"
-            ? opts.exportJson
-            : (opts.diffSql ?? ""),
-        stderr: "",
-      }),
+    run: (runOpts: LegacyEdgeRuntimeRunOpts) => {
+      if (
+        opts.exportJson !== undefined &&
+        runOpts.errPrefix === "error exporting declarative schema"
+      ) {
+        return Effect.succeed({ stdout: opts.exportJson, stderr: "" });
+      }
+      const diffSql = opts.diffSql ?? "";
+      // The pg-delta diff script (uniquely identified by `renderPlanFiles`) prints a
+      // JSON envelope with one file per plan unit; wrap the test's raw SQL into a
+      // single-unit envelope so `legacyDiffPgDelta` parses it.
+      const stdout =
+        runOpts.script.includes("renderPlanFiles") && diffSql.length > 0
+          ? JSON.stringify({
+              version: 1,
+              files: [
+                {
+                  order: 1,
+                  name: "schema_changes",
+                  transactionMode: "transactional",
+                  sql: diffSql,
+                },
+              ],
+            })
+          : diffSql;
+      return Effect.succeed({ stdout, stderr: "" });
+    },
   });
   const dbExec: string[] = [];
   const dbConn = Layer.succeed(LegacyDbConnection, {
@@ -150,7 +179,9 @@ function setup(workdir: string, opts: SetupOpts = {}) {
     resolver,
     mockLegacyCliConfig({ workdir, projectId: opts.projectId ?? Option.some("test") }),
     mockTty({ stdinIsTty: opts.stdinIsTty ?? false, stdoutIsTty: false }),
+    mockStdin(opts.stdinIsTty ?? false),
     Layer.succeed(LegacyExperimentalFlag, opts.experimental ?? true),
+    Layer.succeed(CliArgs, { args: opts.args ?? ["db", "schema", "declarative", "sync"] }),
     Layer.succeed(LegacyYesFlag, opts.yes ?? false),
     Layer.succeed(
       LegacyNetworkIdFlag,
@@ -164,7 +195,15 @@ function setup(workdir: string, opts: SetupOpts = {}) {
     }),
     BunServices.layer,
   );
-  return { layer, out, execInheritCalls, dbExec, cache, localPostgresImageChecks };
+  return {
+    layer,
+    out,
+    execInheritCalls,
+    dbExec,
+    cache,
+    localPostgresImageChecks,
+    exportCatalogCalls,
+  };
 }
 
 const flags = (
@@ -199,10 +238,11 @@ describe("legacy db schema declarative sync integration", () => {
     }).pipe(Effect.provide(layer));
   });
 
-  it.effect("rejects --apply and --no-apply together before the pg-delta gate", () => {
-    // cobra MarkFlagsMutuallyExclusive("apply", "no-apply") runs before PreRunE,
-    // so this fails even when pg-delta is not enabled.
-    const { layer } = setup(tmp.current, { experimental: false });
+  it.effect("--apply and --no-apply together with --experimental fail with the mutex error", () => {
+    // Go's declarative PersistentPreRunE gate (db_schema_declarative.go:49-99) runs
+    // BEFORE cobra's ValidateFlagGroups() mutex check (cobra@v1.10.2/command.go:985,
+    // 1010), so the mutex error only surfaces once the gate is open.
+    const { layer } = setup(tmp.current, { experimental: true });
     return Effect.gen(function* () {
       const exit = yield* Effect.exit(
         legacyDbSchemaDeclarativeSync(
@@ -218,10 +258,122 @@ describe("legacy db schema declarative sync integration", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect(
+    "--apply and --no-apply together without --experimental fail with the gate error, not the mutex error",
+    () => {
+      // Mirrors storage's experimental-gate-vs-mutex ordering fix (CLI-1855 / CLI-1876):
+      // the pg-delta gate runs before the mutex check, so an unopened gate wins even
+      // when the flags would also violate mutual exclusivity.
+      const { layer } = setup(tmp.current, { experimental: false });
+      return Effect.gen(function* () {
+        const exit = yield* Effect.exit(
+          legacyDbSchemaDeclarativeSync(
+            flags({ apply: Option.some(true), noApply: Option.some(true) }),
+          ),
+        );
+        expect(Exit.isFailure(exit)).toBe(true);
+        expect(failError(exit)?.constructor.name).toBe("LegacyDeclarativeNotEnabledError");
+      }).pipe(Effect.provide(layer));
+    },
+  );
+
+  it.effect(
+    "--apply and --no-apply together with SUPABASE_EXPERIMENTAL env (no --experimental flag) fail with the mutex error",
+    () => {
+      // Go's gate reads viper.GetBool("EXPERIMENTAL") (db_schema_declarative.go:78),
+      // which picks up SUPABASE_EXPERIMENTAL via viper.AutomaticEnv (root.go:318-334),
+      // so an env-only experimental session still opens the gate and lets the mutex
+      // check fire. legacyResolveExperimental (not the raw LegacyExperimentalFlag) is
+      // what makes the TS gate honor the env var the same way.
+      const { layer } = setup(tmp.current, { experimental: false });
+      const ENV = "SUPABASE_EXPERIMENTAL";
+      return Effect.gen(function* () {
+        const saved = process.env[ENV];
+        process.env[ENV] = "1";
+        const exit = yield* Effect.exit(
+          legacyDbSchemaDeclarativeSync(
+            flags({ apply: Option.some(true), noApply: Option.some(true) }),
+          ),
+        );
+        if (saved === undefined) delete process.env[ENV];
+        else process.env[ENV] = saved;
+        expect(Exit.isFailure(exit)).toBe(true);
+        expect(failError(exit)).toMatchObject({
+          _tag: "LegacyDeclarativeMutuallyExclusiveFlagsError",
+          message:
+            "if any flags in the group [apply no-apply] are set none of the others can be; [apply no-apply] were all set",
+        });
+      }).pipe(Effect.provide(layer));
+    },
+  );
+
+  it.effect(
+    "an explicit --experimental=false closes the gate even when SUPABASE_EXPERIMENTAL is set",
+    () => {
+      // viper's bound-pflag lookup returns the flag value whenever Changed is true —
+      // BEFORE falling back to AutomaticEnv (viper@v1.21.0/viper.go:1176-1178) — so an
+      // explicit --experimental=false must win over SUPABASE_EXPERIMENTAL=1, closing the
+      // gate instead of letting the env value override it.
+      const { layer } = setup(tmp.current, {
+        experimental: false,
+        args: ["db", "schema", "declarative", "sync", "--experimental=false"],
+      });
+      const ENV = "SUPABASE_EXPERIMENTAL";
+      return Effect.gen(function* () {
+        const saved = process.env[ENV];
+        process.env[ENV] = "1";
+        const exit = yield* Effect.exit(legacyDbSchemaDeclarativeSync(flags()));
+        if (saved === undefined) delete process.env[ENV];
+        else process.env[ENV] = saved;
+        expect(Exit.isFailure(exit)).toBe(true);
+        expect(failError(exit)?.constructor.name).toBe("LegacyDeclarativeNotEnabledError");
+      }).pipe(Effect.provide(layer));
+    },
+  );
+
+  it.effect(
+    "--apply and --no-apply together with SUPABASE_EXPERIMENTAL set only in the project .env fail with the mutex error",
+    () => {
+      // Go's flags.LoadConfig runs loadNestedEnv (which os.Setenv's each project-.env key)
+      // before dbDeclarativeCmd.PersistentPreRunE reads viper.GetBool("EXPERIMENTAL")
+      // (apps/cli-go/cmd/db_schema_declarative.go:73-78, pkg/config/config.go:789), so a
+      // SUPABASE_EXPERIMENTAL set only in supabase/.env opens the gate and lets the mutex
+      // check fire, same as the shell-env case above.
+      const saved = process.env["SUPABASE_EXPERIMENTAL"];
+      delete process.env["SUPABASE_EXPERIMENTAL"];
+      mkdirSync(join(tmp.current, "supabase"), { recursive: true });
+      writeFileSync(join(tmp.current, "supabase", ".env"), "SUPABASE_EXPERIMENTAL=true\n");
+      const { layer } = setup(tmp.current, { experimental: false });
+      return Effect.gen(function* () {
+        const exit = yield* Effect.exit(
+          legacyDbSchemaDeclarativeSync(
+            flags({ apply: Option.some(true), noApply: Option.some(true) }),
+          ),
+        );
+        expect(Exit.isFailure(exit)).toBe(true);
+        expect(failError(exit)).toMatchObject({
+          _tag: "LegacyDeclarativeMutuallyExclusiveFlagsError",
+          message:
+            "if any flags in the group [apply no-apply] are set none of the others can be; [apply no-apply] were all set",
+        });
+      }).pipe(
+        Effect.provide(layer),
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (saved === undefined) delete process.env["SUPABASE_EXPERIMENTAL"];
+            else process.env["SUPABASE_EXPERIMENTAL"] = saved;
+          }),
+        ),
+      );
+    },
+  );
+
   it.effect("rejects --apply=false --no-apply as a conflict (Go flag.Changed)", () => {
     // cobra keys the mutex off flag.Changed, so an explicit `--apply=false` still
     // counts as set and conflicts with `--no-apply`, even though its value is false.
-    const { layer } = setup(tmp.current, { experimental: false });
+    // The gate runs first (see legacyRequirePgDelta's doc comment), so --experimental
+    // is required here for the mutex error to be the one that surfaces.
+    const { layer } = setup(tmp.current, { experimental: true });
     return Effect.gen(function* () {
       const exit = yield* Effect.exit(
         legacyDbSchemaDeclarativeSync(
@@ -310,6 +462,92 @@ describe("legacy db schema declarative sync integration", () => {
         legacyDbSchemaDeclarativeSync(flags({ noApply: Option.some(true) })),
       );
       expect(JSON.stringify(exit)).not.toContain("no declarative schema found");
+    }).pipe(Effect.provide(s.layer));
+  });
+
+  it.effect("bootstrap prints the declarative-schema-written line after the catalog warm", () => {
+    // Go's bootstrap delegates to `declarative.Generate`, which prints
+    // `Declarative schema written to <dir>` to stderr AFTER WriteDeclarativeSchemas
+    // and the catalog warm (`declarative.go:133→138-155→156`), before sync's own
+    // diff (step 2). It prints `utils.GetDeclarativeDir()` — the relative
+    // `supabase/database` default — never the absolute resolved dir (CLI-1980).
+    const s = setup(tmp.current, {
+      experimental: true,
+      stdinIsTty: true,
+      diffSql: "",
+      exportJson: EXPORT_JSON,
+      promptConfirmResponses: [true], // generate a new one? yes (no migrations → no reset prompt)
+    });
+    return Effect.gen(function* () {
+      yield* legacyDbSchemaDeclarativeSync(flags({ noApply: Option.some(true) }));
+      const line = `Declarative schema written to ${join("supabase", "database")}\n`;
+      const written = s.out.rawChunks
+        .map((c, index) => ({ text: stripAnsi(c.text), stream: c.stream, index }))
+        .filter((c) => c.text === line);
+      expect(written).toHaveLength(1);
+      expect(written[0]?.stream).toBe("stderr");
+      const lineAt = written[0]?.index ?? -1;
+      // The warm (first declarative-mode export) fires before the line is printed…
+      const warm = s.exportCatalogCalls.find((c) => c.mode === "declarative");
+      expect(warm?.rawChunksAt).toBeLessThanOrEqual(lineAt);
+      // …and the diff's first export (migrations catalog) fires after it, so the
+      // line sits at the end of the bootstrap, matching Go's ordering.
+      const diffStart = s.exportCatalogCalls.find((c) => c.mode === "migrations");
+      expect(diffStart?.rawChunksAt).toBeGreaterThan(lineAt);
+      // The generated files actually landed in the printed (resolved) dir.
+      expect(
+        existsSync(
+          join(tmp.current, "supabase", "database", "schemas", "public", "tables", "players.sql"),
+        ),
+      ).toBe(true);
+    }).pipe(Effect.provide(s.layer));
+  });
+
+  it.effect("--yes bootstrap prints the declarative-schema-written line too", () => {
+    // Go reaches the same delegated `declarative.Generate` print on the
+    // auto-confirmed (--yes / SUPABASE_YES) bootstrap as on the interactive accept.
+    const s = setup(tmp.current, {
+      experimental: true,
+      stdinIsTty: false,
+      yes: true,
+      diffSql: "",
+      exportJson: EXPORT_JSON,
+    });
+    return Effect.gen(function* () {
+      yield* legacyDbSchemaDeclarativeSync(flags({ noApply: Option.some(true) }));
+      expect(
+        s.out.rawChunks.map((c) => ({ text: stripAnsi(c.text), stream: c.stream })),
+      ).toContainEqual({
+        text: `Declarative schema written to ${join("supabase", "database")}\n`,
+        stream: "stderr",
+      });
+    }).pipe(Effect.provide(s.layer));
+  });
+
+  it.effect("--no-cache bootstrap still prints the declarative-schema-written line", () => {
+    // Go's print sits OUTSIDE the `if !noCache` warm gate (`declarative.go:138-156`):
+    // skipping the catalog warm must not skip the line.
+    const s = setup(tmp.current, {
+      experimental: true,
+      stdinIsTty: false,
+      yes: true,
+      diffSql: "",
+      exportJson: EXPORT_JSON,
+    });
+    return Effect.gen(function* () {
+      yield* legacyDbSchemaDeclarativeSync(flags({ noCache: true, noApply: Option.some(true) }));
+      const line = `Declarative schema written to ${join("supabase", "database")}\n`;
+      const written = s.out.rawChunks
+        .map((c, index) => ({ text: stripAnsi(c.text), stream: c.stream, index }))
+        .filter((c) => c.text === line);
+      expect(written).toHaveLength(1);
+      expect(written[0]?.stream).toBe("stderr");
+      // The warm really was skipped: the only declarative-mode export is the diff's,
+      // which fires after the line — yet the line still printed.
+      const lineAt = written[0]?.index ?? -1;
+      const declarativeExports = s.exportCatalogCalls.filter((c) => c.mode === "declarative");
+      expect(declarativeExports).toHaveLength(1);
+      expect(declarativeExports[0]?.rawChunksAt).toBeGreaterThan(lineAt);
     }).pipe(Effect.provide(s.layer));
   });
 

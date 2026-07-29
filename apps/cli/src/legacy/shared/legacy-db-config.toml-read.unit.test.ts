@@ -453,6 +453,61 @@ describe("legacyReadDbToml", () => {
     );
   });
 
+  it.effect("an explicit remote auth.enabled beats its SUPABASE_AUTH_ENABLED env var", () => {
+    // Same v.Set-above-AutomaticEnv precedence as db.migrations.enabled / pgdelta.enabled
+    // (config.go:635-637), but for auth.enabled specifically (CLI-1878): a matched remote
+    // block's auth.enabled must win over SUPABASE_AUTH_ENABLED.
+    const ref = "abcdefghijklmnopqrst";
+    const previous = process.env["SUPABASE_AUTH_ENABLED"];
+    process.env["SUPABASE_AUTH_ENABLED"] = "true";
+    const dir = withConfig(
+      [
+        "[remotes.prod]",
+        `project_id = "${ref}"`,
+        "[remotes.prod.auth]",
+        "enabled = false",
+        "",
+      ].join("\n"),
+    );
+    return readRef(dir, ref).pipe(
+      Effect.tap((v) =>
+        Effect.sync(() => {
+          expect(v.baseline.authEnabled).toBe(false);
+        }),
+      ),
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env["SUPABASE_AUTH_ENABLED"];
+          else process.env["SUPABASE_AUTH_ENABLED"] = previous;
+          rmSync(dir, { recursive: true, force: true });
+        }),
+      ),
+    );
+  });
+
+  it.effect("SUPABASE_AUTH_ENABLED still wins when the remote block omits auth.enabled", () => {
+    // Control: the env override is suppressed only for keys the matched block explicitly
+    // set; a block that omits auth.enabled leaves the env override in force.
+    const ref = "abcdefghijklmnopqrst";
+    const previous = process.env["SUPABASE_AUTH_ENABLED"];
+    process.env["SUPABASE_AUTH_ENABLED"] = "false";
+    const dir = withConfig(["[remotes.prod]", `project_id = "${ref}"`, ""].join("\n"));
+    return readRef(dir, ref).pipe(
+      Effect.tap((v) =>
+        Effect.sync(() => {
+          expect(v.baseline.authEnabled).toBe(false);
+        }),
+      ),
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env["SUPABASE_AUTH_ENABLED"];
+          else process.env["SUPABASE_AUTH_ENABLED"] = previous;
+          rmSync(dir, { recursive: true, force: true });
+        }),
+      ),
+    );
+  });
+
   it.effect("matches a remote block by a SUPABASE_REMOTES_<NAME>_PROJECT_ID env override", () => {
     // Viper AutomaticEnv supplies/overrides remotes.prod.project_id, so the block merges
     // even with no TOML project_id (here it lifts major_version 15 over the base default).
@@ -860,6 +915,39 @@ describe("legacyReadDbToml", () => {
     );
   });
 
+  it.effect("rejects an unparseable [storage.buckets.<name>].file_size_limit during load", () => {
+    // Go's config.Load decodes every bucket's file_size_limit via the sizeInBytes
+    // decode hook unconditionally (`pkg/config/config.go`), so a malformed value must
+    // fail config load itself — not only later, deep inside `legacySeedBucketsRun`,
+    // where it would go unvalidated on a reused-volume restart or the already-running
+    // short-circuit.
+    const dir = withConfig('[storage.buckets.avatars]\nfile_size_limit = "bogus"\n');
+    return read(dir).pipe(
+      Effect.exit,
+      Effect.tap((exit) =>
+        Effect.sync(() => {
+          expect(Exit.isFailure(exit)).toBe(true);
+          if (Exit.isFailure(exit)) {
+            const json = JSON.stringify(exit.cause);
+            expect(json).toContain("LegacyDbConfigLoadError");
+            expect(json).toContain("invalid storage.buckets.avatars.file_size_limit");
+          }
+          rmSync(dir, { recursive: true, force: true });
+        }),
+      ),
+    );
+  });
+
+  it.effect("accepts a bare-number [storage.buckets.<name>].file_size_limit", () => {
+    // `@supabase/config`'s schema allows file_size_limit as either a quoted
+    // human-readable string or a bare byte count; the numeric form must normalize to
+    // a string before `ramInBytes` parses it rather than being rejected outright.
+    const dir = withConfig("[storage.buckets.avatars]\nfile_size_limit = 5242880\n");
+    return read(dir).pipe(
+      Effect.tap(() => Effect.sync(() => rmSync(dir, { recursive: true, force: true }))),
+    );
+  });
+
   it.effect("parses [api] auto_expose_new_tables string with Go bool tokens (TRUE → true)", () => {
     // Go decodes the *bool via strconv.ParseBool, so `TRUE`/`1`/`t` are true — not only
     // the literal lowercase `true`.
@@ -874,11 +962,12 @@ describe("legacyReadDbToml", () => {
     );
   });
 
-  it.effect("keeps [api] auto_expose_new_tables tri-state None when absent", () => {
-    const dir = withConfig("[api]\n");
+  it.effect("decodes empty api schemas while keeping auto_expose_new_tables absent", () => {
+    const dir = withConfig('[api]\nschemas = ""\n');
     return read(dir).pipe(
       Effect.tap((v) =>
         Effect.sync(() => {
+          expect(v.apiSchemas).toEqual([]);
           expect(Option.isNone(v.baseline.apiAutoExposeNewTables)).toBe(true);
           rmSync(dir, { recursive: true, force: true });
         }),
@@ -1530,6 +1619,28 @@ describe("legacyReadDbToml", () => {
     );
   });
 
+  it.effect("rejects db.major_version = 0 with Go's missing-required message", () => {
+    // Divergence #1 fix: this used to fall through to the generic
+    // "Failed reading config: Invalid db.major_version: 0." message (the same branch that
+    // catches an unsupported value like 16) — `legacyValidateResolvedConfig`'s dedicated `0` case
+    // now matches Go's `Missing required field in config: db.major_version`.
+    const dir = withConfig(["[db]", "major_version = 0", ""].join("\n"));
+    return read(dir).pipe(
+      Effect.exit,
+      Effect.tap((exit) =>
+        Effect.sync(() => {
+          expect(Exit.isFailure(exit)).toBe(true);
+          if (Exit.isFailure(exit)) {
+            expect(JSON.stringify(exit.cause)).toContain(
+              "Missing required field in config: db.major_version",
+            );
+          }
+          rmSync(dir, { recursive: true, force: true });
+        }),
+      ),
+    );
+  });
+
   it.effect("rejects db.major_version = 12 with Go's 12.x message", () => {
     const dir = withConfig(["[db]", "major_version = 12", ""].join("\n"));
     return read(dir).pipe(
@@ -2037,6 +2148,19 @@ describe("legacyReadDbToml auth.Enabled validation (Go config.Validate parity)",
       "[auth.webauthn]",
       'rp_id = "localhost"',
       'rp_origins = ["http://localhost:3000"]',
+    ]),
+  );
+  it.effect("accepts a comma-separated rp_origins string instead of rejecting it as missing", () =>
+    // Go decodes `rp_origins` (a `[]string`) through the same `StringToSliceHookFunc(",")`
+    // mapstructure hook as every other `[]string` field, so a raw string (not just a literal
+    // TOML array) must split, not read as absent — matches start.handler.ts's own
+    // resolveGotruePasskeyWebauthn/legacyStrToArr handling of this identical field.
+    succeeds([
+      "[auth.passkey]",
+      "enabled = true",
+      "[auth.webauthn]",
+      'rp_id = "localhost"',
+      'rp_origins = "http://a.example,http://b.example"',
     ]),
   );
 

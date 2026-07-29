@@ -4,7 +4,9 @@ import { BunServices } from "@effect/platform-bun";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Exit, Layer, Option } from "effect";
 
+import { stripAnsi } from "../../../../../tests/helpers/ansi.ts";
 import {
+  legacyFailWriteStringOnNthCallFsLayer,
   mockLegacyCliConfig,
   mockLegacyLinkedProjectCacheTracked,
   mockLegacyTelemetryStateTracked,
@@ -44,6 +46,21 @@ const EXPORT_JSON = JSON.stringify({
   files: [{ path: "schemas/public/t.sql", order: 0, statements: 1, sql: "create table t ();" }],
 });
 
+// Builds the pg-delta diff envelope printed by `templates/pgdelta.ts`: one file
+// per execution-aware plan unit (`{version:1,files:[{order,name,transactionMode,sql}]}`).
+const pgDeltaDiffEnvelope = (
+  units: ReadonlyArray<{ name: string; sql: string; transactionMode?: string }>,
+): string =>
+  JSON.stringify({
+    version: 1,
+    files: units.map((unit, index) => ({
+      order: index + 1,
+      name: unit.name,
+      transactionMode: unit.transactionMode ?? "transactional",
+      sql: unit.sql,
+    })),
+  });
+
 interface SetupOpts {
   readonly format?: OutputFormat;
   readonly remoteVersions?: ReadonlyArray<string>;
@@ -78,6 +95,8 @@ interface SetupOpts {
   // `--declarative` and `--use-pg-delta` are present, to replay pflag's
   // last-occurrence-wins ordering; defaults to empty.
   readonly args?: ReadonlyArray<string>;
+  // When set, the Nth `writeFileString` fails, exercising cleanup-on-failure.
+  readonly failWriteOnCall?: number;
 }
 
 function setup(workdir: string, opts: SetupOpts = {}) {
@@ -222,7 +241,7 @@ function setup(workdir: string, opts: SetupOpts = {}) {
       }),
   });
 
-  const layer = Layer.mergeAll(
+  const baseLayer = Layer.mergeAll(
     out.layer,
     telemetry.layer,
     cache.layer,
@@ -250,6 +269,12 @@ function setup(workdir: string, opts: SetupOpts = {}) {
     mockRuntimeInfo(),
     BunServices.layer,
   );
+  // Merged last so its `FileSystem` overrides `BunServices` (last-wins); `Path`
+  // still resolves from `BunServices`.
+  const layer =
+    opts.failWriteOnCall === undefined
+      ? baseLayer
+      : Layer.merge(baseLayer, legacyFailWriteStringOnNthCallFsLayer(opts.failWriteOnCall));
 
   return {
     layer,
@@ -280,8 +305,6 @@ const flags = (over: Partial<LegacyDbPullFlags> = {}): LegacyDbPullFlags => ({
   password: over.password ?? Option.none(),
 });
 
-// eslint-disable-next-line no-control-regex
-const stripAnsi = (text: string) => text.replace(/\x1b\[[0-9;]*m/gu, "");
 const streamText = (out: ReturnType<typeof mockOutput>, stream: "stdout" | "stderr") =>
   stripAnsi(
     out.rawChunks
@@ -303,17 +326,164 @@ describe("legacy db pull", () => {
     seedMigration(tmp.current, "20240101000000");
     const s = setup(tmp.current, {
       remoteVersions: ["20240101000000"],
-      edgeStdout: "create table remote ();\n",
+      edgeStdout: pgDeltaDiffEnvelope([
+        {
+          name: "schema_changes",
+          sql: "-- Migration unit 1: schema_changes\n\ncreate table remote ();",
+        },
+      ]),
       yes: true,
     });
     return Effect.gen(function* () {
       yield* legacyDbPull(flags({ diffEngine: Option.some("pg-delta") }));
       const dir = join(tmp.current, "supabase", "migrations");
       expect(existsSync(join(dir, `${"20240101000000"}_local.sql`))).toBe(true);
-      // A new timestamped remote_schema migration was written.
-      expect(streamText(s.out, "stderr")).toContain("Schema written to");
+      // A single-unit plan keeps the unchanged `<ts>_remote_schema.sql` filename.
+      const written = readdirSync(dir).filter((f) => f.endsWith("_remote_schema.sql"));
+      expect(written).toHaveLength(1);
+      expect(readFileSync(join(dir, written[0] ?? ""), "utf8")).toContain(
+        "create table remote ();",
+      );
+      // Go prints the workdir-relative path (`pull.go:76`), never the absolute one.
+      expect(streamText(s.out, "stderr")).toContain(
+        `Schema written to ${join("supabase", "migrations", written[0] ?? "")}\n`,
+      );
+      expect(streamText(s.out, "stderr")).not.toContain(tmp.current);
       expect(s.historyUpserts.length).toBe(1);
       expect(streamText(s.out, "stdout")).toContain("Finished supabase db pull.");
+    }).pipe(Effect.provide(s.layer));
+  });
+
+  it.effect(
+    "a pg-delta plan with transaction boundaries writes one ordered migration file per unit",
+    () => {
+      // pg-delta plans that cross a transaction boundary (e.g. ALTER TYPE ... ADD
+      // VALUE then a statement using the new value) come back as several units; each
+      // is written to its own migration file with a strictly increasing timestamp and
+      // recorded in the remote history. Mirrors Go's `writePgDeltaMigrations`.
+      seedMigration(tmp.current, "20240101000000");
+      const s = setup(tmp.current, {
+        remoteVersions: ["20240101000000"],
+        edgeStdout: pgDeltaDiffEnvelope([
+          { name: "schema_changes", sql: "-- unit 1\n\nalter type mood add value 'ok';" },
+          { name: "after_enum_values", sql: "-- unit 2\n\ninsert into t values ('ok');" },
+          {
+            name: "non_transactional",
+            transactionMode: "none",
+            sql: "-- unit 3\n\ncreate index concurrently i on t (c);",
+          },
+        ]),
+        yes: true,
+      });
+      return Effect.gen(function* () {
+        yield* legacyDbPull(flags({ diffEngine: Option.some("pg-delta") }));
+        const dir = join(tmp.current, "supabase", "migrations");
+        const written = readdirSync(dir)
+          .filter((f) => f !== "20240101000000_local.sql")
+          .sort();
+        expect(written).toHaveLength(3);
+        // Multi-unit plans append the unit name and carry strictly increasing versions.
+        expect(written[0]).toMatch(/^\d{14}_remote_schema_schema_changes\.sql$/u);
+        expect(written[1]).toMatch(/^\d{14}_remote_schema_after_enum_values\.sql$/u);
+        expect(written[2]).toMatch(/^\d{14}_remote_schema_non_transactional\.sql$/u);
+        const versions = written.map((f) => f.slice(0, 14));
+        expect((versions[0] ?? "") < (versions[1] ?? "")).toBe(true);
+        expect((versions[1] ?? "") < (versions[2] ?? "")).toBe(true);
+        expect(readFileSync(join(dir, written[2] ?? ""), "utf8")).toContain(
+          "create index concurrently i on t (c);",
+        );
+        // One "Schema written to" line per unit, each printing the workdir-relative
+        // path (Go's `pull.go:76`), and one history upsert per unit.
+        const err = streamText(s.out, "stderr");
+        expect(err.match(/Schema written to/gu)).toHaveLength(3);
+        for (const file of written) {
+          expect(err).toContain(`Schema written to ${join("supabase", "migrations", file)}\n`);
+        }
+        expect(s.historyUpserts.length).toBe(3);
+        // Go's UpdateMigrationTable prints all versions space-separated.
+        expect(streamText(s.out, "stderr")).toContain(
+          `Repaired migration history: [${versions.join(" ")}] => applied`,
+        );
+      }).pipe(Effect.provide(s.layer));
+    },
+  );
+
+  it.effect(
+    "a multi-unit pg-delta pull reports every written migration path in the json payload",
+    () => {
+      // The structured payload must list ALL written migration files in write order,
+      // not just the first (`schemaWritten`). A pg-delta plan writes one file per unit.
+      seedMigration(tmp.current, "20240101000000");
+      const s = setup(tmp.current, {
+        format: "json",
+        remoteVersions: ["20240101000000"],
+        edgeStdout: pgDeltaDiffEnvelope([
+          { name: "schema_changes", sql: "-- unit 1\n\nalter type mood add value 'ok';" },
+          { name: "after_enum_values", sql: "-- unit 2\n\ninsert into t values ('ok');" },
+          {
+            name: "non_transactional",
+            transactionMode: "none",
+            sql: "-- unit 3\n\ncreate index concurrently i on t (c);",
+          },
+        ]),
+      });
+      return Effect.gen(function* () {
+        yield* legacyDbPull(flags({ diffEngine: Option.some("pg-delta") }));
+        const success = s.out.messages.find((m) => m.type === "success");
+        const data = success?.data as
+          | { schemaWritten?: string; schemaFiles?: Array<string> }
+          | undefined;
+        expect(data?.schemaFiles).toHaveLength(3);
+        // Paths appear in write order, each carrying its unit name.
+        expect(data?.schemaFiles?.[0]).toMatch(/_remote_schema_schema_changes\.sql$/u);
+        expect(data?.schemaFiles?.[1]).toMatch(/_remote_schema_after_enum_values\.sql$/u);
+        expect(data?.schemaFiles?.[2]).toMatch(/_remote_schema_non_transactional\.sql$/u);
+        // `schemaWritten` stays the first written path (unchanged string contract).
+        expect(data?.schemaWritten).toBe(data?.schemaFiles?.[0]);
+      }).pipe(Effect.provide(s.layer));
+    },
+  );
+
+  it.effect("removes already-written unit files when a later pg-delta unit write fails", () => {
+    // A mid-loop write failure best-effort removes every migration file this
+    // invocation already wrote, so no partial multi-file pull is left behind.
+    seedMigration(tmp.current, "20240101000000");
+    const s = setup(tmp.current, {
+      failWriteOnCall: 2,
+      remoteVersions: ["20240101000000"],
+      edgeStdout: pgDeltaDiffEnvelope([
+        { name: "schema_changes", sql: "alter type mood add value 'ok';" },
+        { name: "after_enum_values", sql: "insert into t values ('ok');" },
+      ]),
+      yes: true,
+    });
+    return Effect.gen(function* () {
+      const exit = yield* legacyDbPull(flags({ diffEngine: Option.some("pg-delta") })).pipe(
+        Effect.exit,
+      );
+      expect(Exit.isFailure(exit)).toBe(true);
+      const dir = join(tmp.current, "supabase", "migrations");
+      // Only the pre-seeded local migration remains; the first written unit was
+      // rolled back and the failing second unit never landed.
+      expect(readdirSync(dir)).toEqual(["20240101000000_local.sql"]);
+      // No history rows were upserted because the write failed before the prompt.
+      expect(s.historyUpserts.length).toBe(0);
+    }).pipe(Effect.provide(s.layer));
+  });
+
+  it.effect("a malformed pg-delta diff envelope surfaces a parse error, not 'in sync'", () => {
+    seedMigration(tmp.current, "20240101000000");
+    const s = setup(tmp.current, {
+      remoteVersions: ["20240101000000"],
+      edgeStdout: "not a valid envelope{",
+      yes: true,
+    });
+    return Effect.gen(function* () {
+      const error = yield* legacyDbPull(flags({ diffEngine: Option.some("pg-delta") })).pipe(
+        Effect.flip,
+      );
+      expect(error.message).toContain("failed to parse pg-delta diff output");
+      expect(error.message).not.toContain("No schema changes found");
     }).pipe(Effect.provide(s.layer));
   });
 
@@ -327,7 +497,17 @@ describe("legacy db pull", () => {
     return Effect.gen(function* () {
       yield* legacyDbPull(flags());
       expect(s.provisionCalls[0]?.usePgDelta).toBe(false);
-      expect(streamText(s.out, "stderr")).toContain("Schema written to");
+      const err = streamText(s.out, "stderr");
+      // Go's `ConnectByConfig` prints the Connecting line to stderr before dialing
+      // (`internal/utils/connect.go:348`), ahead of any other pull output.
+      expect(err).toContain("Connecting to remote database...\n");
+      expect(err.indexOf("Connecting to remote database...")).toBeLessThan(
+        err.indexOf("Creating shadow database..."),
+      );
+      const dir = join(tmp.current, "supabase", "migrations");
+      const file = readdirSync(dir).find((f) => f.endsWith("_remote_schema.sql"));
+      expect(err).toContain(`Schema written to ${join("supabase", "migrations", file ?? "")}\n`);
+      expect(err).not.toContain(tmp.current);
     }).pipe(Effect.provide(s.layer));
   });
 
@@ -335,8 +515,17 @@ describe("legacy db pull", () => {
     const s = setup(tmp.current, { edgeStdout: EXPORT_JSON });
     return Effect.gen(function* () {
       yield* legacyDbPull(flags({ declarative: Option.some(true) }));
-      expect(streamText(s.out, "stderr")).toContain("Preparing declarative schema export");
-      expect(streamText(s.out, "stderr")).toContain("Declarative schema written to");
+      const err = streamText(s.out, "stderr");
+      // Go's order: `ConnectByConfig` prints Connecting (`pull.go:40`), then
+      // `pullDeclarativePgDelta` prints Preparing (`pull.go:93`).
+      expect(err).toContain("Connecting to remote database...\n");
+      expect(err.indexOf("Connecting to remote database...")).toBeLessThan(
+        err.indexOf("Preparing declarative schema export"),
+      );
+      // Go prints `utils.GetDeclarativeDir()` — the relative default, not the
+      // resolved absolute directory (`pull.go:119`).
+      expect(err).toContain(`Declarative schema written to ${join("supabase", "database")}\n`);
+      expect(err).not.toContain(tmp.current);
       expect(
         existsSync(join(tmp.current, "supabase", "database", "schemas", "public", "t.sql")),
       ).toBe(true);
@@ -400,7 +589,9 @@ describe("legacy db pull", () => {
       return Effect.gen(function* () {
         yield* legacyDbPull(flags({ usePgDelta: Option.some(true) }));
         expect(streamText(s.out, "stderr")).toContain("Flag --use-pg-delta has been deprecated");
-        expect(streamText(s.out, "stderr")).toContain("Declarative schema written to");
+        expect(streamText(s.out, "stderr")).toContain(
+          `Declarative schema written to ${join("supabase", "database")}\n`,
+        );
       }).pipe(Effect.provide(s.layer));
     },
   );
@@ -497,11 +688,16 @@ describe("legacy db pull", () => {
         expect(content).toContain("create table dumped ();");
         expect(content).toContain("create table diffed ();");
         expect(content.indexOf("dumped")).toBeLessThan(content.indexOf("diffed"));
-        // stderr order: dump → shadow → diff → written.
+        // stderr order: connect → dump → shadow → diff → written. The Connecting
+        // line comes first (Go's `ConnectByConfig` at the top of `pull.Run`).
         const err = streamText(s.out, "stderr");
+        expect(err).toContain("Connecting to remote database...\n");
         expect(err).toContain("Dumping schema from remote database...");
         expect(err).toContain("Creating shadow database...");
-        expect(err).toContain("Schema written to");
+        expect(err).toContain(`Schema written to ${join("supabase", "migrations", file ?? "")}\n`);
+        expect(err.indexOf("Connecting to remote database")).toBeLessThan(
+          err.indexOf("Dumping schema"),
+        );
         expect(err.indexOf("Dumping schema")).toBeLessThan(err.indexOf("Creating shadow"));
         expect(s.historyUpserts.length).toBe(1);
       }).pipe(Effect.provide(s.layer));
@@ -527,8 +723,14 @@ describe("legacy db pull", () => {
         remoteHistoryUpdated: true,
         engine: "migra",
       });
-      const data = success?.data as { schemaWritten?: string } | undefined;
+      const data = success?.data as
+        | { schemaWritten?: string; schemaFiles?: Array<string> }
+        | undefined;
       expect(data?.schemaWritten).toMatch(/_remote_schema\.sql$/u);
+      // The single-unit case lists exactly one written migration path, and it is the
+      // same path as the singular `schemaWritten` field.
+      expect(data?.schemaFiles).toHaveLength(1);
+      expect(data?.schemaFiles?.[0]).toBe(data?.schemaWritten);
     }).pipe(Effect.provide(s.layer));
   });
 
@@ -548,7 +750,9 @@ describe("legacy db pull", () => {
       const file = readdirSync(dir).find((f) => f.endsWith("_remote_schema.sql"));
       expect(file).toBeDefined();
       expect(readFileSync(join(dir, file ?? ""), "utf8")).toContain("create table dumped ();");
-      expect(streamText(s.out, "stderr")).toContain("Schema written to");
+      expect(streamText(s.out, "stderr")).toContain(
+        `Schema written to ${join("supabase", "migrations", file ?? "")}\n`,
+      );
     }).pipe(Effect.provide(s.layer));
   });
 
@@ -787,6 +991,9 @@ describe("legacy db pull", () => {
     return Effect.gen(function* () {
       yield* legacyDbPull(flags());
       expect(streamText(s.out, "stdout")).not.toContain("Finished supabase db pull.");
+      // Diagnostics still go to stderr in machine mode (Go writes the Connecting
+      // line to os.Stderr regardless of output format); stdout stays payload-only.
+      expect(streamText(s.out, "stderr")).toContain("Connecting to remote database...\n");
       const success = s.out.messages.find((m) => m.type === "success");
       expect(success?.data).toMatchObject({ declarative: false, remoteHistoryUpdated: true });
     }).pipe(Effect.provide(s.layer));
@@ -948,6 +1155,9 @@ describe("legacy db pull", () => {
       }
       expect(s.proxyCalls).toHaveLength(1);
       expect(s.proxyCalls[0]?.env).toEqual({ SUPABASE_TELEMETRY_DISABLED: "1" });
+      // The Go child's own `ConnectByConfig` prints the Connecting line; the
+      // parent must not print it too (it would appear twice in the stream).
+      expect(streamText(s.out, "stderr")).not.toContain("Connecting to");
     }).pipe(Effect.provide(s.layer));
   });
 
@@ -1008,6 +1218,9 @@ describe("legacy db pull", () => {
       yield* legacyDbPull(flags());
       expect(s.proxyCalls).toHaveLength(1);
       expect(s.proxyCalls[0]?.env).toEqual({ SUPABASE_TELEMETRY_DISABLED: "1" });
+      // The Go child's own `ConnectByConfig` prints the Connecting line; the
+      // parent must not print it too (it would appear twice in the stream).
+      expect(streamText(s.out, "stderr")).not.toContain("Connecting to");
     }).pipe(Effect.provide(s.layer));
   });
 
@@ -1045,7 +1258,7 @@ describe("legacy db pull", () => {
     writeFileSync(join(tmp.current, "supabase", ".env"), "SUPABASE_EXPERIMENTAL_PG_DELTA=true\n");
     const s = setup(tmp.current, {
       remoteVersions: ["20240101000000"],
-      edgeStdout: "create table remote ();\n",
+      edgeStdout: pgDeltaDiffEnvelope([{ name: "schema_changes", sql: "create table remote ();" }]),
       yes: true,
     });
     return Effect.gen(function* () {
@@ -1068,6 +1281,19 @@ describe("legacy db pull", () => {
     return Effect.gen(function* () {
       yield* legacyDbPull(flags({ local: Option.some(true) }));
       expect(s.provisionCalls[0]?.targetLocal).toBe(true);
+      // A local target prints the local wording (Go's `IsLocalDatabase` branch in
+      // `ConnectByConfigStream`, `internal/utils/connect.go:344-346`).
+      expect(streamText(s.out, "stderr")).toContain("Connecting to local database...\n");
+    }).pipe(Effect.provide(s.layer));
+  });
+
+  it.effect("db pull --local keeps migration repair suggestions local", () => {
+    seedMigration(tmp.current, "20240102000000");
+    const s = setup(tmp.current, { remoteVersions: ["20240101000000"] });
+    return Effect.gen(function* () {
+      const exit = yield* legacyDbPull(flags({ local: Option.some(true) })).pipe(Effect.exit);
+      expect(JSON.stringify(exit)).toContain("migration repair --local --status reverted");
+      expect(JSON.stringify(exit)).toContain("migration repair --local --status applied");
     }).pipe(Effect.provide(s.layer));
   });
 
@@ -1158,7 +1384,7 @@ describe("legacy db pull", () => {
     );
     const s = setup(tmp.current, {
       remoteVersions: ["20240101000000"],
-      edgeStdout: "create table remote ();\n",
+      edgeStdout: pgDeltaDiffEnvelope([{ name: "schema_changes", sql: "create table remote ();" }]),
       yes: true,
       resolvedRef: "abcdefghijklmnopqrst",
     });
@@ -1180,7 +1406,7 @@ describe("legacy db pull", () => {
     const s = setup(tmp.current, {
       remoteVersions: ["20240101000000"],
       edgeFailFirstWith: "error diffing schema:\nfailed to connect: network is unreachable",
-      edgeStdout: "create table remote ();\n",
+      edgeStdout: pgDeltaDiffEnvelope([{ name: "schema_changes", sql: "create table remote ();" }]),
       yes: true,
       poolerAvailable: true,
     });
@@ -1191,7 +1417,9 @@ describe("legacy db pull", () => {
       expect(streamText(s.out, "stderr")).toContain("does not support IPv6");
       expect(streamText(s.out, "stderr")).toContain("Retrying via the IPv4 connection pooler");
       expect(s.edgeRunCount).toBe(2);
-      expect(streamText(s.out, "stderr")).toContain("Schema written to");
+      expect(streamText(s.out, "stderr")).toMatch(
+        /Schema written to supabase[/\\]migrations[/\\]\d{14}_remote_schema\.sql\n/u,
+      );
     }).pipe(Effect.provide(s.layer));
   });
 
@@ -1207,7 +1435,9 @@ describe("legacy db pull", () => {
       yield* legacyDbPull(flags({ linked: Option.some(true), declarative: Option.some(true) }));
       expect(streamText(s.out, "stderr")).toContain("Retrying via the IPv4 connection pooler");
       expect(s.edgeRunCount).toBe(2);
-      expect(streamText(s.out, "stderr")).toContain("Declarative schema written to");
+      expect(streamText(s.out, "stderr")).toContain(
+        `Declarative schema written to ${join("supabase", "database")}\n`,
+      );
     }).pipe(Effect.provide(s.layer));
   });
 

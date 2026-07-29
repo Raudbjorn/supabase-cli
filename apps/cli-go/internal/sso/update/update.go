@@ -45,8 +45,8 @@ func Run(ctx context.Context, params RunParams) error {
 	}
 
 	if getResp.JSON200 == nil {
-		if orgSlug, isGated := utils.SuggestUpgradeOnError(ctx, params.ProjectRef, "auth.saml_2", getResp.StatusCode()); isGated {
-			telemetry.TrackUpgradeSuggested(ctx, "auth.saml_2", orgSlug)
+		if feature, orgSlug, isGated := utils.SuggestUpgradeOnError(ctx, params.ProjectRef, "auth.saml_2", getResp.StatusCode(), getResp.Body); isGated {
+			telemetry.TrackUpgradeSuggested(ctx, feature, orgSlug)
 		}
 		if getResp.StatusCode() == http.StatusNotFound {
 			return errors.Errorf("An identity provider with ID %q could not be found.", parsed)
@@ -74,15 +74,7 @@ func Run(ctx context.Context, params RunParams) error {
 	}
 
 	if params.AttributeMapping != "" {
-		body.AttributeMapping = &struct {
-			Keys map[string]struct {
-				Array   *bool     "json:\"array,omitempty\""
-				Default *any      "json:\"default,omitempty\""
-				Name    *string   "json:\"name,omitempty\""
-				Names   *[]string "json:\"names,omitempty\""
-			} "json:\"keys\""
-		}{}
-		if err := saml.ReadAttributeMappingFile(Fs, params.AttributeMapping, body.AttributeMapping); err != nil {
+		if err := saml.ReadAttributeMappingFile(Fs, params.AttributeMapping, &body.AttributeMapping); err != nil {
 			return err
 		}
 	}
@@ -127,8 +119,8 @@ func Run(ctx context.Context, params RunParams) error {
 
 	if putResp.JSON200 == nil {
 		// GET branch above early-returns on failure, so this and the GET fire are mutually exclusive (max one event per invocation).
-		if orgSlug, isGated := utils.SuggestUpgradeOnError(ctx, params.ProjectRef, "auth.saml_2", putResp.StatusCode()); isGated {
-			telemetry.TrackUpgradeSuggested(ctx, "auth.saml_2", orgSlug)
+		if feature, orgSlug, isGated := utils.SuggestUpgradeOnError(ctx, params.ProjectRef, "auth.saml_2", putResp.StatusCode(), putResp.Body); isGated {
+			telemetry.TrackUpgradeSuggested(ctx, feature, orgSlug)
 		}
 		return errors.New("unexpected error fetching identity provider: " + string(putResp.Body))
 	}

@@ -1,12 +1,16 @@
 import { Effect, Exit, FileSystem, Option, Path } from "effect";
 import { LegacyCliConfig } from "../../config/legacy-cli-config.service.ts";
 import { LegacyCredentials } from "../../auth/legacy-credentials.service.ts";
+import {
+  INVALID_PROJECT_REF_MESSAGE,
+  PROJECT_REF_PATTERN,
+} from "../../config/legacy-project-ref.service.ts";
 import { LegacyLinkedProjectCache } from "../../telemetry/legacy-linked-project-cache.service.ts";
 import { LegacyTelemetryState } from "../../telemetry/legacy-telemetry-state.service.ts";
 import { legacyReadDbToml } from "../../shared/legacy-db-config.toml-read.ts";
 import { legacyResolveDbImage } from "../../shared/legacy-db-image.ts";
 import { legacyResolveEdgeRuntimeImage } from "../../shared/legacy-edge-runtime-image.ts";
-import { legacyTempPaths } from "../../shared/legacy-temp-paths.ts";
+import { legacyReadServiceVersionOverrides } from "../../shared/legacy-service-version-overrides.ts";
 import { LegacyOutputFlag } from "../../../shared/legacy/global-flags.ts";
 import { Output } from "../../../shared/output/output.service.ts";
 import { encodeGoJson, encodeToml, encodeYaml } from "../../shared/legacy-go-output.encoders.ts";
@@ -16,8 +20,6 @@ import {
   formatServicesWarning,
   listLocalServiceVersions,
   type LocalServiceImageOverrides,
-  type LocalServiceVersionName,
-  type LocalServiceVersionOverrides,
   mergeRemoteServiceVersions,
   renderServicesTable,
   renderServicesWarning,
@@ -62,6 +64,21 @@ export const legacyServices = Effect.fn("legacy.services")(function* (_flags: Le
   yield* Effect.gen(function* () {
     const accessTokenExit = yield* credentials.getAccessToken.pipe(Effect.exit);
     const accessToken = Exit.isSuccess(accessTokenExit) ? accessTokenExit.value : Option.none();
+
+    const validLinkedRef = Option.filter(linkedProjectRef, (ref) => PROJECT_REF_PATTERN.test(ref));
+    if (Option.isSome(linkedProjectRef) && Option.isNone(validLinkedRef)) {
+      // Go's `flags.LoadProjectRef` (project_ref.go:54-76) validates the ref but
+      // `cmd/services.go`'s Run only warns on the error and keeps going, so Go
+      // still calls `listRemoteImages` with the malformed ref (services.go:61-62).
+      // TS matches the warning but deliberately skips the remote call instead of
+      // reproducing it: the ref is embedded unescaped into the tenant gateway
+      // hostname in `fetchLinkedServiceVersions`, so proceeding would let a
+      // malformed ref redirect the service-role key to an attacker-controlled host.
+      // Emitted before the config-load warning below to match the order Go's
+      // `Run` prints them in (services.go:18-24).
+      yield* output.raw(`${INVALID_PROJECT_REF_MESSAGE}\n`, "stderr");
+    }
+
     const tomlValues = yield* legacyReadDbToml(
       fs,
       path,
@@ -75,7 +92,7 @@ export const legacyServices = Effect.fn("legacy.services")(function* (_flags: Le
     const serviceVersions =
       tomlValues === null
         ? {}
-        : yield* readLegacyServiceVersionOverrides(
+        : yield* legacyReadServiceVersionOverrides(
             fs,
             path,
             cliConfig.workdir,
@@ -109,11 +126,11 @@ export const legacyServices = Effect.fn("legacy.services")(function* (_flags: Le
     };
 
     let rows = listLocalServiceVersions(localImageOptions);
-    if (Option.isSome(linkedProjectRef) && Option.isSome(accessToken)) {
+    if (Option.isSome(validLinkedRef) && Option.isSome(accessToken)) {
       const remote = yield* fetchLinkedServiceVersions({
         apiUrl: cliConfig.apiUrl,
         projectHost: cliConfig.projectHost,
-        projectRef: linkedProjectRef.value,
+        projectRef: validLinkedRef.value,
         accessToken: accessToken.value,
         userAgent: cliConfig.userAgent,
       });
@@ -166,42 +183,3 @@ export const legacyServices = Effect.fn("legacy.services")(function* (_flags: Le
 function formatConfigLoadError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
-
-const LEGACY_VERSION_FILES = [
-  ["auth", "gotrue-version", (majorVersion: number | undefined) => (majorVersion ?? 17) > 14],
-  ["postgrest", "rest-version", (majorVersion: number | undefined) => (majorVersion ?? 17) > 14],
-  ["storage", "storage-version"],
-  ["realtime", "realtime-version"],
-  ["studio", "studio-version"],
-  ["pgmeta", "pgmeta-version"],
-  ["analytics", "logflare-version"],
-  ["pooler", "pooler-version"],
-] as const satisfies ReadonlyArray<
-  readonly [LocalServiceVersionName, string, ((majorVersion: number | undefined) => boolean)?]
->;
-
-const readLegacyServiceVersionOverrides = Effect.fnUntraced(function* (
-  fs: FileSystem.FileSystem,
-  path: Path.Path,
-  workdir: string,
-  majorVersion: number | undefined,
-) {
-  const paths = legacyTempPaths(path, workdir);
-  const versions: LocalServiceVersionOverrides = {};
-
-  for (const [service, fileName, shouldRead] of LEGACY_VERSION_FILES) {
-    if (shouldRead !== undefined && !shouldRead(majorVersion)) {
-      continue;
-    }
-
-    const version = yield* fs.readFileString(path.join(paths.tempDir, fileName)).pipe(
-      Effect.map((content) => content.trim()),
-      Effect.orElseSucceed(() => ""),
-    );
-    if (version.length > 0) {
-      versions[service] = version;
-    }
-  }
-
-  return versions;
-});

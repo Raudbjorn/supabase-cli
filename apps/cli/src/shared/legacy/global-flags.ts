@@ -1,8 +1,8 @@
-import { Effect } from "effect";
+import { Effect, Option } from "effect";
 import { Flag, GlobalFlag } from "effect/unstable/cli";
 
 import { CliArgs } from "../cli/cli-args.service.ts";
-import { legacyViperBool, legacyViperEnvBool } from "./legacy-viper-env.ts";
+import { legacyViperEnvBool, legacyViperEnvBoolWithProjectFallback } from "./legacy-viper-env.ts";
 
 // The Effect CLI hoists global flags out of the token stream before the leaf
 // parse and builds ONE tree-wide registry, so a command cannot redeclare an
@@ -95,6 +95,48 @@ export const LEGACY_GLOBAL_FLAGS = [
   LegacyAgentFlag,
 ] as const;
 
+/**
+ * Resolves the current value of every global/persistent flag above, keyed by
+ * its own CLI flag name (each flag's `.id`, e.g. `debug`, `workdir`). Used by
+ * `legacy/telemetry/legacy-command-instrumentation.ts` to mirror Go's
+ * `changedFlags()` walking `cmd.Parent()`'s `PersistentFlags()` in addition to
+ * a command's own flags (`cmd/root_analytics.go:53-76`) — global flags here
+ * live in a single Effect-context-wide registry rather than per-ancestor
+ * `pflag.FlagSet`s, so this reads all of them unconditionally instead of
+ * walking a parent chain (CLI-1896).
+ *
+ * Read via `Effect.serviceOption` (adds no `R` requirement) so a caller that
+ * hasn't wired the global-flag context — e.g. a focused unit test — simply
+ * gets an empty record instead of a missing-service defect; production always
+ * provides every global flag through `Command.withGlobalFlags` at the CLI
+ * root (`legacy/cli/root.ts`).
+ *
+ * Reads each flag individually (rather than looping `LEGACY_GLOBAL_FLAGS`)
+ * because each `Setting<Id, A>` has a distinct value type `A` — a homogeneous
+ * loop widens the union in a way `Effect.serviceOption` can't resolve back to
+ * a single service lookup without an `as` cast, which this codebase forbids.
+ * `global-flags.unit.test.ts` asserts the resolved id set stays exactly in
+ * sync with `LEGACY_GLOBAL_FLAGS` — extend both together when adding a new
+ * global flag.
+ */
+export const legacyGlobalFlagValues = Effect.gen(function* () {
+  const values: Record<string, unknown> = {};
+  const setIfPresent = (id: string, option: Option.Option<unknown>) => {
+    if (Option.isSome(option)) values[id] = option.value;
+  };
+  setIfPresent(LegacyAgentFlag.id, yield* Effect.serviceOption(LegacyAgentFlag));
+  setIfPresent(LegacyCreateTicketFlag.id, yield* Effect.serviceOption(LegacyCreateTicketFlag));
+  setIfPresent(LegacyDebugFlag.id, yield* Effect.serviceOption(LegacyDebugFlag));
+  setIfPresent(LegacyDnsResolverFlag.id, yield* Effect.serviceOption(LegacyDnsResolverFlag));
+  setIfPresent(LegacyExperimentalFlag.id, yield* Effect.serviceOption(LegacyExperimentalFlag));
+  setIfPresent(LegacyNetworkIdFlag.id, yield* Effect.serviceOption(LegacyNetworkIdFlag));
+  setIfPresent(LegacyOutputFlag.id, yield* Effect.serviceOption(LegacyOutputFlag));
+  setIfPresent(LegacyProfileFlag.id, yield* Effect.serviceOption(LegacyProfileFlag));
+  setIfPresent(LegacyWorkdirFlag.id, yield* Effect.serviceOption(LegacyWorkdirFlag));
+  setIfPresent(LegacyYesFlag.id, yield* Effect.serviceOption(LegacyYesFlag));
+  return values;
+});
+
 const PFLAG_FALSE_VALUES = new Set(["0", "f", "F", "false", "FALSE", "False"]);
 
 /**
@@ -132,11 +174,13 @@ export const legacyResolveYes = Effect.gen(function* () {
 /**
  * `--yes` resolved with the project `.env` consulted too, for commands that load the nested
  * project env before prompting (`migration down`, `migration repair --all`). Go runs
- * `loadNestedEnv` — which `os.Setenv`s each project-.env key — inside `ParseDatabaseConfig`
- * before `PromptYesNo` reads `viper.GetBool("YES")` (`pkg/config/config.go:701`,
- * `internal/utils/console.go:71`), so a `SUPABASE_YES` set only in `supabase/.env`
- * auto-confirms. The shell env still wins over the file value. An explicit `--yes`
- * (including `--yes=false`) wins over both. `projectEnv` is the loaded map from
+ * `loadNestedEnv` — `godotenv.Load`, which only sets keys absent from the shell env —
+ * inside `ParseDatabaseConfig` before `PromptYesNo` reads `viper.GetBool("YES")`
+ * (`pkg/config/config.go:701`, `internal/utils/console.go:71`), so a `SUPABASE_YES` set
+ * only in `supabase/.env` auto-confirms. Shell *presence* — any value, including `false`,
+ * empty, or garbage — suppresses the file value entirely (see
+ * {@link legacyViperEnvBoolWithProjectFallback}). An explicit `--yes` (including
+ * `--yes=false`) wins over both. `projectEnv` is the loaded map from
  * `legacyLoadProjectEnv`.
  */
 export const legacyResolveYesWithProjectEnv = (projectEnv: Record<string, string>) =>
@@ -146,37 +190,61 @@ export const legacyResolveYesWithProjectEnv = (projectEnv: Record<string, string
     if (legacyYesFlagExplicitlyFalse(cliArgs.args)) {
       return false;
     }
-    return (
-      flag || legacyViperEnvBool("SUPABASE_YES") || legacyViperBool(projectEnv["SUPABASE_YES"])
-    );
+    return flag || legacyViperEnvBoolWithProjectFallback("SUPABASE_YES", projectEnv);
   });
+
+/**
+ * True when the raw argv contains an explicit `--experimental=<false>` (pflag's `ParseBool`
+ * false set). Mirrors {@link legacyYesFlagExplicitlyFalse}: `--experimental` is bound to
+ * viper the same way `--yes` is (`apps/cli-go/cmd/root.go:318-334`), and viper's bound-pflag
+ * lookup returns the flag value whenever `Changed` is true — BEFORE falling back to
+ * `AutomaticEnv` — regardless of whether that value is `true` or `false`
+ * (`viper@v1.21.0/viper.go:1176-1178`). A plain boolean can't distinguish an explicit
+ * `--experimental=false` from the omitted default, so scan the raw argv. Only the `=false`
+ * form needs special handling: `--experimental` / `--experimental=true` are already `true`,
+ * so `flag || env` matches Go, and an omitted flag correctly falls through to the env value.
+ */
+const legacyExperimentalFlagExplicitlyFalse = (args: ReadonlyArray<string>): boolean =>
+  args.some(
+    (arg) =>
+      arg.startsWith("--experimental=") &&
+      PFLAG_FALSE_VALUES.has(arg.slice("--experimental=".length)),
+  );
 
 /**
  * `--experimental` resolved with Go's viper `AutomaticEnv` fallback: the gate in
  * `rootCmd.PersistentPreRunE` reads `viper.GetBool("EXPERIMENTAL")`
  * (`apps/cli-go/cmd/root.go:94`), so `SUPABASE_EXPERIMENTAL` enables experimental
- * commands just like the flag. A passed `--experimental` wins over the env.
+ * commands just like the flag. An explicit `--experimental` — including
+ * `--experimental=false` — wins over the env, matching viper's bound-pflag precedence.
  */
 export const legacyResolveExperimental = Effect.gen(function* () {
   const flag = yield* LegacyExperimentalFlag;
+  const cliArgs = yield* CliArgs;
+  if (legacyExperimentalFlagExplicitlyFalse(cliArgs.args)) {
+    return false;
+  }
   return flag || legacyViperEnvBool("SUPABASE_EXPERIMENTAL");
 });
 
 /**
  * `--experimental` resolved with the project `.env` consulted too, for commands that load the
- * nested project env before branching on the experimental gate (`db reset`). Go's
- * `ParseDatabaseConfig` runs `loadNestedEnv` — which `os.Setenv`s each project-.env key —
- * before `reset.Run` reads `viper.GetBool("EXPERIMENTAL")`, so a `SUPABASE_EXPERIMENTAL` set
- * only in `supabase/.env` enables the experimental path. The shell env still wins over the
- * file value; a passed `--experimental` wins over both. `projectEnv` is the loaded map from
- * `legacyLoadProjectEnv`.
+ * nested project env before branching on the experimental gate (`db reset`,
+ * `db schema declarative generate`/`sync`). Go's `ParseDatabaseConfig` /
+ * `dbDeclarativeCmd.PersistentPreRunE` run `loadNestedEnv` — `godotenv.Load`, which only
+ * sets keys absent from the shell env — before reading `viper.GetBool("EXPERIMENTAL")`, so
+ * a `SUPABASE_EXPERIMENTAL` set only in `supabase/.env` enables the experimental path.
+ * Shell *presence* — any value, including `false`, empty, or garbage — suppresses the file
+ * value entirely (see {@link legacyViperEnvBoolWithProjectFallback}); an explicit
+ * `--experimental` — including `--experimental=false` — wins over both, matching viper's
+ * bound-pflag precedence. `projectEnv` is the loaded map from `legacyLoadProjectEnv`.
  */
 export const legacyResolveExperimentalWithProjectEnv = (projectEnv: Record<string, string>) =>
   Effect.gen(function* () {
     const flag = yield* LegacyExperimentalFlag;
-    return (
-      flag ||
-      legacyViperEnvBool("SUPABASE_EXPERIMENTAL") ||
-      legacyViperBool(projectEnv["SUPABASE_EXPERIMENTAL"])
-    );
+    const cliArgs = yield* CliArgs;
+    if (legacyExperimentalFlagExplicitlyFalse(cliArgs.args)) {
+      return false;
+    }
+    return flag || legacyViperEnvBoolWithProjectFallback("SUPABASE_EXPERIMENTAL", projectEnv);
   });

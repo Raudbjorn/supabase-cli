@@ -1,8 +1,15 @@
 import type { V1CreateABranchOutput } from "@supabase/api/effect";
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Exit, Option } from "effect";
+import { Cause, Effect, Exit, Layer, Option } from "effect";
+import { Command } from "effect/unstable/cli";
 
-import { mockAnalytics, mockOutput } from "../../../../../tests/helpers/mocks.ts";
+import {
+  mockAnalytics,
+  mockOutput,
+  mockStdin,
+  mockTty,
+} from "../../../../../tests/helpers/mocks.ts";
+import { LEGACY_GLOBAL_FLAGS, LegacyYesFlag } from "../../../../shared/legacy/global-flags.ts";
 import {
   LEGACY_VALID_REF,
   buildLegacyTestRuntime,
@@ -13,7 +20,7 @@ import {
   mockLegacyTelemetryStateTracked,
   useLegacyTempWorkdir,
 } from "../../../../../tests/helpers/legacy-mocks.ts";
-import type { LegacyBranchesCreateFlags } from "./create.command.ts";
+import { legacyBranchesCreateCommand, type LegacyBranchesCreateFlags } from "./create.command.ts";
 import { legacyBranchesCreate } from "./create.handler.ts";
 
 type CreatedBranch = typeof V1CreateABranchOutput.Type;
@@ -70,6 +77,12 @@ interface SetupOpts {
   readonly network?: "fail";
   readonly gated?: boolean;
   readonly featureKey?: string;
+  /** Resolved `--yes`/`SUPABASE_YES` for the git-branch auto-name confirm. */
+  readonly yes?: boolean;
+  readonly stdinIsTty?: boolean;
+  /** Piped stdin lines consumed by the non-TTY confirm read. */
+  readonly stdinInput?: string;
+  readonly promptConfirmResponses?: ReadonlyArray<boolean>;
 }
 
 function buildApiLayer(opts: SetupOpts) {
@@ -99,17 +112,25 @@ function buildApiLayer(opts: SetupOpts) {
 }
 
 function setup(opts: SetupOpts = {}) {
-  const out = mockOutput({ format: opts.format ?? "text" });
+  const out = mockOutput({
+    format: opts.format ?? "text",
+    promptConfirmResponses: opts.promptConfirmResponses,
+  });
   const analytics = mockAnalytics();
   const api = buildApiLayer(opts);
   const cliConfig = mockLegacyCliConfig({ workdir: tempRoot.current });
-  const layer = buildLegacyTestRuntime({
-    out,
-    api,
-    cliConfig,
-    analytics,
-    goOutput: opts.goOutput === undefined ? Option.none() : Option.some(opts.goOutput),
-  });
+  const layer = Layer.mergeAll(
+    buildLegacyTestRuntime({
+      out,
+      api,
+      cliConfig,
+      analytics,
+      tty: mockTty({ stdinIsTty: opts.stdinIsTty ?? false, stdoutIsTty: false }),
+      stdin: mockStdin(opts.stdinIsTty ?? false, opts.stdinInput),
+      goOutput: opts.goOutput === undefined ? Option.none() : Option.some(opts.goOutput),
+    }),
+    Layer.succeed(LegacyYesFlag, opts.yes ?? false),
+  );
   return { layer, out, api, analytics };
 }
 
@@ -120,14 +141,17 @@ function setupTracked(opts: SetupOpts = {}) {
   const cliConfig = mockLegacyCliConfig({ workdir: tempRoot.current });
   const telemetry = mockLegacyTelemetryStateTracked();
   const cache = mockLegacyLinkedProjectCacheTracked();
-  const layer = buildLegacyTestRuntime({
-    out,
-    api,
-    cliConfig,
-    analytics,
-    telemetry: telemetry.layer,
-    linkedProjectCache: cache.layer,
-  });
+  const layer = Layer.mergeAll(
+    buildLegacyTestRuntime({
+      out,
+      api,
+      cliConfig,
+      analytics,
+      telemetry: telemetry.layer,
+      linkedProjectCache: cache.layer,
+    }),
+    Layer.succeed(LegacyYesFlag, opts.yes ?? false),
+  );
   return { layer, out, api, telemetry, cache, analytics };
 }
 
@@ -195,6 +219,105 @@ describe("legacy branches create integration", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  // ---------------------------------------------------------------------------
+  // Git-branch auto-name confirmation — Go `create.go:17-28` routes it through
+  // `PromptYesNo(title, true)` (`console.go:64-82`). `GITHUB_HEAD_REF` drives
+  // `detectGitBranch` deterministically (its highest-priority source).
+  // ---------------------------------------------------------------------------
+
+  const withGitBranch = <A, E, R>(effect: Effect.Effect<A, E, R>, branch = "feat-y") => {
+    const prevHead = process.env["GITHUB_HEAD_REF"];
+    process.env["GITHUB_HEAD_REF"] = branch;
+    return effect.pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (prevHead === undefined) delete process.env["GITHUB_HEAD_REF"];
+          else process.env["GITHUB_HEAD_REF"] = prevHead;
+        }),
+      ),
+    );
+  };
+
+  it.live("--yes auto-confirms the git-branch name with the [Y/n] y echo", () => {
+    const { layer, out, api } = setup({ yes: true, stdinIsTty: true });
+    return withGitBranch(
+      Effect.gen(function* () {
+        yield* legacyBranchesCreate(baseFlags);
+        // Go's `viper.GetBool("YES")` branch echoes `<title> [Y/n] y` to stderr
+        // (`console.go:70-72`) instead of blocking the TTY prompt.
+        expect(out.stderrText).toContain("Do you want to create a branch named ");
+        expect(out.stderrText).toContain("? [Y/n] y\n");
+        expect(api.requests[0]?.body).toMatchObject({
+          branch_name: "feat-y",
+          git_branch: "feat-y",
+        });
+      }).pipe(Effect.provide(layer)),
+    );
+  });
+
+  it.live("SUPABASE_YES=1 auto-confirms the git-branch name like --yes", () => {
+    const prev = process.env["SUPABASE_YES"];
+    process.env["SUPABASE_YES"] = "1";
+    const { layer, out, api } = setup({ stdinIsTty: true });
+    return withGitBranch(
+      Effect.gen(function* () {
+        yield* legacyBranchesCreate(baseFlags);
+        expect(out.stderrText).toContain("? [Y/n] y\n");
+        expect(api.requests[0]?.body).toMatchObject({ branch_name: "feat-y" });
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (prev === undefined) delete process.env["SUPABASE_YES"];
+            else process.env["SUPABASE_YES"] = prev;
+          }),
+        ),
+        Effect.provide(layer),
+      ),
+    );
+  });
+
+  it.live("non-TTY with piped `n` declines the git-branch name like Go", () => {
+    const { layer, out, api } = setup({ stdinIsTty: false, stdinInput: "n\n" });
+    return withGitBranch(
+      Effect.gen(function* () {
+        const exit = yield* Effect.exit(legacyBranchesCreate(baseFlags));
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) {
+          expect(JSON.stringify(exit.cause)).toContain("LegacyBranchesCreateCancelledError");
+        }
+        // The piped answer is echoed to stderr like Go's non-TTY PromptText.
+        expect(out.stderrText).toContain("? [Y/n] n\n");
+        expect(api.requests).toHaveLength(0);
+      }).pipe(Effect.provide(layer)),
+    );
+  });
+
+  it.live("non-TTY with empty stdin takes the Yes default and creates the branch", () => {
+    const { layer, out, api } = setup({ stdinIsTty: false });
+    return withGitBranch(
+      Effect.gen(function* () {
+        yield* legacyBranchesCreate(baseFlags);
+        // Label printed, empty scan echoed, true default wins (`console.go:64-102`).
+        expect(out.stderrText).toContain("? [Y/n] \n");
+        expect(api.requests[0]?.body).toMatchObject({ branch_name: "feat-y" });
+      }).pipe(Effect.provide(layer)),
+    );
+  });
+
+  it.live("TTY decline of the git-branch name cancels without creating", () => {
+    const { layer, api } = setup({ stdinIsTty: true, promptConfirmResponses: [false] });
+    return withGitBranch(
+      Effect.gen(function* () {
+        const exit = yield* Effect.exit(legacyBranchesCreate(baseFlags));
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) {
+          expect(JSON.stringify(exit.cause)).toContain("LegacyBranchesCreateCancelledError");
+        }
+        expect(api.requests).toHaveLength(0);
+      }).pipe(Effect.provide(layer)),
+    );
+  });
+
   it.live("emits a success event for --output-format=json", () => {
     const { layer, out } = setup({ format: "json" });
     return Effect.gen(function* () {
@@ -257,6 +380,35 @@ describe("legacy branches create integration", () => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.live("envelope on 402 suggests upgrade with no extra API calls", () => {
+    const { layer, out, analytics, api } = setup({
+      status: 402,
+      response: {
+        message: "Branching is supported only on the Pro plan or above",
+        error: {
+          code: "entitlement_required",
+          feature: "branching_limit",
+          upgrade_url: "https://supabase.com/dashboard/org/env-org/billing",
+        },
+      } as unknown as CreatedBranch,
+    });
+    return Effect.gen(function* () {
+      const exit = yield* Effect.exit(
+        legacyBranchesCreate({ ...baseFlags, name: Option.some("feat-x") }),
+      );
+      expect(Exit.isFailure(exit)).toBe(true);
+      expect(api.requests).toHaveLength(1);
+      expect(api.requests[0]?.url).toContain("/branches");
+      expect(out.stderrText).toContain("/org/env-org/billing");
+      expect(analytics.captured).toEqual([
+        {
+          event: "cli_upgrade_suggested",
+          properties: { feature_key: "branching_limit", org_slug: "env-org" },
+        },
+      ]);
+    }).pipe(Effect.provide(layer));
+  });
+
   it.live("does NOT fire upgrade suggested on 500 (Go skips 5xx)", () => {
     const { layer, analytics } = setup({ status: 500 });
     return Effect.gen(function* () {
@@ -282,4 +434,44 @@ describe("legacy branches create integration", () => {
       expect(cache.cached).toBe(true);
     }).pipe(Effect.provide(layer));
   });
+
+  // Go parity (`apps/cli-go/cmd/projects.go:34-55`, reused by `branches create`
+  // at `apps/cli-go/cmd/branches.go:212`): Go's --size EnumFlag is an 18-value
+  // list that does not include "nano" (or "pico") and rejects any other value
+  // at flag-parse time. TS previously listed "nano" as a valid choice, silently
+  // succeeding where Go errors.
+  it.live("rejects --size nano at flag-parse time, matching Go's 18-value enum", () => {
+    const root = Command.make("supabase").pipe(
+      Command.withGlobalFlags(LEGACY_GLOBAL_FLAGS),
+      Command.withSubcommands([legacyBranchesCreateCommand]),
+    );
+
+    return Effect.gen(function* () {
+      const exit = yield* Effect.exit(
+        Command.runWith(root, { version: "0.0.0-test" })(["create", "--size", "nano"]),
+      );
+      expect(Exit.isFailure(exit)).toBe(true);
+      if (Exit.isFailure(exit)) {
+        expect(rejectsInvalidSizeChoice(Cause.squash(exit.cause))).toBe(true);
+      }
+    }) as Effect.Effect<void>;
+  });
 });
+
+// Distinguishes "the --size flag itself was rejected at parse time" from any
+// other failure (e.g. a missing runtime service in this minimal test setup),
+// so the regression test above can't pass for the wrong reason.
+function rejectsInvalidSizeChoice(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("errors" in error)) return false;
+  const { errors } = error;
+  if (!Array.isArray(errors)) return false;
+  return errors.some(
+    (candidate: unknown) =>
+      typeof candidate === "object" &&
+      candidate !== null &&
+      "_tag" in candidate &&
+      candidate._tag === "InvalidValue" &&
+      "option" in candidate &&
+      candidate.option === "size",
+  );
+}

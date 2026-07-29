@@ -10,6 +10,7 @@ import { LegacyDockerRun } from "./legacy-docker-run.service.ts";
 import { legacyResolveEdgeRuntimeImage } from "./legacy-edge-runtime-image.ts";
 import { LegacyEdgeRuntimeScriptError } from "./legacy-edge-runtime-script.errors.ts";
 import {
+  LEGACY_EDGE_RUNTIME_SCRIPT_ERROR_SENTINEL,
   LegacyEdgeRuntimeScript,
   legacyBuildEdgeRuntimeEntrypoint,
   legacyBuildEdgeRuntimeStartCmd,
@@ -106,7 +107,14 @@ export const legacyEdgeRuntimeScriptLayer = Layer.effect(
               env,
               binds: opts.binds,
               workingDir: Option.none(),
-              securityOpt: [],
+              // SELinux-enforcing hosts (e.g. Fedora + rootless Podman) block the
+              // container from reading CLI-generated files under the `/workspace`
+              // bind, like the pg-delta CA bundle (supabase/cli#5989). Disable label
+              // separation for this helper container instead of relabeling the
+              // user's project files — same as `db test`'s pg_prove run
+              // (`apps/cli-go/internal/db/test/test.go:81`); Bitbucket CI clears it
+              // via `legacyApplyBitbucketDockerFilter`.
+              securityOpt: ["label:disable"],
               extraHosts,
               network,
             })
@@ -128,6 +136,21 @@ export const legacyEdgeRuntimeScriptLayer = Layer.effect(
             return yield* Effect.fail(
               new LegacyEdgeRuntimeScriptError({
                 message: `${opts.errPrefix}: error running container: exit ${result.exitCode}:\n${result.stderr}`,
+              }),
+            );
+          }
+
+          // The pg-delta templates force the worker to exit by throwing, so a
+          // script crash is masked by the "main worker has been destroyed"
+          // suppression above. The sentinel — printed only by the templates'
+          // catch blocks — marks a real failure so the collected stderr (which
+          // holds the real error) reaches the user instead of looking like an
+          // empty diff. Byte-for-byte port of Go's check in
+          // apps/cli-go/internal/utils/edgeruntime.go.
+          if (result.stderr.includes(LEGACY_EDGE_RUNTIME_SCRIPT_ERROR_SENTINEL)) {
+            return yield* Effect.fail(
+              new LegacyEdgeRuntimeScriptError({
+                message: `${opts.errPrefix}: error running script:\n${result.stderr}`,
               }),
             );
           }

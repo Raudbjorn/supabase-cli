@@ -7,7 +7,7 @@ import { mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { brotliCompressSync, constants as zlibConstants } from "node:zlib";
-import { Effect, Layer, Option, Sink, Stdio, Stream } from "effect";
+import { Effect, Exit, Layer, Option, Sink, Stdio, Stream } from "effect";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 import type * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
@@ -25,6 +25,8 @@ import {
   mockOutput,
   mockProjectLinkState,
   mockRuntimeInfo,
+  mockStdin,
+  mockTty,
 } from "../../../../../tests/helpers/mocks.ts";
 import { functionsDeploy } from "./deploy.handler.ts";
 import type { FunctionsDeployFlags } from "./deploy.command.ts";
@@ -315,6 +317,13 @@ function mockDeployApi(
               return jsonResponse(request, 200, makeFunction());
             }
 
+            if (
+              request.method === "DELETE" &&
+              path.startsWith(`/v1/projects/${PROJECT_REF}/functions/`)
+            ) {
+              return jsonResponse(request, 200, {});
+            }
+
             return jsonResponse(request, 404, { error: "not found" });
           }),
         ),
@@ -424,6 +433,8 @@ function setup(
     readonly format?: "text" | "json" | "stream-json";
     readonly childLayer?: Layer.Layer<ChildProcessSpawner.ChildProcessSpawner, never, never>;
     readonly api?: Parameters<typeof mockDeployApi>[0];
+    /** Piped stdin lines consumed by the non-TTY `--prune` confirm read. */
+    readonly stdinInput?: string;
   } = {},
 ) {
   const out = mockOutput({ format: opts.format ?? "text", interactive: false });
@@ -439,6 +450,8 @@ function setup(
     Stdio.layerTest({
       args: Effect.succeed(opts.rawArgs ?? ["functions", "deploy"]),
     }),
+    mockStdin(false, opts.stdinInput),
+    mockTty({ stdinIsTty: false, stdoutIsTty: false }),
     opts.childLayer ?? mockChildProcessSpawner({ exitCode: 0 }).layer,
   );
 
@@ -1549,6 +1562,44 @@ describe("functions deploy", () => {
     }).pipe(Effect.ensuring(cleanupTempDir(tempDir)));
   });
 
+  it.live("bundles when Docker only shares the project directory", () => {
+    const tempDir = makeTempDir();
+    const sharedOutputRoot = join(tempDir, "supabase", ".temp");
+    let outputPath = "";
+    const child = mockChildProcessSpawner({
+      exitCode: 0,
+      onSpawn: (record) => {
+        if (record.command !== "docker" || record.args[0] !== "run") {
+          return;
+        }
+        outputPath = resolveDockerOutputPath(record.args);
+        if (!outputPath.startsWith(`${sharedOutputRoot}${sep}`)) {
+          return;
+        }
+        mkdirSync(dirname(outputPath), { recursive: true });
+        writeFileSync(outputPath, "eszip-test-output");
+      },
+    });
+
+    return Effect.gen(function* () {
+      yield* Effect.promise(() => writeProjectConfig(tempDir));
+      yield* Effect.promise(() => writeLocalFunction(tempDir, "hello-world"));
+
+      const { layer } = setup(tempDir, {
+        rawArgs: ["functions", "deploy", "hello-world", "--use-docker"],
+        childLayer: child.layer,
+      });
+
+      yield* functionsDeploy({
+        ...BASE_FLAGS,
+        functionNames: ["hello-world"],
+        useDocker: true,
+      }).pipe(Effect.provide(layer));
+
+      expect(outputPath.startsWith(`${sharedOutputRoot}${sep}`)).toBe(true);
+    }).pipe(Effect.ensuring(cleanupTempDir(tempDir)));
+  });
+
   it.live("forwards npm auth environment to the Docker bundler", () => {
     const tempDir = makeTempDir();
     const previousRegistry = process.env["NPM_CONFIG_REGISTRY"];
@@ -2171,8 +2222,198 @@ describe("functions deploy", () => {
       if (!(error instanceof ConflictingFunctionDeployFlagsError)) {
         throw new Error(`unexpected error: ${String(error)}`);
       }
-      expect(error.message).toContain("--use-api");
-      expect(error.message).toContain("--use-docker");
+      // Byte-matches cobra's validateExclusiveFlagGroups (flag_groups.go:204):
+      // full group in registration order, changed subset sorted alphabetically.
+      expect(error.message).toBe(
+        "if any flags in the group [use-api use-docker legacy-bundle] are set none of the others can be; [use-api use-docker] were all set",
+      );
     }).pipe(Effect.ensuring(cleanupTempDir(tempDir)));
+  });
+
+  it.live("still rejects the bundler mutex when --use-docker=false is explicit", () => {
+    const tempDir = makeTempDir();
+
+    return Effect.gen(function* () {
+      yield* Effect.promise(() => writeProjectConfig(tempDir));
+      const { layer } = setup(tempDir, {
+        rawArgs: ["functions", "deploy", "--use-api", "--use-docker=false"],
+      });
+
+      const error = yield* functionsDeploy({
+        ...BASE_FLAGS,
+        useApi: true,
+        useDocker: false,
+      }).pipe(Effect.provide(layer), Effect.flip);
+
+      expect(error).toBeInstanceOf(ConflictingFunctionDeployFlagsError);
+      if (!(error instanceof ConflictingFunctionDeployFlagsError)) {
+        throw new Error(`unexpected error: ${String(error)}`);
+      }
+      // cobra tracks pflag.Changed, not the resolved boolean value — an
+      // explicit --use-docker=false still counts as "set" for the mutex.
+      expect(error.message).toBe(
+        "if any flags in the group [use-api use-docker legacy-bundle] are set none of the others can be; [use-api use-docker] were all set",
+      );
+    }).pipe(Effect.ensuring(cleanupTempDir(tempDir)));
+  });
+
+  describe("--jobs validation (Go parity: cmd/functions.go:79-82)", () => {
+    it.live("rejects --jobs > 1 without --use-api", () => {
+      const tempDir = makeTempDir();
+
+      return Effect.gen(function* () {
+        yield* Effect.promise(() => writeProjectConfig(tempDir));
+        const { layer } = setup(tempDir, {
+          rawArgs: ["functions", "deploy", "--jobs", "2"],
+        });
+
+        const error = yield* functionsDeploy({
+          ...BASE_FLAGS,
+          useApi: false,
+          jobs: Option.some(2),
+        }).pipe(Effect.provide(layer), Effect.flip);
+
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toBe("--jobs must be used together with --use-api");
+      }).pipe(Effect.ensuring(cleanupTempDir(tempDir)));
+    });
+
+    it.live("allows --jobs > 1 together with --use-api", () => {
+      const tempDir = makeTempDir();
+
+      return Effect.gen(function* () {
+        yield* Effect.promise(() => writeProjectConfig(tempDir));
+        yield* Effect.promise(() => writeLocalFunction(tempDir, "hello-world"));
+
+        const { out, layer } = setup(tempDir, {
+          rawArgs: ["functions", "deploy", "hello-world", "--use-api", "--jobs", "2"],
+        });
+
+        yield* functionsDeploy({
+          ...BASE_FLAGS,
+          functionNames: ["hello-world"],
+          useApi: true,
+          jobs: Option.some(2),
+        }).pipe(Effect.provide(layer));
+
+        expect(out.stdoutText).toContain(`Deployed Functions on project ${PROJECT_REF}`);
+      }).pipe(Effect.ensuring(cleanupTempDir(tempDir)));
+    });
+  });
+
+  describe("--prune confirmation (Go parity: deploy.go:180-195, console.go:64-102)", () => {
+    // Strip ANSI SGR (bold slugs via `legacyBold`) so byte-assertions are stable
+    // whether or not the test stderr supports color.
+    // eslint-disable-next-line no-control-regex
+    const stripSgr = (text: string) => text.replace(/\x1b\[[0-9;]*m/gu, "");
+    const PRUNE_PROMPT =
+      "Do you want to delete the following Functions from your project?\n \u2022 remote-only\n\n [y/N] ";
+
+    const pruneSetup = (tempDir: string, stdinInput?: string) =>
+      setup(tempDir, {
+        rawArgs: ["functions", "deploy", "--use-api", "--prune"],
+        stdinInput,
+        api: {
+          listFunctions: [
+            makeFunction(),
+            makeFunction({ slug: "remote-only", name: "remote-only" }),
+          ],
+        },
+      });
+
+    it.live("--yes auto-confirms with the Go prompt echo and deletes the orphan", () => {
+      const tempDir = makeTempDir();
+      return Effect.gen(function* () {
+        yield* Effect.promise(() => writeProjectConfig(tempDir));
+        yield* Effect.promise(() => writeLocalFunction(tempDir, "hello-world"));
+        const { out, api, layer } = pruneSetup(tempDir);
+
+        yield* functionsDeploy({
+          ...BASE_FLAGS,
+          functionNames: ["hello-world"],
+          useApi: true,
+          prune: true,
+          yes: true,
+        }).pipe(Effect.provide(layer));
+
+        expect(stripSgr(out.stderrText)).toContain(`${PRUNE_PROMPT}y\n`);
+        expect(out.stderrText).toContain("Deleting Function: remote-only\n");
+        expect(
+          api.requests.some(
+            (request) =>
+              request.method === "DELETE" &&
+              request.path === `/v1/projects/${PROJECT_REF}/functions/remote-only`,
+          ),
+        ).toBe(true);
+      }).pipe(Effect.ensuring(cleanupTempDir(tempDir)));
+    });
+
+    it.live("piped `n` declines the prune and cancels like Go", () => {
+      const tempDir = makeTempDir();
+      return Effect.gen(function* () {
+        yield* Effect.promise(() => writeProjectConfig(tempDir));
+        yield* Effect.promise(() => writeLocalFunction(tempDir, "hello-world"));
+        const { out, api, layer } = pruneSetup(tempDir, "n\n");
+
+        const exit = yield* Effect.exit(
+          functionsDeploy({
+            ...BASE_FLAGS,
+            functionNames: ["hello-world"],
+            useApi: true,
+            prune: true,
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) {
+          expect(JSON.stringify(exit.cause)).toContain("FunctionDeployCancelledError");
+        }
+        // The piped answer is echoed after the label like Go's non-TTY PromptText.
+        expect(stripSgr(out.stderrText)).toContain(`${PRUNE_PROMPT}n\n`);
+        expect(api.requests.some((request) => request.method === "DELETE")).toBe(false);
+      }).pipe(Effect.ensuring(cleanupTempDir(tempDir)));
+    });
+
+    it.live("piped `y` confirms the prune like Go", () => {
+      const tempDir = makeTempDir();
+      return Effect.gen(function* () {
+        yield* Effect.promise(() => writeProjectConfig(tempDir));
+        yield* Effect.promise(() => writeLocalFunction(tempDir, "hello-world"));
+        const { out, api, layer } = pruneSetup(tempDir, "y\n");
+
+        yield* functionsDeploy({
+          ...BASE_FLAGS,
+          functionNames: ["hello-world"],
+          useApi: true,
+          prune: true,
+        }).pipe(Effect.provide(layer));
+
+        expect(stripSgr(out.stderrText)).toContain(`${PRUNE_PROMPT}y\n`);
+        expect(api.requests.some((request) => request.method === "DELETE")).toBe(true);
+      }).pipe(Effect.ensuring(cleanupTempDir(tempDir)));
+    });
+
+    it.live("empty stdin takes the No default and cancels", () => {
+      const tempDir = makeTempDir();
+      return Effect.gen(function* () {
+        yield* Effect.promise(() => writeProjectConfig(tempDir));
+        yield* Effect.promise(() => writeLocalFunction(tempDir, "hello-world"));
+        const { out, api, layer } = pruneSetup(tempDir);
+
+        const exit = yield* Effect.exit(
+          functionsDeploy({
+            ...BASE_FLAGS,
+            functionNames: ["hello-world"],
+            useApi: true,
+            prune: true,
+          }).pipe(Effect.provide(layer)),
+        );
+
+        expect(Exit.isFailure(exit)).toBe(true);
+        // Empty scan echoed, false default wins (`console.go:74-82`).
+        expect(stripSgr(out.stderrText)).toContain(`${PRUNE_PROMPT}\n`);
+        expect(api.requests.some((request) => request.method === "DELETE")).toBe(false);
+      }).pipe(Effect.ensuring(cleanupTempDir(tempDir)));
+    });
   });
 });

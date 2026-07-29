@@ -1,7 +1,9 @@
 import { Argument, Command, Flag } from "effect/unstable/cli";
 import type * as CliCommand from "effect/unstable/cli/Command";
 
+import { Layer } from "effect";
 import { withJsonErrorHandling } from "../../../../shared/output/json-error-handling.ts";
+import { stdinLayer } from "../../../../shared/runtime/stdin.layer.ts";
 import { legacyManagementApiRuntimeLayer } from "../../../shared/legacy-management-api-runtime.layer.ts";
 import { withLegacyCommandInstrumentation } from "../../../telemetry/legacy-command-instrumentation.ts";
 import { legacyBranchesCreate } from "./create.handler.ts";
@@ -44,7 +46,6 @@ const BRANCH_SIZES = [
   "48xlarge_optimized_memory",
   "4xlarge",
   "8xlarge",
-  "nano",
   "small",
   "xlarge",
 ] as const;
@@ -96,9 +97,13 @@ export const legacyBranchesCreateCommand = Command.make("create", config).pipe(
   Command.withShortDescription("Create a preview branch"),
   Command.withHandler((flags) =>
     legacyBranchesCreate(flags).pipe(
-      withLegacyCommandInstrumentation({ flags, safeFlags: ["project-ref"] }),
+      withLegacyCommandInstrumentation({ flags, safeFlags: ["project-ref"], config }),
       withJsonErrorHandling,
     ),
   ),
-  Command.provide(legacyManagementApiRuntimeLayer(["branches", "create"])),
+  // `stdinLayer`: the confirmation prompt reads piped stdin via `legacyPromptYesNo`
+  // (Go's `Console.ReadLine`, `console.go:38-61`) on a non-TTY stdin.
+  Command.provide(
+    Layer.mergeAll(legacyManagementApiRuntimeLayer(["branches", "create"]), stdinLayer),
+  ),
 );

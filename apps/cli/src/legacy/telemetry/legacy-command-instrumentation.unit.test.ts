@@ -1,7 +1,14 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Layer, Option, Stdio } from "effect";
+import { Flag } from "effect/unstable/cli";
 import { commandRuntimeLayer } from "../../shared/runtime/command-runtime.layer.ts";
-import { LegacyOutputFlag } from "../../shared/legacy/global-flags.ts";
+import {
+  LegacyAgentFlag,
+  LegacyDebugFlag,
+  LegacyDnsResolverFlag,
+  LegacyOutputFlag,
+  LegacyWorkdirFlag,
+} from "../../shared/legacy/global-flags.ts";
 import { CurrentAnalyticsContext } from "../../shared/telemetry/analytics-context.ts";
 import { Analytics } from "../../shared/telemetry/analytics.service.ts";
 import { ProcessControl } from "../../shared/runtime/process-control.service.ts";
@@ -439,6 +446,156 @@ describe("withLegacyCommandInstrumentation", () => {
     );
   });
 
+  it.live("passes Flag.choice values through verbatim (Go parity: isEnumFlag)", () => {
+    const analytics = mockContextualAnalytics();
+    const config = {
+      lang: Flag.choice("lang", ["typescript", "go", "python"] as const),
+    };
+
+    return Effect.void.pipe(
+      withLegacyCommandInstrumentation({
+        flags: { lang: "python" },
+        config,
+      }),
+      Effect.provide(analytics.layer),
+      Effect.provide(mockProcessControl().layer),
+      Effect.provide(mockOutput({ format: "text" }).layer),
+      Effect.provide(
+        Stdio.layerTest({ args: Effect.succeed(["gen", "types", "--lang", "python"]) }),
+      ),
+      Effect.provide(commandRuntimeLayer(["gen", "types"])),
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const event = analytics.captured[0];
+          expect(event?.properties.flags).toEqual({ lang: "python" });
+        }),
+      ),
+    );
+  });
+
+  it.live(
+    "passes a Flag.withDefault-wrapped Flag.choice value through verbatim (Map(Optional(Single)))",
+    () => {
+      const analytics = mockContextualAnalytics();
+      // Mirrors gen signing-key's real `algorithm` flag construction exactly —
+      // `.pipe(Flag.withDefault(...))` composes as `Map(Optional(Single))`.
+      const config = {
+        algorithm: Flag.choice("algorithm", ["RS256", "ES256"] as const).pipe(
+          Flag.withDefault("ES256" as const),
+        ),
+      };
+
+      return Effect.void.pipe(
+        withLegacyCommandInstrumentation({
+          flags: { algorithm: "RS256" },
+          config,
+        }),
+        Effect.provide(analytics.layer),
+        Effect.provide(mockProcessControl().layer),
+        Effect.provide(mockOutput({ format: "text" }).layer),
+        Effect.provide(
+          Stdio.layerTest({ args: Effect.succeed(["gen", "signing-key", "--algorithm", "RS256"]) }),
+        ),
+        Effect.provide(commandRuntimeLayer(["gen", "signing-key"])),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            const event = analytics.captured[0];
+            expect(event?.properties.flags).toEqual({ algorithm: "RS256" });
+          }),
+        ),
+      );
+    },
+  );
+
+  it.live(
+    "resolves a Flag.choice's shorthand alias to its canonical name (Go parity: pflag.Visit)",
+    () => {
+      const analytics = mockContextualAnalytics();
+      // Mirrors sso add's real `type` flag construction exactly — `-t` is a
+      // registered alias (Flag.withAlias("t")) that must be mapped to the
+      // canonical "type" name for extractChangedFlagNames to record it at all.
+      const config = {
+        type: Flag.choice("type", ["saml"] as const).pipe(Flag.withAlias("t")),
+      };
+
+      return Effect.void.pipe(
+        withLegacyCommandInstrumentation({
+          flags: { type: "saml" },
+          config,
+          aliases: { t: "type" },
+        }),
+        Effect.provide(analytics.layer),
+        Effect.provide(mockProcessControl().layer),
+        Effect.provide(mockOutput({ format: "text" }).layer),
+        Effect.provide(Stdio.layerTest({ args: Effect.succeed(["sso", "add", "-t", "saml"]) })),
+        Effect.provide(commandRuntimeLayer(["sso", "add"])),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            const event = analytics.captured[0];
+            expect(event?.properties.flags).toEqual({ type: "saml" });
+          }),
+        ),
+      );
+    },
+  );
+
+  it.live("passes an Optional-wrapped Flag.choice value through verbatim", () => {
+    const analytics = mockContextualAnalytics();
+    const config = {
+      algorithm: Flag.choice("algorithm", ["RS256", "ES256"] as const).pipe(Flag.optional),
+    };
+
+    return Effect.void.pipe(
+      withLegacyCommandInstrumentation({
+        flags: { algorithm: Option.some("ES256") },
+        config,
+      }),
+      Effect.provide(analytics.layer),
+      Effect.provide(mockProcessControl().layer),
+      Effect.provide(mockOutput({ format: "text" }).layer),
+      Effect.provide(
+        Stdio.layerTest({ args: Effect.succeed(["gen", "signing-key", "--algorithm", "ES256"]) }),
+      ),
+      Effect.provide(commandRuntimeLayer(["gen", "signing-key"])),
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const event = analytics.captured[0];
+          expect(event?.properties.flags).toEqual({ algorithm: "ES256" });
+        }),
+      ),
+    );
+  });
+
+  it.live("still redacts non-choice string flags even when config is provided", () => {
+    const analytics = mockContextualAnalytics();
+    const config = {
+      lang: Flag.choice("lang", ["typescript", "go"] as const),
+      schema: Flag.string("schema"),
+    };
+
+    return Effect.void.pipe(
+      withLegacyCommandInstrumentation({
+        flags: { lang: "go", schema: "public" },
+        config,
+      }),
+      Effect.provide(analytics.layer),
+      Effect.provide(mockProcessControl().layer),
+      Effect.provide(mockOutput({ format: "text" }).layer),
+      Effect.provide(
+        Stdio.layerTest({
+          args: Effect.succeed(["gen", "types", "--lang", "go", "--schema", "public"]),
+        }),
+      ),
+      Effect.provide(commandRuntimeLayer(["gen", "types"])),
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const event = analytics.captured[0];
+          expect(event?.properties.flags).toEqual({ lang: "go", schema: "<redacted>" });
+        }),
+      ),
+    );
+  });
+
   it.live("omits the `flags` property when no flags changed", () => {
     const analytics = mockContextualAnalytics();
 
@@ -822,6 +979,211 @@ describe("withLegacyCommandInstrumentation", () => {
     );
   });
 
+  // Global/persistent flag parity (CLI-1896): Go's changedFlags() walks
+  // cmd.Parent()'s PersistentFlags() in addition to the leaf's own flags
+  // (cmd/root_analytics.go:53-76), so a global flag like --debug resolves to
+  // its real value even though no command declares it locally. The wrapper
+  // reads shared/legacy/global-flags.ts itself rather than relying on the
+  // per-command `flags` option to carry global flag values.
+
+  it.live("records a changed global boolean flag's real value (e.g. --debug)", () => {
+    // Go reports `flags: {debug: true}` for `supabase --debug telemetry disable`
+    // (isBooleanFlag is always safe, regardless of markFlagTelemetrySafe) — the
+    // TS port previously had no way to resolve `debug` at all and fell back to
+    // "<redacted>" for every global flag, even booleans.
+    const analytics = mockContextualAnalytics();
+
+    return Effect.void.pipe(
+      withLegacyCommandInstrumentation({ flags: {} }),
+      Effect.provide(analytics.layer),
+      Effect.provide(mockProcessControl().layer),
+      Effect.provide(mockOutput({ format: "text" }).layer),
+      Effect.provide(Stdio.layerTest({ args: Effect.succeed(["backups", "list", "--debug"]) })),
+      Effect.provide(commandRuntimeLayer(["backups", "list"])),
+      Effect.provide(Layer.succeed(LegacyDebugFlag, true)),
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const event = analytics.captured[0];
+          expect(event?.properties.flags).toEqual({ debug: true });
+        }),
+      ),
+    );
+  });
+
+  it.live("merges a changed global flag alongside the command's own local flags", () => {
+    const analytics = mockContextualAnalytics();
+
+    return Effect.void.pipe(
+      withLegacyCommandInstrumentation({
+        flags: { projectRef: Option.some("abcdefghijklmnopqrst") },
+      }),
+      Effect.provide(analytics.layer),
+      Effect.provide(mockProcessControl().layer),
+      Effect.provide(mockOutput({ format: "text" }).layer),
+      Effect.provide(
+        Stdio.layerTest({
+          args: Effect.succeed([
+            "secrets",
+            "list",
+            "--project-ref",
+            "abcdefghijklmnopqrst",
+            "--debug",
+          ]),
+        }),
+      ),
+      Effect.provide(commandRuntimeLayer(["secrets", "list"])),
+      Effect.provide(Layer.succeed(LegacyDebugFlag, true)),
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const event = analytics.captured[0];
+          expect(event?.properties.flags).toEqual({
+            "project-ref": "<redacted>",
+            debug: true,
+          });
+        }),
+      ),
+    );
+  });
+
+  it.live(
+    "still redacts a changed global string flag like --workdir (Go never marks it telemetry-safe)",
+    () => {
+      const analytics = mockContextualAnalytics();
+
+      return Effect.void.pipe(
+        withLegacyCommandInstrumentation({ flags: {} }),
+        Effect.provide(analytics.layer),
+        Effect.provide(mockProcessControl().layer),
+        Effect.provide(mockOutput({ format: "text" }).layer),
+        Effect.provide(
+          Stdio.layerTest({
+            args: Effect.succeed(["backups", "list", "--workdir", "/tmp/project"]),
+          }),
+        ),
+        Effect.provide(commandRuntimeLayer(["backups", "list"])),
+        Effect.provide(Layer.succeed(LegacyWorkdirFlag, Option.some("/tmp/project"))),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            const event = analytics.captured[0];
+            expect(event?.properties.flags).toEqual({ workdir: "<redacted>" });
+          }),
+        ),
+      );
+    },
+  );
+
+  it.live(
+    "passes a changed global choice flag like --dns-resolver through verbatim (Go parity: isEnumFlag, CLI-1904)",
+    () => {
+      const analytics = mockContextualAnalytics();
+
+      return Effect.void.pipe(
+        withLegacyCommandInstrumentation({ flags: {} }),
+        Effect.provide(analytics.layer),
+        Effect.provide(mockProcessControl().layer),
+        Effect.provide(mockOutput({ format: "text" }).layer),
+        Effect.provide(
+          Stdio.layerTest({
+            args: Effect.succeed(["backups", "list", "--dns-resolver", "https"]),
+          }),
+        ),
+        Effect.provide(commandRuntimeLayer(["backups", "list"])),
+        Effect.provide(Layer.succeed(LegacyDnsResolverFlag, "https" as const)),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            const event = analytics.captured[0];
+            expect(event?.properties.flags).toEqual({ "dns-resolver": "https" });
+          }),
+        ),
+      );
+    },
+  );
+
+  it.live(
+    "passes a changed global choice flag like --agent through verbatim (Go parity: isEnumFlag, CLI-1904)",
+    () => {
+      const analytics = mockContextualAnalytics();
+
+      return Effect.void.pipe(
+        withLegacyCommandInstrumentation({ flags: {} }),
+        Effect.provide(analytics.layer),
+        Effect.provide(mockProcessControl().layer),
+        Effect.provide(mockOutput({ format: "text" }).layer),
+        Effect.provide(
+          Stdio.layerTest({
+            args: Effect.succeed(["backups", "list", "--agent", "yes"]),
+          }),
+        ),
+        Effect.provide(commandRuntimeLayer(["backups", "list"])),
+        Effect.provide(Layer.succeed(LegacyAgentFlag, "yes" as const)),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            const event = analytics.captured[0];
+            expect(event?.properties.flags).toEqual({ agent: "yes" });
+          }),
+        ),
+      );
+    },
+  );
+
+  it.live(
+    "still redacts a global choice flag shadowed by a command's own differently-typed local flag (db diff's local string --output, Go parity)",
+    () => {
+      // `db diff` declares its own local `output: Flag.string("output")` (a
+      // file path, `cmd/db.go:622`) rather than a `Flag.choice` — mirroring
+      // Go, where that command's own non-enum flag object governs
+      // `isEnumFlag`, not root's persistent `*utils.EnumFlag`. Simulate that
+      // shape here: `output` is declared in the handler's own `flags` record
+      // (so `isFromHandler` is true) but absent from `config`, so it must NOT
+      // inherit safety from `GLOBAL_CHOICE_FLAG_NAMES` just because the CLI
+      // name collides with the global `--output` choice flag.
+      const analytics = mockContextualAnalytics();
+
+      return Effect.void.pipe(
+        withLegacyCommandInstrumentation({ flags: { output: "diff.sql" } }),
+        Effect.provide(analytics.layer),
+        Effect.provide(mockProcessControl().layer),
+        Effect.provide(mockOutput({ format: "text" }).layer),
+        Effect.provide(
+          Stdio.layerTest({
+            args: Effect.succeed(["db", "diff", "--output", "diff.sql"]),
+          }),
+        ),
+        Effect.provide(commandRuntimeLayer(["db", "diff"])),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            const event = analytics.captured[0];
+            expect(event?.properties.flags).toEqual({ output: "<redacted>" });
+          }),
+        ),
+      );
+    },
+  );
+
+  it.live("falls back to redacted when a changed global flag's service isn't wired", () => {
+    // Defensive case: `Effect.serviceOption` must never throw/defect when a
+    // narrow harness (or, hypothetically, an incompletely-wired real command)
+    // doesn't provide a global flag's context — it degrades to the prior
+    // REDACTED_VALUE behavior instead of crashing.
+    const analytics = mockContextualAnalytics();
+
+    return Effect.void.pipe(
+      withLegacyCommandInstrumentation({ flags: {} }),
+      Effect.provide(analytics.layer),
+      Effect.provide(mockProcessControl().layer),
+      Effect.provide(mockOutput({ format: "text" }).layer),
+      Effect.provide(Stdio.layerTest({ args: Effect.succeed(["backups", "list", "--debug"]) })),
+      Effect.provide(commandRuntimeLayer(["backups", "list"])),
+      // Note: no LegacyDebugFlag layer provided.
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const event = analytics.captured[0];
+          expect(event?.properties.flags).toEqual({ debug: "<redacted>" });
+        }),
+      ),
+    );
+  });
+
   it.live("stops recording flags at the -- end-of-options sentinel", () => {
     // `test db -- --linked`: pflag stops parsing flags at `--`, so `--linked`
     // is a positional arg, not a changed flag. changedFlags() never sees it.
@@ -848,4 +1210,71 @@ describe("withLegacyCommandInstrumentation", () => {
       ),
     );
   });
+
+  // CLI-1896 review follow-up (Codex): a global flag's SHORTHAND must resolve
+  // through the same fallback its long form already does.
+
+  it.live("resolves a global flag's shorthand (-o) through the global fallback", () => {
+    // `-o json` must resolve to the canonical `output` flag the same way
+    // `--output json` already does: Go's `pflag.Visit` reports the canonical
+    // `flag.Name` for either form (`cmd/root_analytics.go:53-76`), and `-o` is
+    // `--output`'s only registered persistent shorthand (`cmd/root.go:330`).
+    const analytics = mockContextualAnalytics();
+
+    return Effect.void.pipe(
+      withLegacyCommandInstrumentation({ flags: {} }),
+      Effect.provide(analytics.layer),
+      Effect.provide(mockProcessControl().layer),
+      Effect.provide(mockOutput({ format: "text" }).layer),
+      Effect.provide(Stdio.layerTest({ args: Effect.succeed(["backups", "list", "-o", "json"]) })),
+      Effect.provide(commandRuntimeLayer(["backups", "list"])),
+      Effect.provide(Layer.succeed(LegacyOutputFlag, Option.some("json" as const))),
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const event = analytics.captured[0];
+          // `output` is a global choice flag — passed through verbatim
+          // (Go parity: isEnumFlag, CLI-1904), and it must be PRESENT, not
+          // silently dropped.
+          expect(event?.properties.flags).toEqual({ output: "json" });
+        }),
+      ),
+    );
+  });
+
+  it.live(
+    "does not fabricate a global flag from a local flag's value token (secrets set --env-file --debug)",
+    () => {
+      // `--env-file` is a value-consuming local string flag. In bare
+      // space-separated form, pflag consumes the very next token as its
+      // VALUE regardless of its shape, so Go's changedFlags() never marks
+      // `debug` as changed for this invocation — the whole token is
+      // `env-file`'s value. Without `env-file` registered in
+      // VALUE_CONSUMING_LONG_FLAGS, extractChangedFlagNames would wrongly
+      // treat the trailing `--debug` as a separate flag, and CLI-1896's
+      // global-flag fallback would then fabricate a `flags.debug` value Go
+      // never records.
+      const analytics = mockContextualAnalytics();
+
+      return Effect.void.pipe(
+        withLegacyCommandInstrumentation({
+          flags: { envFile: Option.some("--debug") },
+        }),
+        Effect.provide(analytics.layer),
+        Effect.provide(mockProcessControl().layer),
+        Effect.provide(mockOutput({ format: "text" }).layer),
+        Effect.provide(
+          Stdio.layerTest({
+            args: Effect.succeed(["secrets", "set", "--env-file", "--debug"]),
+          }),
+        ),
+        Effect.provide(commandRuntimeLayer(["secrets", "set"])),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            const event = analytics.captured[0];
+            expect(event?.properties.flags).toEqual({ "env-file": "<redacted>" });
+          }),
+        ),
+      );
+    },
+  );
 });

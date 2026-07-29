@@ -1,7 +1,6 @@
 import { brotliCompressSync, constants as zlibConstants } from "node:zlib";
-import { chmod, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { tmpdir } from "node:os";
 import { URL } from "node:url";
 import { FunctionResponse, operationDefinitions, type ApiClient } from "@supabase/api/effect";
 import {
@@ -12,11 +11,22 @@ import {
 import { Duration, Effect, Option, Schema, Stream } from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import * as HttpClientError from "effect/unstable/http/HttpClientError";
+import { legacyPromptYesNo } from "../legacy/legacy-prompt-yes-no.ts";
+import { CONTEXT_CANCELED_MESSAGE } from "../output/errors.ts";
 import { Output } from "../output/output.service.ts";
 import { spawnContainerCli } from "../../legacy/shared/legacy-container-cli.ts";
+import { legacyBold } from "../../legacy/shared/legacy-colors.ts";
 import { legacyGetRegistryImageUrl } from "../../legacy/shared/legacy-docker-registry.ts";
 import { findGitRootPath } from "../git/git-root.ts";
-import { invalidFunctionSlugDetail, validateFunctionSlugMessage } from "./functions.shared.ts";
+import {
+  cobraMutuallyExclusiveErrorMessage,
+  hasExplicitLongFlag,
+} from "../cli/cobra-flag-groups.ts";
+import {
+  FUNCTIONS_BUNDLER_MUTEX_GROUP,
+  invalidFunctionSlugDetail,
+  validateFunctionSlugMessage,
+} from "./functions.shared.ts";
 import {
   ConflictingFunctionDeployFlagsError,
   FunctionDeployCancelledError,
@@ -54,6 +64,7 @@ interface DeployFunctionsDependencies<ResolveError, ResolveRequirements> {
   readonly projectRoot: string;
   readonly supabaseDir: string;
   readonly dashboardUrl: string;
+  readonly goViperCompat: boolean;
   readonly yes?: boolean;
   readonly rawArgs: ReadonlyArray<string>;
   readonly edgeRuntimeVersion: string;
@@ -192,30 +203,6 @@ function validateDeploySlug(slug: string): Effect.Effect<void, InvalidFunctionDe
   return Effect.fail(new InvalidFunctionDeploySlugError({ message: invalidFunctionSlugDetail }));
 }
 
-function hasExplicitLongFlag(
-  rawArgs: ReadonlyArray<string>,
-  commandPath: ReadonlyArray<string>,
-  flagName: string,
-): boolean {
-  const commandIndex = rawArgs.findIndex((_, index) =>
-    commandPath.every((segment, offset) => rawArgs[index + offset] === segment),
-  );
-  if (commandIndex === -1) {
-    return rawArgs.some((token) => token === `--${flagName}` || token.startsWith(`--${flagName}=`));
-  }
-
-  for (let index = commandIndex + commandPath.length; index < rawArgs.length; index += 1) {
-    const token = rawArgs[index];
-    if (token === undefined || token === "--") {
-      return false;
-    }
-    if (token === `--${flagName}` || token.startsWith(`--${flagName}=`)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 function explicitBooleanFlag(
   rawArgs: ReadonlyArray<string>,
   commandPath: ReadonlyArray<string>,
@@ -264,6 +251,16 @@ export function localDockerId(name: string, projectId: string) {
 
 const dockerCliProjectLabel = "com.supabase.cli.project";
 const dockerComposeProjectLabel = "com.docker.compose.project";
+/**
+ * Must stay in sync with `LEGACY_CLI_WORKDIR_LABEL`
+ * (`legacy/shared/legacy-docker-ids.ts:95`) — same string literal, kept as a
+ * separate copy here rather than imported to respect the `next`/`legacy`
+ * isolation boundary (this file has no Go equivalent for the other two
+ * labels either). Read back by `legacyCleanupStartSecrets` so a later
+ * `stop`/`legacyRollbackStart` can reclaim this container's staged-secret
+ * directory using its OWN workdir rather than the caller's cwd.
+ */
+export const dockerWorkdirLabel = "com.supabase.cli.workdir";
 const dockerNpmEnvNames = ["NPM_CONFIG_REGISTRY", "NPM_AUTH_TOKEN"] as const;
 
 export function dockerProjectLabels(projectId: string) {
@@ -1206,7 +1203,7 @@ function shouldUseDenoJsonDiscovery(entrypoint: string, importMap: string) {
   return isDenoConfigFile(importMap) && dirname(importMap) === dirname(entrypoint);
 }
 
-function isUserDefinedDockerNetwork(networkMode: string) {
+export function isUserDefinedDockerNetwork(networkMode: string) {
   return (
     networkMode.length > 0 &&
     networkMode !== "default" &&
@@ -1349,8 +1346,10 @@ const bundleFunctionWithDocker = Effect.fnUntraced(function* (
   const output = yield* Output;
   yield* output.raw(`Bundling Function: ${config.slug}\n`, "stderr");
 
+  const outputRoot = resolve(functionsDir, "..", ".temp");
+  yield* Effect.tryPromise(() => mkdir(outputRoot, { recursive: true }));
   const outputDir = yield* Effect.tryPromise(() =>
-    mkdtemp(join(tmpdir(), `.supabase-output-${config.slug}-`)),
+    mkdtemp(join(outputRoot, `.supabase-output-${config.slug}-`)),
   );
   try {
     yield* Effect.tryPromise(() => chmod(outputDir, 0o777));
@@ -1770,8 +1769,9 @@ export const discoverFunctionSlugs = Effect.fnUntraced(function* (
     readdir(functionsDir, { withFileTypes: true }),
   ).pipe(
     Effect.catch((error) => {
-      const cause =
-        typeof error === "object" && error !== null && "error" in error ? error.error : error;
+      // `Effect.tryPromise`'s default failure is a `Cause.UnknownError`, which stores the
+      // original rejection on `.cause` (inherited from `Error`) — NOT `.error`.
+      const cause = error.cause;
       return cause instanceof Error && "code" in cause && cause.code === "ENOENT"
         ? Effect.succeed(undefined)
         : Effect.fail(error);
@@ -2081,13 +2081,20 @@ const pruneFunctions = Effect.fnUntraced(function* (
     return;
   }
 
-  const prompt = [
+  // Go's `confirmPruneAll` + `fmt.Sprintln` (`deploy.go:189,206-212`): header, one
+  // ` • <bold slug>` line per function, and a trailing blank line before the
+  // `[y/N]` choices. Routed through `legacyPromptYesNo` (Go `PromptYesNo(msg,
+  // false)`, `console.go:64-82`) so `--yes`/`SUPABASE_YES` auto-confirms with the
+  // stderr echo and a non-TTY stdin honors a piped `y`/`n` answer (CLI-1974).
+  const prompt = `${[
     "Do you want to delete the following Functions from your project?",
-    ...toDelete.map((slug) => ` - ${slug}`),
-  ].join("\n");
-  const confirmed = yes || (yield* output.promptConfirm(`${prompt}\n`, { defaultValue: false }));
+    ...toDelete.map((slug) => ` • ${legacyBold(slug)}`),
+  ].join("\n")}\n\n`;
+  const confirmed = yield* legacyPromptYesNo(output, yes, prompt, false);
   if (!confirmed) {
-    return yield* Effect.fail(new FunctionDeployCancelledError({ message: "context canceled" }));
+    return yield* Effect.fail(
+      new FunctionDeployCancelledError({ message: CONTEXT_CANCELED_MESSAGE }),
+    );
   }
 
   for (const slug of toDelete) {
@@ -2103,6 +2110,10 @@ export function deployFunctions<ResolveError, ResolveRequirements>(
   return Effect.gen(function* () {
     const output = yield* Output;
     const commandPath = ["functions", "deploy"] as const;
+    // Presence-based (true for `--use-api=false`, not just bare `--use-api`) — mirrors
+    // cobra's `Changed()`-driven `MarkFlagsMutuallyExclusive`, so it's only used for the
+    // mutual-exclusivity check below. Behavior branches (bundler routing, --jobs guard)
+    // key off the resolved `flags.useApi` value instead, matching Go's own `if useApi`.
     const explicitUseApi = hasExplicitLongFlag(dependencies.rawArgs, commandPath, "use-api");
     const explicitUseDocker = hasExplicitLongFlag(dependencies.rawArgs, commandPath, "use-docker");
     const explicitLegacyBundle = hasExplicitLongFlag(
@@ -2111,25 +2122,32 @@ export function deployFunctions<ResolveError, ResolveRequirements>(
       "legacy-bundle",
     );
 
-    const selectedModes = [
-      explicitUseApi ? "--use-api" : undefined,
-      explicitUseDocker ? "--use-docker" : undefined,
-      explicitLegacyBundle ? "--legacy-bundle" : undefined,
-    ].filter((flag) => flag !== undefined);
+    const changedModes = [
+      explicitUseApi ? "use-api" : undefined,
+      explicitUseDocker ? "use-docker" : undefined,
+      explicitLegacyBundle ? "legacy-bundle" : undefined,
+    ].filter((flag): flag is string => flag !== undefined);
 
-    if (selectedModes.length > 1) {
+    if (changedModes.length > 1) {
       return yield* Effect.fail(
         new ConflictingFunctionDeployFlagsError({
-          message: `flags ${selectedModes.join(", ")} are mutually exclusive`,
+          message: cobraMutuallyExclusiveErrorMessage(FUNCTIONS_BUNDLER_MUTEX_GROUP, changedModes),
         }),
       );
     }
 
-    const useLocalBundler = !explicitUseApi && (flags.useDocker || flags.legacyBundle);
+    // Go parity (`cmd/functions.go:79-80`): `if useApi { useDocker = false }` mutates the
+    // resolved boolean, not a presence flag — `--use-api=false` alone must NOT force the
+    // API path, it should fall through to whatever `--use-docker`/`--legacy-bundle`
+    // already resolved to.
+    const useLocalBundler = !flags.useApi && (flags.useDocker || flags.legacyBundle);
     const configuredJobs = Option.getOrElse(flags.jobs, () => 1);
     const jobs = configuredJobs === 0 ? 1 : configuredJobs;
-    if (useLocalBundler && jobs > 1) {
-      return yield* Effect.fail(new Error("--jobs cannot be used with local bundling"));
+    // Go parity (`cmd/functions.go:79-82`): the guard is `if useApi { ... } else if
+    // maxJobs > 1 { error }` — keyed on the resolved `--use-api` value alone, not on
+    // whether local bundling (Docker/legacy-bundle) is in play.
+    if (!flags.useApi && jobs > 1) {
+      return yield* Effect.fail(new Error("--jobs must be used together with --use-api"));
     }
 
     const preResolvedProjectRef =
@@ -2155,7 +2173,10 @@ export function deployFunctions<ResolveError, ResolveRequirements>(
     // `@supabase/config` merges the matching `[remotes.*]` block over the base
     // config (Go's `loadFromFile` with `Config.ProjectId` set), so the resolved
     // config already reflects any remote function/edge_runtime overrides.
-    const loadedConfig = yield* loadProjectConfig(dependencies.projectRoot, { projectRef });
+    const loadedConfig = yield* loadProjectConfig(dependencies.projectRoot, {
+      projectRef,
+      goViperCompat: dependencies.goViperCompat,
+    });
     const deployConfig = loadedConfig?.config;
     const edgeRuntimeVersion = yield* resolveEdgeRuntimeVersion(
       deployConfig?.edge_runtime.deno_version,
