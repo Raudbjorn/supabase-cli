@@ -28,7 +28,13 @@ class LegacyContainerRuntimeNotFoundError extends Data.TaggedError(
   readonly message: string;
 }> {}
 
-const RUNTIME_NOT_FOUND_MESSAGE =
+/**
+ * Exported so `legacy-docker-suggest.ts`'s daemon-unreachable matcher can test
+ * against this literal directly instead of a hardcoded copy of the substring —
+ * keeping the producer and the classifier from drifting apart if this ever gets
+ * reworded.
+ */
+export const legacyContainerRuntimeNotFoundMessage =
   "docker: command not found (podman also not found) — install Docker Desktop or Podman and ensure it is on PATH";
 
 /**
@@ -42,6 +48,26 @@ export function legacyDescribeContainerCliFailure(cause: unknown): string {
   if (cause instanceof LegacyContainerRuntimeNotFoundError) return cause.message;
   if (cause instanceof Error) return cause.message;
   return String(cause);
+}
+
+/**
+ * Docker's/Podman's "container doesn't exist" stderr shapes for `container inspect` — Docker's
+ * "No such container"/"No such object" (either casing depending on daemon version/CLI path) or
+ * Podman's own differently worded "no container with name or ID ... found: no such container" —
+ * the subprocess equivalent of Go's `errdefs.IsNotFound` for a CLI-shelled-out (rather than
+ * Engine-API) caller. Case-insensitive and covers all three shapes so a lowercase Podman message
+ * is tolerated exactly like an uppercase Docker one — the same distinction
+ * `legacy-docker-image-resolve.ts`'s `isImageNotFoundMessage` draws for `image inspect`.
+ * Hoisted here (rather than left as separate per-caller copies) so every container-not-found
+ * check across the container-lifecycle/start/health-check domain shares one predicate instead of
+ * re-deriving the same match with different Podman coverage.
+ */
+export function legacyIsContainerNotFoundMessage(message: string): boolean {
+  return (
+    /no such container/iu.test(message) ||
+    /no such object/iu.test(message) ||
+    /no container with name or id/iu.test(message)
+  );
 }
 
 /** Which of the two supported container CLIs actually answered a spawn. */
@@ -64,7 +90,9 @@ export const legacySpawnContainerCliWithRuntime = (
         Effect.map((handle) => ({ handle, runtime: podmanRuntime })),
         Effect.catch(() =>
           Effect.fail(
-            new LegacyContainerRuntimeNotFoundError({ message: RUNTIME_NOT_FOUND_MESSAGE }),
+            new LegacyContainerRuntimeNotFoundError({
+              message: legacyContainerRuntimeNotFoundMessage,
+            }),
           ),
         ),
       ),
@@ -100,21 +128,19 @@ export const containerCliExitCode = (
   options?: ChildProcess.CommandOptions,
   podmanArgs?: ReadonlyArray<string>,
 ) =>
-  spawner
-    .exitCode(ChildProcess.make("docker", args, options))
-    .pipe(
-      Effect.catch(() =>
-        spawner
-          .exitCode(ChildProcess.make("podman", podmanArgs ?? args, options))
-          .pipe(
-            Effect.catch(() =>
-              Effect.fail(
-                new LegacyContainerRuntimeNotFoundError({ message: RUNTIME_NOT_FOUND_MESSAGE }),
-              ),
-            ),
+  spawner.exitCode(ChildProcess.make("docker", args, options)).pipe(
+    Effect.catch(() =>
+      spawner.exitCode(ChildProcess.make("podman", podmanArgs ?? args, options)).pipe(
+        Effect.catch(() =>
+          Effect.fail(
+            new LegacyContainerRuntimeNotFoundError({
+              message: legacyContainerRuntimeNotFoundMessage,
+            }),
           ),
+        ),
       ),
-    );
+    ),
+  );
 
 function collectDockerCliText(stream: Stream.Stream<Uint8Array, unknown>) {
   const decoder = new TextDecoder();
@@ -124,6 +150,52 @@ function collectDockerCliText(stream: Stream.Stream<Uint8Array, unknown>) {
     (text, chunk) => text + decoder.decode(chunk, { stream: true }),
   ).pipe(Effect.map((text) => text + decoder.decode()));
 }
+
+/**
+ * Like {@link containerCliExitCode}, but also collecting the child's stdout —
+ * for callers that need the CLI's own report of what it did (e.g. the `docker
+ * … prune` deleted-ID lists backing Go's `--debug` "Pruned …" reports in
+ * `DockerRemoveAll`, `docker.go:123-143`). Collecting (i.e. reading) stdout
+ * also sidesteps the unread-pipe hang that `stdout: "ignore"` callers avoid by
+ * discarding it. stderr is discarded, matching the exit-code-only helper.
+ * `podmanArgs` has the same meaning as on {@link containerCliExitCode}.
+ */
+export const legacyContainerCliExitCodeAndStdout = (
+  spawner: Spawner,
+  args: ReadonlyArray<string>,
+  podmanArgs?: ReadonlyArray<string>,
+) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const options = {
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "ignore",
+      } satisfies ChildProcess.CommandOptions;
+      const handle = yield* spawner.spawn(ChildProcess.make("docker", args, options)).pipe(
+        Effect.catch(() =>
+          spawner.spawn(ChildProcess.make("podman", podmanArgs ?? args, options)).pipe(
+            Effect.catch(() =>
+              Effect.fail(
+                new LegacyContainerRuntimeNotFoundError({
+                  message: legacyContainerRuntimeNotFoundMessage,
+                }),
+              ),
+            ),
+          ),
+        ),
+      );
+      // Subscribe to stdout concurrently with awaiting the exit code — Node's
+      // "exit" event can fire before a fast process's stdio pipes are drained,
+      // so a late subscriber would see an already-ended, empty stream (same
+      // pattern as `legacy-docker-lifecycle.ts`'s `spawnDockerPsLines`).
+      const [exitCode, stdout] = yield* Effect.all(
+        [handle.exitCode.pipe(Effect.map(Number)), collectDockerCliText(handle.stdout)],
+        { concurrency: "unbounded" },
+      );
+      return { exitCode, stdout };
+    }),
+  );
 
 /**
  * Mirrors Go's `versions.GreaterThanOrEqualTo` (`docker/api/types/versions`,

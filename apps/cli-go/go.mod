@@ -15,12 +15,12 @@ require (
 	github.com/containerd/errdefs v1.0.0
 	github.com/containers/common v0.64.2
 	github.com/docker/docker v28.5.2+incompatible
-	github.com/docker/go-connections v0.7.0
+	github.com/docker/go-connections v0.8.1
 	github.com/docker/go-units v0.5.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/getsentry/sentry-go v0.48.0
 	github.com/go-errors/errors v1.5.1
-	github.com/go-git/go-git/v5 v5.19.1
+	github.com/go-git/go-git/v5 v5.19.2
 	github.com/go-playground/validator/v10 v10.30.3
 	github.com/go-viper/mapstructure/v2 v2.5.0
 	github.com/go-xmlfmt/xmlfmt v1.1.3
@@ -29,7 +29,7 @@ require (
 	github.com/google/go-querystring v1.2.0
 	github.com/google/jsonschema-go v0.4.3
 	github.com/google/uuid v1.6.0
-	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
+	github.com/gorilla/websocket v1.5.3
 	github.com/h2non/gock v1.2.0
 	github.com/jackc/pgconn v1.14.3
 	github.com/jackc/pgerrcode v0.0.0-20240316143900-6e2875d9b438
@@ -41,13 +41,13 @@ require (
 	github.com/multigres/multigres v0.0.0-20260126223308-f5a52171bbc4
 	github.com/oapi-codegen/nullable v1.2.0
 	github.com/olekukonko/tablewriter v1.1.4
-	github.com/posthog/posthog-go v1.21.0
+	github.com/posthog/posthog-go v1.22.0
 	github.com/spf13/afero v1.15.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.11.1
-	github.com/stripe/pg-schema-diff v1.0.7
+	github.com/stripe/pg-schema-diff v1.0.8
 	github.com/supabase/cli/pkg v1.0.0
 	github.com/tidwall/jsonc v0.3.3
 	github.com/ulikunitz/xz v0.5.12
