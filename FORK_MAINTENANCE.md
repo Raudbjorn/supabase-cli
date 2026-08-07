@@ -1,213 +1,25 @@
 # Fork Maintenance Guide
 
-This fork of Supabase CLI replaces the heavy `go-ethereum` dependency with a lightweight stub that redirects to decred's optimized secp256k1 implementation.
+This is a maintainer's-eye summary of why this fork exists and how it stays in sync with upstream. The canonical, step-by-step sync procedure lives in `AGENTS.md` ("Updating this fork, rebuilding, and installing the Arch package") — this file intentionally does not duplicate it, to avoid the two drifting out of sync again.
 
 ## Why This Fork Exists
 
-**Problem:** go-ethereum is a massive dependency that:
-- Significantly increases build time
-- Causes frequent checksum mismatch errors
-- Adds unnecessary bloat for a single crypto function
+1. **`go-ethereum` replacement** — upstream depends on `github.com/ethereum/go-ethereum` for a single `secp256k1` curve function. That dependency is large, slow to build, and prone to checksum mismatches. `apps/cli-go/internal/go-ethereum-stub/` provides the same API backed by `decred/dcrd`'s implementation, wired in via a `replace` directive in `apps/cli-go/go.mod`.
+2. **`containers/common` replacement** — same rationale, a second heavy dependency swapped for a lightweight stub at `apps/cli-go/internal/containers-common-stub/`.
+3. **Functional `start` command** — upstream deleted its Docker-based `internal/start` implementation outright, on the assumption that a TypeScript CLI wraps the Go binary and talks to Docker directly instead. This package (`supabase-git` on the AUR) ships the bare Go binary as `/usr/bin/supabase` with no TypeScript wrapper, so `supabase start` must keep working without `--sandbox`. `apps/cli-go/internal/start/`, `apps/cli-go/cmd/start.go`, and `apps/cli-go/cmd/start_test.go` are therefore permanently fork-owned and restored from the fork's own history on every sync, regardless of whether git flags a conflict on them.
+4. **No docker/cli dependency in `internal/utils/docker.go`** — the two functions that would otherwise need `docker/cli` (`NewDocker`, `loadRegistryAuth`) live in `apps/cli-go/internal/utils/docker_fork.go` instead, so the rest of `docker.go` stays byte-identical to upstream and merges without manual intervention.
+5. **Some upstream CI workflows disabled** — `.github/dependabot.yml` is deleted from this fork's tree (re-deleted on every sync); a handful of upstream workflows not relevant to a personal AUR fork (automerge, deploy, deploy-check, release) are disabled at the GitHub repo level (Settings → Actions) rather than by editing/renaming the workflow files, so those files stay identical to upstream and merge cleanly.
 
-**Solution:** A lightweight internal stub at `internal/go-ethereum-stub/` that provides the same `crypto/secp256k1` API but uses decred's implementation, which:
-- Supports modern CPU features (AVX-512)
-- Is actively maintained and optimized
-- Has a much smaller footprint
+## Sync Strategy: Merge, Not Rebase
 
-## Automated Syncing
+This fork syncs via `git merge upstream-real/develop --no-edit`, **not** rebase. Merge is correct here because:
 
-The fork automatically syncs with upstream daily at 3 AM UTC via GitHub Actions.
+- The fork's own history already contains 15+ merge commits from prior syncs — a rebase would replay all of them against a moved upstream tip, conflicting repeatedly for no benefit.
+- A force-push is never required, so there's no risk of clobbering work in progress on `origin/develop`.
+- Fork-owned files (item 3 and 4 above) need deterministic post-merge restoration regardless of conflict status — a `git checkout <pre-merge-HEAD> -- <path>` after `git merge` handles this uniformly whether git flagged a conflict or silently deleted an untouched sibling file. A rebase, replaying many commits, would need this same fixup after every replayed commit that touches those paths, not just once.
 
-### How It Works
+Run the sync with `/home/svnbjrn/dev/supabase-git/update-fork.sh`, which automates the full merge + fork-owned-path restoration + `go.mod`/`go.sum` reconciliation + build/test gate described in `AGENTS.md`. It stops before commit/push/install so a human or agent can review the diff first.
 
-1. **Rebase Strategy**: Uses `git rebase` (not merge) to maintain a clean linear history
-2. **Smart Conflict Resolution**: Automatically handles expected conflicts in `go.mod`/`go.sum`
-3. **Verification**: Ensures the ethereum stub remains intact after sync
-4. **Testing**: Runs build tests before pushing
-5. **Notifications**: Creates an issue if manual intervention is needed
+## Historical Note
 
-### Manual Trigger
-
-You can manually trigger a sync from the GitHub Actions tab:
-1. Go to "Actions" → "Sync Fork with Upstream (Rebase)"
-2. Click "Run workflow" → "Run workflow"
-
-## Manual Syncing
-
-If you need to sync manually:
-
-```bash
-# Clone your fork
-git clone https://github.com/Raudbjorn/supabase-cli.git
-cd supabase-cli
-git checkout develop
-
-# Add upstream remote (one-time)
-git remote add upstream https://github.com/supabase/cli.git
-
-# Fetch latest upstream changes
-git fetch upstream --tags
-
-# Rebase on upstream (preferred over merge for clean history)
-git rebase upstream/develop
-
-# If conflicts occur (usually in go.mod/go.sum):
-# Keep our ethereum replacement
-git checkout --ours go.mod
-git add go.mod go.sum
-git rebase --continue
-
-# Verify the stub is intact
-test -d internal/go-ethereum-stub && echo "✓ Stub intact"
-grep "replace github.com/ethereum/go-ethereum" go.mod && echo "✓ Replace directive intact"
-
-# Test build
-export GOSUMDB=off CGO_ENABLED=0
-go mod tidy
-go build ./...
-
-# Push with force-with-lease (safe force push)
-git push --force-with-lease origin develop
-```
-
-## Why Rebase Instead of Merge?
-
-**Rebase is better for this use case because:**
-
-1. **Clean History**: Single linear commit history, no merge commits
-   ```
-   # With Rebase (clean):
-   A---B---C---D (our ethereum fix)
-
-   # With Merge (messy):
-   A---B---C---M---M---M (merge commits)
-   ```
-
-2. **Easier to Review**: Each commit shows exactly what changed
-3. **Simpler Conflicts**: Our changes are minimal (one stub + go.mod replace)
-4. **Bisect-Friendly**: `git bisect` works better with linear history
-
-**When Merge is Better:**
-- Feature branches with many collaborators
-- Complex branching strategies
-- When you want to preserve exact branch history
-
-**Our Case:** We have a simple, persistent change (ethereum stub) that needs to stay on top of upstream. Rebase is perfect here.
-
-## Expected Conflicts
-
-During sync, you may see conflicts in:
-- `go.mod`: Our `replace` directive vs upstream's dependency updates
-- `go.sum`: Checksum changes from dependency updates
-
-**Resolution:** Always keep our version (`--ours`) for the ethereum replacement, accept upstream for everything else.
-
-## Monitoring
-
-The workflow will:
-- ✅ Run daily automatically
-- ✅ Create an issue if sync fails
-- ✅ Provide detailed summary in Actions tab
-- ✅ Force-push only when changes are successfully rebased and tested
-
-## Testing After Sync
-
-The automated workflow runs:
-```bash
-go mod tidy
-go build -v ./...
-```
-
-For comprehensive testing:
-```bash
-# Run tests
-go test -short ./...
-
-# Build with optimizations (as PKGBUILD does)
-export GOAMD64=v4
-export GOMAXPROCS=64
-go build -v -p=64 \
-  -ldflags="-s -w" \
-  -o supabase .
-
-# Test the binary
-./supabase --version
-```
-
-## Keeping PKGBUILD Updated
-
-After successful upstream sync, update your PKGBUILD:
-
-```bash
-cd ~/dev/supabase-git
-rm -rf src/ pkg/
-
-# Build will automatically fetch latest from your fork
-makepkg -sf --noconfirm
-```
-
-The PKGBUILD's `pkgver()` function will automatically detect the new version.
-
-## Troubleshooting
-
-### Workflow Failed with Conflicts
-
-Check the Actions run for details, then manually sync:
-```bash
-git fetch upstream
-git rebase upstream/develop
-# Resolve conflicts
-git push --force-with-lease origin develop
-```
-
-### Ethereum Stub Missing After Sync
-
-Re-create it:
-```bash
-mkdir -p internal/go-ethereum-stub/crypto/secp256k1
-
-cat > internal/go-ethereum-stub/go.mod <<'EOF'
-module github.com/ethereum/go-ethereum
-go 1.21
-require github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0
-EOF
-
-cat > internal/go-ethereum-stub/crypto/secp256k1/curve.go <<'EOF'
-package secp256k1
-import (
-	"crypto/elliptic"
-	dcrdSecp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
-)
-func S256() elliptic.Curve {
-	return dcrdSecp256k1.S256()
-}
-EOF
-
-# Add replace directive to go.mod
-echo "replace github.com/ethereum/go-ethereum v1.15.8 => ./internal/go-ethereum-stub" >> go.mod
-
-git add internal/go-ethereum-stub go.mod
-git commit -m "Restore ethereum stub"
-```
-
-### Build Fails After Sync
-
-```bash
-# Clean and retry
-rm -rf ~/go/pkg/mod/github.com/ethereum/go-ethereum*
-export GOSUMDB=off
-go clean -modcache
-go mod tidy
-go build ./...
-```
-
-## Contact
-
-For issues with:
-- **The fork itself**: Open issue at `Raudbjorn/supabase-cli`
-- **Upstream Supabase**: Open issue at `supabase/cli`
-- **PKGBUILD**: Check your local repository
-
-## License
-
-This fork maintains the same MIT license as upstream Supabase CLI.
+An earlier version of this fork used a daily automated GitHub Actions workflow (`sync-upstream.yml`) implementing a rebase-and-force-push strategy. That workflow was disabled early on and has since been deleted; it no longer reflects how this fork is maintained. If you find references to it elsewhere, they're stale.

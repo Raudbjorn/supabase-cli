@@ -3,11 +3,8 @@ package utils
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"regexp"
 	"strings"
@@ -28,24 +25,9 @@ import (
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/go-errors/errors"
 	"github.com/spf13/viper"
-	"go.opentelemetry.io/otel"
 )
 
 var Docker = NewDocker()
-
-func NewDocker() *client.Client {
-	// Silence otel errors as users don't care about docker metrics
-	// 2024/08/12 23:11:12 1 errors occurred detecting resource:
-	// 	* conflicting Schema URL: https://opentelemetry.io/schemas/1.21.0
-	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(cause error) {}))
-	// Use docker/docker/client directly instead of going through docker/cli.
-	// This eliminates the heavy docker/cli dependency tree.
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		log.Fatalln("Failed to create Docker client:", err)
-	}
-	return cli
-}
 
 const (
 	DinDHost            = "host.docker.internal"
@@ -189,25 +171,6 @@ func getRegistryAuth(registry string) string {
 		entry.value = loadRegistryAuth(registry)
 	})
 	return entry.value
-}
-
-func loadRegistryAuth(registry string) string {
-	// Load auth config directly from ~/.docker/config.json instead of using
-	// docker/cli's config loader. This eliminates the docker/cli dependency.
-	auth, err := LoadDockerAuthConfig(registry)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Failed to load registry credentials:", err)
-		return ""
-	}
-	if auth.Auth == "" && auth.Username == "" {
-		return ""
-	}
-	encoded, err := json.Marshal(auth)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Failed to serialise auth config:", err)
-		return ""
-	}
-	return base64.URLEncoding.EncodeToString(encoded)
 }
 
 // Defaults to Supabase public ECR for faster image pull

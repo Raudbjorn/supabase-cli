@@ -84,7 +84,7 @@ Run commands from the repo root unless noted.
 | `apps/cli/vitest.config.ts` | TS CLI unit/integration/e2e/live Vitest projects. |
 | `apps/cli-e2e/AGENTS.md` | Detailed replay/record/live e2e harness notes. |
 | `apps/cli-go/go.mod` | Go module plus fork-critical `replace` directives. |
-| `apps/cli-go/FORK_MAINTENANCE.md` | Upstream sync/fork-stub rationale; check against local napkin before following literally. |
+| `FORK_MAINTENANCE.md` | Upstream sync/fork-stub rationale (why the fork exists); points here for the actual sync steps. |
 | `apps/cli-go/pkg/config/templates/Dockerfile` | Source of truth for local stack image tags. |
 | `apps/cli-go/pkg/api/{client,types}.gen.go` | Generated Go Management API client/types; regenerate via `go generate`. |
 | `tools/nx-plugins/src/*.ts` | Inferred target definitions; explains targets absent from `package.json`. |
@@ -113,6 +113,8 @@ The working checkout usually lives inside an AUR/package directory:
 - package root: `/home/svnbjrn/dev/supabase-git`
 - PKGBUILD source branch: `develop`
 
+**Mechanical path:** run `/home/svnbjrn/dev/supabase-git/update-fork.sh`. It performs every step below (fetch, merge, fork-owned-path restoration, go.mod/go.sum reconciliation, build+test gate) and stops before commit/push/install for review. The manual steps are documented here so the rationale behind each is traceable and so a novel conflict (the script exits nonzero and tells you which paths) can be resolved by hand.
+
 Process:
 
 ```sh
@@ -122,25 +124,35 @@ git checkout develop
 git merge upstream-real/develop --no-edit
 ```
 
-Conflict rules:
+Conflict rules — apply ALL of these after every merge, not just the ones git flags as conflicted. Several of these paths get **silently deleted with no conflict marker at all** when upstream has removed the same path and the fork's copy wasn't independently touched in that merge — git resolves that as a clean delete. The only reliable defense is restoring unconditionally, which is exactly what `update-fork.sh` does.
 
-1. For `apps/cli-go/go.mod` / `go.sum`, take upstream's module updates, then re-add the two fork-specific replacements:
+1. **`apps/cli-go/go.mod` / `go.sum`** — take upstream's module updates, then re-add the two fork-specific replacements:
    ```go
    replace github.com/ethereum/go-ethereum => ./internal/go-ethereum-stub
    replace github.com/containers/common => ./internal/containers-common-stub
    ```
    Upstream-owned replacements such as `github.com/supabase/cli/pkg => ./pkg` and `github.com/fsnotify/fsevents => ./fsevents` should survive normally.
-2. Run tidy with the system resolver if DNS through pure Go times out:
+2. **`apps/cli-go/internal/start/`, `apps/cli-go/cmd/start.go`, `apps/cli-go/cmd/start_test.go`** — permanently fork-owned (see `FORK_MAINTENANCE.md` item 3). Upstream deleted `internal/start` outright and reduced `cmd/start.go` to a stub that always errors. Always restore all three paths from the pre-merge `develop` HEAD after merging, unconditionally:
+   ```sh
+   git checkout <pre-merge-HEAD> -- apps/cli-go/internal/start apps/cli-go/cmd/start.go apps/cli-go/cmd/start_test.go
+   git add apps/cli-go/internal/start apps/cli-go/cmd/start.go apps/cli-go/cmd/start_test.go
+   ```
+3. **`.github/dependabot.yml`** — the fork deletes this file; upstream edits it almost every sync, so it reappears via merge. Always re-delete after merging:
+   ```sh
+   git rm -f --ignore-unmatch .github/dependabot.yml
+   ```
+4. **`apps/cli-go/internal/utils/docker.go`** — only `NewDocker` and `loadRegistryAuth` are allowed to diverge from upstream, and they live in `apps/cli-go/internal/utils/docker_fork.go`, not in `docker.go` itself. `docker.go` should always be able to take upstream's version wholesale. If a merge conflicts inside `docker.go` outside of a call site referencing `docker_fork.go`'s functions, something has drifted from this convention — investigate rather than blindly keeping either side.
+5. Run tidy with the system resolver if DNS through pure Go times out:
    ```sh
    cd apps/cli-go
    CGO_ENABLED=1 GODEBUG=netdns=cgo GOSUMDB=off GOPROXY=https://proxy.golang.org,direct go mod tidy
    ```
-3. Verify the Go fork before packaging:
+6. Verify the Go fork before packaging:
    ```sh
    GOSUMDB=off CGO_ENABLED=0 go build -mod=readonly ./...
-   go test -short ./internal/sandbox/...
+   go test -short ./internal/sandbox/... ./internal/start/... ./internal/status/... ./internal/utils/... ./cmd/...
    ```
-4. Build and install the package:
+7. Build and install the package:
    ```sh
    cd /home/svnbjrn/dev/supabase-git
    makepkg -sf --noconfirm
