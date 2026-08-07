@@ -58,7 +58,7 @@ require (
 	golang.org/x/net v0.57.0
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/term v0.45.0
-	google.golang.org/grpc v1.82.1
+	google.golang.org/grpc v1.83.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -349,8 +349,6 @@ require (
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.64.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.43.0 // indirect
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
-	go.opentelemetry.io/otel/sdk v1.44.0 // indirect
-	go.opentelemetry.io/otel/sdk/metric v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
@@ -362,8 +360,6 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 	golang.org/x/tools v0.47.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gotest.tools/gotestsum v1.12.2 // indirect
@@ -376,12 +372,12 @@ replace github.com/supabase/cli/pkg v1.0.0 => ./pkg
 
 replace github.com/fsnotify/fsevents v0.2.0 => ./fsevents
 
-replace github.com/ethereum/go-ethereum => ./internal/go-ethereum-stub
-
-replace github.com/containers/common => ./internal/containers-common-stub
-
 tool (
 	github.com/golangci/golangci-lint/v2/cmd/golangci-lint
 	github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen
 	gotest.tools/gotestsum
 )
+
+replace github.com/ethereum/go-ethereum => ./internal/go-ethereum-stub
+
+replace github.com/containers/common => ./internal/containers-common-stub
