@@ -16,6 +16,11 @@ import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
 import type { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner";
 
 import {
+  actionability,
+  type CliErrorActionabilityDeclaration,
+  ErrorActionabilityId,
+} from "../../../shared/telemetry/error-actionability.ts";
+import {
   legacySpawnContainerCliWithRuntime,
   type LegacyContainerRuntime,
 } from "../legacy-container-cli.ts";
@@ -24,7 +29,7 @@ import { legacyKongAuthHeaders } from "../legacy-kong-auth.ts";
 
 type Spawner = ChildProcessSpawner["Service"];
 
-/** Go's `serviceTimeout` (`apps/cli-go/internal/start/start.go:161`). */
+/** Go's `serviceTimeout` (`apps/cli-go/internal/start/start.go:161`, deleted in CLI-1966; last present at commit a253ccba2). */
 const LEGACY_HEALTH_CHECK_TIMEOUT_SECONDS = 30;
 
 /**
@@ -62,10 +67,14 @@ export interface LegacyHealthCheckFailure {
   readonly reason: string;
 }
 
-/** Internal-only: one probe round's failures, narrowing which containers are still watched next round. */
-class LegacyHealthCheckProbeError extends Data.TaggedError("LegacyHealthCheckProbeError")<{
+/** Runtime-internal probe sentinel; exported only for the exhaustive actionability guard. */
+export class LegacyHealthCheckProbeError extends Data.TaggedError("LegacyHealthCheckProbeError")<{
   readonly failures: ReadonlyArray<LegacyHealthCheckFailure>;
-}> {}
+}> {
+  get [ErrorActionabilityId](): CliErrorActionabilityDeclaration {
+    return actionability.startStack;
+  }
+}
 
 /**
  * The retry loop's final, and only surfaced, failure — mirrors Go returning
@@ -83,7 +92,11 @@ export class LegacyHealthCheckTimeoutError extends Data.TaggedError(
    * pointing at an HTTP request logger is a non-sequitur (as in CLI-1973).
    */
   readonly suggestion?: string;
-}> {}
+}> {
+  get [ErrorActionabilityId](): CliErrorActionabilityDeclaration {
+    return actionability.startStack;
+  }
+}
 
 /**
  * PostgREST's local Kong gateway coordinates, mirroring Go's
@@ -368,7 +381,7 @@ export function legacyWaitForHealthyServices(
                 onSuccess: (): LegacyHealthCheckFailure | undefined => undefined,
               }),
             ),
-          { concurrency: "unbounded" },
+          { concurrency: 1 },
         );
         const failures = outcomes.filter(
           (outcome): outcome is LegacyHealthCheckFailure => outcome !== undefined,
@@ -408,8 +421,12 @@ export function legacyWaitForHealthyServices(
           );
           return yield* Effect.fail(
             new LegacyHealthCheckTimeoutError({
+              // Go's `assertContainerHealthy` embeds the id INSIDE the message
+              // (`errors.Errorf("%s container is not running: %s", …)`,
+              // `status.go:150,154`) — a bare space, not an `<id>: ` prefix, so the
+              // joined `errors.Join` text is `<id> container is not ready: <health>`.
               message: probeError.failures
-                .map((failure) => `${failure.containerId}: ${failure.reason}`)
+                .map((failure) => `${failure.containerId} ${failure.reason}`)
                 .join("\n"),
               unhealthy: probeError.failures,
               ...(suggestion === undefined ? {} : { suggestion }),

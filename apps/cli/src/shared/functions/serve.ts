@@ -10,7 +10,12 @@ import {
   type ResolvedProjectValue,
   type ResolvedFunctionConfig as ManifestFunctionConfig,
 } from "@supabase/config";
-import { defaultJwtSecret, defaultPublishableKey, defaultSecretKey } from "@supabase/stack/effect";
+import {
+  defaultJwtSecret,
+  defaultPublishableKey,
+  defaultSecretKey,
+  edgeRuntimeNofileUlimit,
+} from "@supabase/stack/effect";
 import {
   createHmac,
   createPrivateKey,
@@ -27,12 +32,12 @@ import {
   legacyDescribeContainerCliFailure,
   spawnContainerCli,
 } from "../../legacy/shared/legacy-container-cli.ts";
-import { legacyGetRegistryImageUrl } from "../../legacy/shared/legacy-docker-registry.ts";
 import {
   LEGACY_SUGGEST_DOCKER_INSTALL,
   legacyIsDockerDaemonUnreachable,
 } from "../../legacy/shared/legacy-docker-suggest.ts";
 import { parseDotEnv } from "../../legacy/shared/legacy-dotenv.ts";
+import { legacyViperEnvStringWithProjectFallback } from "../legacy/legacy-viper-env.ts";
 import {
   resolveRemoteJwks,
   resolveThirdPartyIssuerUrl,
@@ -46,25 +51,31 @@ import {
   type FileWatchEvent,
 } from "../runtime/file-watcher.service.ts";
 import { ProcessControl } from "../runtime/process-control.service.ts";
-import { dockerfileServiceImage } from "../services/dockerfile-images.ts";
 import {
   buildDockerBinds,
   discoverFunctionSlugs,
   dockerBindContainerPath,
   dockerBindHostPath,
-  dockerProjectLabels,
   dockerWorkdirLabel,
+  rawFunctionConfigRecord,
+  resolveFunctionConfigs,
+  type ResolvedDeployFunctionConfig,
+} from "./deploy.ts";
+import {
+  containerArchiveBytes,
+  dockerProjectLabels,
   ensureDockerNamedVolume,
   ensureDockerNetwork,
   localDockerId,
   normalizeProjectId,
-  rawFunctionConfigRecord,
+  resolveDockerNetworkMode,
   resolveEdgeRuntimeVersion,
-  resolveFunctionConfigs,
+  resolveFunctionsDockerImage,
   runChildProcess,
   toDockerPath,
-  type ResolvedDeployFunctionConfig,
-} from "./deploy.ts";
+} from "./functions-docker.ts";
+import { loadFunctionsProjectConfig, type FunctionsGoConfigCompat } from "./functions-config.ts";
+import { edgeRuntimeImage, resolveEdgeRuntimeVersionPin } from "./functions.shared.ts";
 const decodeProjectConfig = Schema.decodeUnknownSync(ProjectConfigSchema);
 const defaultProjectConfig = decodeProjectConfig({});
 
@@ -96,7 +107,6 @@ const ignoredDirNames = new Set([
 ]);
 const dockerLogRetryDelay = Duration.millis(400);
 const dockerLogDiagnosticTailLength = 4_096;
-const legacyDefaultEdgeRuntimeImage = dockerfileServiceImage("edgeruntime");
 const defaultSupabaseEnv = "development";
 const serveMainContainerPath = "/root/index.ts";
 const shellVariableNamePattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -115,7 +125,6 @@ const watchIgnoreGlobs = [
   "**/*.tmp",
   "**/.#*",
 ] as const;
-const emptyStringArray: ReadonlyArray<string> = [];
 
 export const FUNCTIONS_SERVE_INSPECT_MODES = ["run", "brk", "wait"] as const;
 
@@ -140,6 +149,13 @@ export interface FunctionsServeDependencies {
   readonly networkId: Option.Option<string>;
   readonly projectIdOverride: Option.Option<string>;
   readonly goViperCompat: boolean;
+  /**
+   * `undefined` in `next`; the legacy shell injects
+   * `legacyFunctionsGoConfigCompat` so this file never imports `legacy/`
+   * directly — see {@link FunctionsGoConfigCompat}. Distinct from
+   * `goViperCompat` above, which only gates `env(...)` interpolation.
+   */
+  readonly goConfigCompat: FunctionsGoConfigCompat | undefined;
 }
 
 interface PlainServeAuthConfig {
@@ -169,6 +185,8 @@ interface ServeResolvedConfig {
   readonly configFunctions: Readonly<Record<string, ManifestFunctionConfig>>;
   readonly rawConfigFunctions: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
   readonly configPath?: string;
+  /** Go's post-`loadNestedEnv` merged env (ambient-wins). `undefined` in `next`. */
+  readonly projectEnvValues: Readonly<Record<string, string>> | undefined;
 }
 
 interface ServeFunctionContainerConfig {
@@ -264,6 +282,8 @@ export interface StartEdgeRuntimeContainerInput {
   readonly debug: boolean;
   readonly networkId: string;
   readonly envFile: Option.Option<string>;
+  /** Standalone `functions serve` discovers `supabase/functions/<slug>/.env`; `start` does not. */
+  readonly discoverFunctionEnvFiles: boolean;
   readonly importMap: Option.Option<string>;
   readonly noVerifyJwt: Option.Option<boolean>;
   readonly inspectMode: FunctionsServeInspectMode | undefined;
@@ -676,6 +696,7 @@ const resolveServeConfig = Effect.fnUntraced(function* (
   projectRoot: string,
   projectIdOverride: Option.Option<string>,
   goViperCompat: boolean,
+  goConfigCompat: FunctionsGoConfigCompat | undefined,
 ) {
   const projectEnv = yield* loadServeProjectEnvironment(projectRoot);
   const projectRef = Option.match(projectIdOverride, {
@@ -689,10 +710,20 @@ const resolveServeConfig = Effect.fnUntraced(function* (
   // environment. We resolve that environment ourselves (Go-accurate, layering
   // `.env.<SUPABASE_ENV>`/`.env.local`/`.env` over the ambient env) and pass it
   // in, so loading neither re-reads those files nor mutates `process.env`.
+  //
+  // `search: false`/`tomlOnly: true` when `goConfigCompat` is set (legacy
+  // shell): this MUST match `loadFunctionsProjectConfig`'s own options below
+  // exactly, or the two loads can resolve two different files (an ancestor's
+  // config.toml vs this dir's; a stray config.json vs config.toml) — one
+  // supplying `auth`/`edgeRuntime`/`apiPort` here, the other supplying
+  // `denoVersion`/`Config.Validate` below, silently mixing fields from two
+  // different projects. `next` (`goConfigCompat === undefined`) keeps the
+  // package defaults (ancestor search, JSON preferred), unchanged.
   const loadedConfig = yield* loadProjectConfig(projectRoot, {
     ...(projectRef === undefined ? {} : { projectRef }),
     ...(projectEnv === null ? {} : { projectEnv }),
     goViperCompat,
+    ...(goConfigCompat === undefined ? {} : { search: false, tomlOnly: true }),
   });
   const baseConfig = loadedConfig?.config ?? defaultProjectConfig;
 
@@ -741,15 +772,59 @@ const resolveServeConfig = Effect.fnUntraced(function* (
   const rawProjectId = Option.getOrElse(projectIdOverride, () => configProjectId).trim();
   const fallbackProjectId = basename(resolve(projectRoot));
 
+  // Go: `flags.LoadConfig` -> `Config.Validate` (`pkg/config/config.go:878,989-1192`)
+  // — `restartEdgeRuntime` runs this FIRST, before `AssertSupabaseDbIsRunning`
+  // (see this function's own caller for that ordering) — so an invalid
+  // config must fail here too, before any Docker check. Legacy shell only;
+  // `next` keeps its own package-default config resolution above unchanged.
+  // A second, independent config/dotenv load (rather than reusing this
+  // function's own `loadedConfig`/`projectEnv` above) — that pipeline's
+  // `env(...)`-interpolation purpose is unrelated to Go's `SUPABASE_*`
+  // `AutomaticEnv` override system this one provides, and the two shouldn't
+  // be entangled for a shipped, long-running command's config path.
+  // `search`/`tomlOnly` are aligned with this file's own `loadedConfig` call
+  // above (see its comment) so the two loads can never disagree about which
+  // file is "the" project config. `projectEnvValues` (for registry/network-id
+  // env lookups, this file's own caller) and the env-overridden
+  // `deno_version` are consumed from it; `auth`/`apiPort`/functions above
+  // keep their existing derivation. `projectId` also keeps its existing
+  // derivation — a known gap, narrow to trigger but NOT cosmetic when hit:
+  // unlike `deploy`/`download` (which use `context.projectId` outright),
+  // `rawProjectId` below only ever sees `SUPABASE_PROJECT_ID` from the
+  // *ambient* shell (`projectIdOverride`, from `LegacyCliConfig`), not from
+  // project dotenv. A project that sets it only in `supabase/.env` therefore
+  // gets a different `supabase_edge_runtime_<id>`/`supabase_network_<id>`
+  // here than `deploy`/`download`/`start` resolve for the SAME project — so
+  // `serve` creates a second network and a container `reloadKong(projectId)`'s
+  // Kong (named off the other id) can't route to: a silently non-functional
+  // `serve`, where Go reads one `Config.ProjectId` for everything. Folding
+  // `goContext.projectEnvValues` in here would also require reconciling this
+  // function's `projectIdOverride`-wins-unconditionally precedence with
+  // `legacyResolveLocalProjectId`'s config-file-wins-over-`projectRef`
+  // precedence (they're not the same order) — left open rather than risking
+  // that regression under time pressure (review round on CLI-1963).
+  const goContext =
+    goConfigCompat === undefined
+      ? undefined
+      : yield* loadFunctionsProjectConfig({
+          projectRoot,
+          projectRef,
+          goConfigCompat,
+        });
+
   return {
     projectId: normalizeProjectId(rawProjectId.length > 0 ? rawProjectId : fallbackProjectId),
     apiPort,
     auth,
-    edgeRuntime,
+    edgeRuntime:
+      goContext === undefined
+        ? edgeRuntime
+        : { ...edgeRuntime, deno_version: goContext.denoVersion },
     configDeclaredFunctions,
     configFunctions,
     rawConfigFunctions: rawFunctionConfigRecord(loadedConfig?.document),
     configPath: loadedConfig?.path,
+    projectEnvValues: goContext?.projectEnvValues,
   } satisfies ServeResolvedConfig;
 });
 
@@ -788,66 +863,69 @@ export function buildFunctionsServeInspectArgs(
   ];
 }
 
+const readDotEnvFile = Effect.fnUntraced(function* (pathname: string, optional: boolean) {
+  const contents = yield* Effect.tryPromise({
+    try: () =>
+      readFile(pathname, "utf8").then(
+        (value) => value,
+        (error) => {
+          if (optional && error instanceof Error && "code" in error && error.code === "ENOENT") {
+            return undefined;
+          }
+          throw error;
+        },
+      ),
+    catch: (cause) =>
+      new Error(
+        `failed to load environment file: ${pathname}${cause instanceof Error ? ` (${cause.message})` : ""}`,
+        { cause },
+      ),
+  });
+  if (contents === undefined) {
+    return {};
+  }
+  return yield* Effect.try({
+    try: () => parseDotEnv(contents),
+    catch: (cause) => sanitizeDotEnvParseError(pathname, cause),
+  });
+});
+
+const filterCustomEnv = Effect.fnUntraced(function* (env: Readonly<Record<string, string>>) {
+  const output = yield* Output;
+  const filtered: Array<[string, string]> = [];
+  for (const [name, value] of Object.entries(env)) {
+    if (name.startsWith("SUPABASE_")) {
+      yield* output.raw(`Env name cannot start with SUPABASE_, skipping: ${name}\n`, "stderr");
+      continue;
+    }
+    filtered.push([name, value]);
+  }
+  return Object.fromEntries(filtered);
+});
+
 const parseCustomEnvFile = Effect.fnUntraced(function* (
   envFileFlag: Option.Option<string>,
   projectRoot: string,
   flagCwd: string,
   configSecrets: Readonly<Record<string, string>>,
 ) {
-  const output = yield* Output;
-  const toEnvEntries = (parsed: Record<string, string>) => {
-    const merged = new Map<string, string>(Object.entries(configSecrets));
-    for (const [name, value] of Object.entries(parsed)) {
-      merged.set(name, value);
-    }
-    return Effect.forEach([...merged], ([name, value]) => {
-      if (name.startsWith("SUPABASE_")) {
-        return output
-          .raw(`Env name cannot start with SUPABASE_, skipping: ${name}\n`, "stderr")
-          .pipe(Effect.as(emptyStringArray));
-      }
-      return Effect.succeed([`${name}=${value}`] as const);
-    }).pipe(Effect.map((entries) => entries.flat()));
-  };
-
-  if (Option.isNone(envFileFlag)) {
-    const fallbackPath = join(projectRoot, fallbackEnvFilePath);
-    const exists = yield* Effect.tryPromise(() =>
-      readFile(fallbackPath, "utf8").then(
-        (contents) => ({ contents, path: fallbackPath }),
-        (error) => {
-          if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-            return undefined;
-          }
-          throw error;
-        },
-      ),
-    );
-    if (exists === undefined) {
-      return yield* toEnvEntries({});
-    }
-    const parsed = yield* Effect.try({
-      try: () => parseDotEnv(exists.contents),
-      catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
-    });
-    return yield* toEnvEntries(parsed);
-  }
-
-  const envFilePath = normalizeEnvPath(flagCwd, envFileFlag.value);
-  const contents = yield* Effect.tryPromise({
-    try: () => readFile(envFilePath, "utf8"),
-    catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+  const envFilePath = Option.match(envFileFlag, {
+    onNone: () => join(projectRoot, fallbackEnvFilePath),
+    onSome: (pathname) => normalizeEnvPath(flagCwd, pathname),
   });
-  const parsed = yield* Effect.try({
-    try: () => parseDotEnv(contents),
-    catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
-  });
-  return yield* toEnvEntries(parsed);
+  const parsed = yield* readDotEnvFile(envFilePath, Option.isNone(envFileFlag));
+  const filtered = yield* filterCustomEnv({ ...configSecrets, ...parsed });
+  return Object.entries(filtered).map(([name, value]) => `${name}=${value}`);
+});
+
+const parseFunctionEnvFile = Effect.fnUntraced(function* (pathname: string) {
+  return yield* readDotEnvFile(pathname, true).pipe(Effect.flatMap(filterCustomEnv));
 });
 
 function toFunctionContainerConfig(
   workdir: string,
   config: ResolvedDeployFunctionConfig,
+  envFile: Readonly<Record<string, string>>,
 ): ServeFunctionContainerConfig {
   const toContainerPath = (pathname: string) => {
     const resolvedPath = resolve(pathname);
@@ -865,7 +943,9 @@ function toFunctionContainerConfig(
     ...(config.staticFiles.length === 0
       ? {}
       : { staticFiles: config.staticFiles.map((pathname) => toContainerPath(pathname)) }),
-    ...(Object.keys(config.env).length === 0 ? {} : { env: config.env }),
+    ...(Object.keys(envFile).length === 0 && Object.keys(config.env).length === 0
+      ? {}
+      : { env: { ...envFile, ...config.env } }),
   };
 }
 
@@ -1031,19 +1111,19 @@ const loadServeProjectEnvironment = Effect.fnUntraced(function* (projectRoot: st
   for (const dir of [paths.supabaseDir, paths.projectRoot]) {
     for (const filename of loadDefaultEnvFilenames(env)) {
       const envPath = join(dir, filename);
-      const contents = yield* Effect.tryPromise(() =>
-        readFile(envPath, "utf8").then(
-          (value) => value,
-          (error) => {
-            if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-              return undefined;
-            }
-            throw error;
-          },
-        ),
-      ).pipe(
-        Effect.mapError((cause) => (cause instanceof Error ? cause : new Error(String(cause)))),
-      );
+      const contents = yield* Effect.tryPromise({
+        try: () =>
+          readFile(envPath, "utf8").then(
+            (value) => value,
+            (error) => {
+              if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+                return undefined;
+              }
+              throw error;
+            },
+          ),
+        catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+      });
       if (contents === undefined) {
         continue;
       }
@@ -1335,6 +1415,30 @@ const bestEffortRemoveContainer = Effect.fnUntraced(function* (containerId: stri
   }).pipe(Effect.ignore);
 });
 
+// One step of Edge Runtime's create → cp → start bring-up. Only the cp step passes a
+// `messagePrefix` — its raw stderr is uninterpretable alone — while create/start keep the
+// `docker run -d` era stderr surface byte-identical.
+const runEdgeRuntimeDockerStep = Effect.fnUntraced(function* (
+  args: ReadonlyArray<string>,
+  opts: { readonly messagePrefix?: string; readonly stdin?: Stream.Stream<Uint8Array> } = {},
+) {
+  const result = yield* runChildProcess("docker", args, {
+    stdin: opts.stdin,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (result.exitCode !== 0) {
+    const detail = result.stderr.trim() || result.stdout.trim();
+    const message =
+      opts.messagePrefix === undefined
+        ? detail || "failed to start edge runtime"
+        : detail.length > 0
+          ? `${opts.messagePrefix}: ${detail}`
+          : opts.messagePrefix;
+    return yield* Effect.fail(new Error(message));
+  }
+});
+
 const reloadKong = Effect.fnUntraced(function* (projectId: string) {
   const output = yield* Output;
   const kongId = localDockerId("kong", projectId);
@@ -1369,22 +1473,6 @@ export function buildServeEntrypointCommand(
 ) {
   return `${multilineEnvScriptPath === undefined ? "" : `. ${multilineEnvScriptPath}\n`}${command.join(" ")}
 `;
-}
-
-async function writeServeMainTemplateFile(template: string, dir: string) {
-  // Mount the bundled runtime template instead of embedding it in `sh -c` so
-  // Windows does not hit `uv_spawn` ENAMETOOLONG on path-heavy projects.
-  // Self-healing — see the matching comment in `writeDockerEnvFile` above.
-  await rm(dir, { recursive: true, force: true });
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  const pathname = join(dir, "index.ts");
-  await writeFile(pathname, template);
-  // `Z` — same SELinux relabel rationale as `writeDockerMultilineEnvScript`'s bind.
-  return { bind: `${pathname}:${serveMainContainerPath}:ro,Z` } as const;
-}
-
-function edgeRuntimeImageTag(version: string) {
-  return version.startsWith("v") ? version : `v${version}`;
 }
 
 const resolveServeFunctionConfigs = Effect.fnUntraced(function* (
@@ -1516,20 +1604,27 @@ export const startEdgeRuntimeContainer = Effect.fn("functions.startEdgeRuntimeCo
     // Deterministic, persistent host path (the same `<workdir>/supabase/.temp/start-secrets/`
     // convention `start`'s own container-lifecycle bring-up used to stage Kong/Postgres/
     // Supavisor's `secretFiles` on host disk before they moved to `docker cp` delivery —
-    // see `legacyCopyStartSecretFileIntoContainer`'s doc comment, `container-lifecycle.ts`)
+    // see `legacyCopyStartSecretFilesIntoContainer`'s doc comment, `container-lifecycle.ts`)
     // rather than `os.tmpdir()`: `legacyCleanupStartSecrets` (wired into both `stop` and a
     // failed-`start` rollback) reclaims this same `<workdir>/supabase/.temp/start-secrets/
     // <containerId>` tree keyed by container name, so these JWT/service-role-key/secret env
     // artifacts no longer leak on host disk indefinitely after the container is torn down.
     const stagingDir = join(input.projectRoot, "supabase", ".temp", "start-secrets", containerId);
-    // A single directory-wide `rm` rather than three per-file `.cleanup()` closures (the JWT
-    // secrets/env file, the multiline-env script, the serve-main template all live under
-    // `stagingDir`): this is what lets the cleanup cover the whole staging-write window below,
-    // including a mid-write failure between the first and second `writeDocker*` call, not just
-    // the final `docker run` step.
-    const cleanupRuntimeArtifacts = Effect.tryPromise(() =>
-      rm(stagingDir, { recursive: true, force: true }),
-    ).pipe(Effect.orDie);
+    // A single directory-wide `rm` rather than per-file `.cleanup()` closures (the JWT
+    // secrets/env file and the multiline-env script both live under `stagingDir`): this is
+    // what lets the cleanup cover the whole staging-write window below, including a mid-write
+    // failure between the first and second `writeDocker*` call, not just the final docker
+    // create/cp/start steps.
+    const removeRuntimeArtifacts = Effect.tryPromise({
+      try: () => rm(stagingDir, { recursive: true, force: true }),
+      catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+    });
+    const bestEffortCleanupRuntimeArtifacts = removeRuntimeArtifacts.pipe(
+      Effect.tapError((error) =>
+        output.warn(`Failed to clean up Edge Runtime artifacts: ${error.message}`),
+      ),
+      Effect.ignoreCause,
+    );
 
     const functionConfigs = yield* resolveServeFunctionConfigs(
       input.projectRoot,
@@ -1570,7 +1665,15 @@ export const startEdgeRuntimeContainer = Effect.fn("functions.startEdgeRuntimeCo
           new Error(missingSourceWarning.trimStart().replace(/^WARN:\s*/, "")),
         );
       }
-      functionsConfig[config.slug] = toFunctionContainerConfig(input.projectRoot, config);
+      const functionEnv =
+        input.discoverFunctionEnvFiles && Option.isNone(input.envFile)
+          ? yield* parseFunctionEnvFile(join(functionsDir, config.slug, ".env"))
+          : {};
+      functionsConfig[config.slug] = toFunctionContainerConfig(
+        input.projectRoot,
+        config,
+        functionEnv,
+      );
     }
 
     const binds = new Set(functionBinds);
@@ -1605,25 +1708,27 @@ export const startEdgeRuntimeContainer = Effect.fn("functions.startEdgeRuntimeCo
       partitionDockerEnvEntries(dockerEnv);
     // Everything from here on writes into `stagingDir` (or starts the container that reads from
     // it), so the whole window — including a mid-write failure between two `writeDocker*` calls,
-    // not just the final `docker run` step — is wrapped in `Effect.onError` below.
+    // not just the final docker create/cp/start steps — is wrapped in `Effect.onError` below.
+    // Container removal on failure stays with the callers, matching `docker run -d` behavior.
     return yield* Effect.gen(function* () {
       yield* Effect.try({
         try: () => validateDockerMultilineEnvNames(multilineDockerEnv),
         catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
       });
-      const dockerEnvFile = yield* Effect.tryPromise(() =>
-        writeDockerEnvFile(singleLineDockerEnv, join(stagingDir, "env")),
-      );
+      const dockerEnvFile = yield* Effect.tryPromise({
+        try: () => writeDockerEnvFile(singleLineDockerEnv, join(stagingDir, "env")),
+        catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+      });
       const multilineEnvDir = "/root/.supabase/multiline-env";
-      const dockerMultilineEnvScript = yield* Effect.tryPromise(() =>
-        writeDockerMultilineEnvScript(
-          multilineDockerEnv,
-          multilineEnvDir,
-          join(stagingDir, "multiline-env"),
-        ),
-      ).pipe(
-        Effect.mapError((cause) => (cause instanceof Error ? cause : new Error(String(cause)))),
-      );
+      const dockerMultilineEnvScript = yield* Effect.tryPromise({
+        try: () =>
+          writeDockerMultilineEnvScript(
+            multilineDockerEnv,
+            multilineEnvDir,
+            join(stagingDir, "multiline-env"),
+          ),
+        catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+      });
 
       const labels = dockerProjectLabels(projectId);
       const runtimeCommand = [
@@ -1636,15 +1741,20 @@ export const startEdgeRuntimeContainer = Effect.fn("functions.startEdgeRuntimeCo
         ...(input.debug ? ["--verbose"] : []),
       ];
       const serveMainTemplate = yield* Effect.promise(() => getLegacyFunctionsServeMainTemplate());
-      const serveMainTemplateFile = yield* Effect.tryPromise(() =>
-        writeServeMainTemplateFile(serveMainTemplate, join(stagingDir, "main")),
-      ).pipe(
-        Effect.mapError((cause) => (cause instanceof Error ? cause : new Error(String(cause)))),
-      );
+      // Streamed in via `docker cp` between create and start: embedding the template in the
+      // `sh -c` argv hits Windows ENAMETOOLONG (#5711), and a single-file host bind mounts as
+      // an empty directory on daemons that cannot see this host's filesystem (#6254, #4190).
+      const serveMainArchive = yield* Effect.tryPromise({
+        try: () => containerArchiveBytes({ [serveMainContainerPath]: serveMainTemplate }),
+        catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+      });
       const containerProjectRoot = toDockerPath(input.projectRoot);
+      const nofile = edgeRuntimeNofileUlimit(input.platform);
+      if (nofile.clampWarning !== undefined) {
+        yield* output.warn(nofile.clampWarning);
+      }
       const command = [
-        "run",
-        "-d",
+        "create",
         "--name",
         containerId,
         "--network",
@@ -1653,15 +1763,13 @@ export const startEdgeRuntimeContainer = Effect.fn("functions.startEdgeRuntimeCo
         "edge_runtime",
         ...(hasBindUnder(binds, containerProjectRoot) ? ["--workdir", containerProjectRoot] : []),
         "--ulimit",
-        "nofile=65536:65536",
+        nofile.arg,
         "--label",
         `com.supabase.cli.project=${labels["com.supabase.cli.project"]}`,
         "--label",
         `com.docker.compose.project=${labels["com.docker.compose.project"]}`,
         "--label",
         `${dockerWorkdirLabel}=${input.projectRoot}`,
-        "-v",
-        serveMainTemplateFile.bind,
         ...([...binds] as ReadonlyArray<string>).flatMap((bind) => ["-v", bind]),
         ...(dockerMultilineEnvScript === undefined ? [] : ["-v", dockerMultilineEnvScript.bind]),
         ...(dockerEnvFile === undefined ? [] : ["--env-file", dockerEnvFile.path]),
@@ -1676,22 +1784,21 @@ export const startEdgeRuntimeContainer = Effect.fn("functions.startEdgeRuntimeCo
         buildServeEntrypointCommand(runtimeCommand, dockerMultilineEnvScript?.scriptPath),
       ];
 
-      const result = yield* runChildProcess("docker", command, {
-        stdout: "pipe",
-        stderr: "pipe",
+      // The container must exist for `docker cp` to have a target, and must not be running
+      // yet so edge-runtime never races the copy.
+      yield* runEdgeRuntimeDockerStep(command);
+      yield* runEdgeRuntimeDockerStep(["cp", "-", `${containerId}:/`], {
+        messagePrefix: "failed to copy edge runtime main service into container",
+        stdin: Stream.make(serveMainArchive),
       });
-      if (result.exitCode !== 0) {
-        const message =
-          result.stderr.trim() || result.stdout.trim() || "failed to start edge runtime";
-        return yield* Effect.fail(new Error(message));
-      }
+      yield* runEdgeRuntimeDockerStep(["start", containerId]);
 
       return {
         containerId,
-        cleanup: cleanupRuntimeArtifacts,
+        cleanup: removeRuntimeArtifacts.pipe(Effect.orDie),
         watchSpecs: yield* Effect.promise(() => buildWatchSpecs([...functionBinds])),
       } satisfies StartedRuntime;
-    }).pipe(Effect.onError(() => cleanupRuntimeArtifacts));
+    }).pipe(Effect.onError(() => bestEffortCleanupRuntimeArtifacts));
   },
 );
 
@@ -1740,30 +1847,34 @@ const startEdgeRuntime = Effect.fnUntraced(function* (input: {
     input.dependencies.projectRoot,
     input.dependencies.projectIdOverride,
     input.dependencies.goViperCompat,
+    input.dependencies.goConfigCompat,
   );
   const projectId = resolved.projectId;
   const containerId = localDockerId("edge_runtime", projectId);
   let ownsRuntime = false;
   let startedRuntime: StartedRuntime | undefined;
   return yield* Effect.gen(function* () {
-    const networkMode = Option.getOrElse(input.networkId, () =>
-      localDockerId("network", projectId),
-    );
+    // `SUPABASE_NETWORK_ID` (env or project dotenv) is legacy-shell-only —
+    // same Go-viper-parity gate as `resolved.projectEnvValues` itself
+    // (`undefined` in `next`).
+    const networkMode = resolveDockerNetworkMode({
+      explicit: Option.getOrUndefined(input.networkId),
+      envOverride:
+        resolved.projectEnvValues === undefined
+          ? undefined
+          : legacyViperEnvStringWithProjectFallback(
+              "SUPABASE_NETWORK_ID",
+              resolved.projectEnvValues,
+            ),
+      projectId,
+    });
     const localAuthArtifacts = yield* resolveLocalAuthArtifacts(resolved.auth, resolved.configPath);
-    const edgeRuntimeVersionOverride = yield* Effect.tryPromise(() =>
-      readFile(join(input.dependencies.supabaseDir, ".temp", "edge-runtime-version"), "utf8"),
-    ).pipe(
-      Effect.map((value) => value.trim()),
-      Effect.catch(() => Effect.succeed("")),
+    const edgeRuntimeVersionOverride = yield* resolveEdgeRuntimeVersionPin(
+      input.dependencies.supabaseDir,
     );
     const edgeRuntimeVersion = yield* resolveEdgeRuntimeVersion(
       resolved.edgeRuntime.deno_version,
       edgeRuntimeVersionOverride,
-    );
-    const image = legacyGetRegistryImageUrl(
-      edgeRuntimeVersion.length === 0
-        ? legacyDefaultEdgeRuntimeImage
-        : `supabase/edge-runtime:${edgeRuntimeImageTag(edgeRuntimeVersion)}`,
     );
 
     yield* assertLocalDbRunning(projectId);
@@ -1783,6 +1894,33 @@ const startEdgeRuntime = Effect.fnUntraced(function* (input: {
     // caller-supplies-artifacts contract intact for `start`'s bring-up
     // (`edge-runtime.service.ts`), which resolves its own JWKS.
     const authArtifacts = yield* finalizeAuthArtifacts(localAuthArtifacts);
+
+    // Go: `DockerStart` -> `DockerResolveImageIfNotCached` (`internal/utils/docker.go:326-386`)
+    // — resolved here, not earlier: `hasLocalImage` fails fast on an
+    // unreachable daemon, which would otherwise hijack the down-daemon
+    // message `assertLocalDbRunning` above is responsible for producing.
+    //
+    // Known ordering divergence (not fixed here — see below): Go's own
+    // `ServeFunctions` (`serve.go:134-167`) parses `--env-file` and every
+    // per-function config BEFORE ever calling `DockerStart`
+    // (`serve.go:218`), so a broken env file or function config fails fast,
+    // before any pull. This port's `startEdgeRuntimeContainer` (below) does
+    // that same parsing internally, but AFTER receiving an already-resolved
+    // `image` — so on a cold image cache, a broken `--env-file` now surfaces
+    // after a potentially slow `docker pull` instead of immediately. Fixing
+    // this properly means splitting `startEdgeRuntimeContainer` into a
+    // "build container config" phase and a "run it" phase so this resolve
+    // can move between them — but that function is also `start`'s bring-up
+    // core (`edge-runtime.service.ts`), which already passes in a
+    // pre-resolved image via `legacyEnsureImagesCached`, so restructuring it
+    // risks that shipped, more critical path. Left as a documented
+    // UX-only regression (the command still fails with the right error,
+    // just later) rather than a hasty change to shared, `start`-critical
+    // code (review round on CLI-1963).
+    const image = yield* resolveFunctionsDockerImage(
+      edgeRuntimeImage(edgeRuntimeVersion),
+      resolved.projectEnvValues,
+    );
 
     startedRuntime = yield* startEdgeRuntimeContainer({
       config: {
@@ -1805,6 +1943,7 @@ const startEdgeRuntime = Effect.fnUntraced(function* (input: {
       debug: input.debug,
       networkId: networkMode,
       envFile: input.flags.envFile,
+      discoverFunctionEnvFiles: true,
       importMap: input.flags.importMap,
       noVerifyJwt: input.flags.noVerifyJwt,
       inspectMode: input.inspectMode,

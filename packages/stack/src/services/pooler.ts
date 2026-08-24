@@ -1,13 +1,18 @@
 import type { ServiceDef } from "@supabase/process-compose";
 import { dockerPortMapArgs } from "../Platform.ts";
-import { dockerRunService, type ServiceDependency } from "./service-utils.ts";
+import type { StackIdentity } from "../StackIdentity.ts";
+import {
+  dockerRunService,
+  type ContainerRuntimeOptions,
+  type ServiceDependency,
+} from "./service-utils.ts";
 import { stackHealthBudgets } from "./health-budgets.ts";
 
 type PoolMode = "transaction" | "session";
 
-interface DockerPoolerOptions {
+interface DockerPoolerOptions extends ContainerRuntimeOptions {
   readonly image: string;
-  readonly apiPort: number;
+  readonly identity: StackIdentity;
   readonly hostAdminPort: number;
   readonly hostPort: number;
   readonly dbHost: string;
@@ -69,8 +74,9 @@ end`;
 export const makePoolerServiceDocker = (opts: DockerPoolerOptions): ServiceDef =>
   (() => {
     return dockerRunService({
+      runtime: opts.runtime,
       name: "pooler",
-      apiPort: opts.apiPort,
+      identity: opts.identity,
       image: opts.image,
       networkArgs: dockerPortMapArgs(opts.platformOs, [
         { host: opts.hostAdminPort, container: poolerContainerPorts.admin },

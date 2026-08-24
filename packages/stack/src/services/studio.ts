@@ -1,11 +1,16 @@
 import type { ServiceDef } from "@supabase/process-compose";
 import { dockerNetworkArgs } from "../Platform.ts";
-import { dockerRunService, type ServiceDependency } from "./service-utils.ts";
+import type { StackIdentity } from "../StackIdentity.ts";
+import {
+  dockerRunService,
+  type ContainerRuntimeOptions,
+  type ServiceDependency,
+} from "./service-utils.ts";
 import { stackHealthBudgets } from "./health-budgets.ts";
 
-interface DockerStudioOptions {
+interface DockerStudioOptions extends ContainerRuntimeOptions {
   readonly image: string;
-  readonly apiPort: number;
+  readonly identity: StackIdentity;
   readonly port: number;
   readonly apiUrl: string;
   readonly publicApiUrl: string;
@@ -36,8 +41,9 @@ const studioHealthCheck = (port: number): ServiceDef["healthCheck"] => ({
 
 export const makeStudioServiceDocker = (opts: DockerStudioOptions): ServiceDef =>
   dockerRunService({
+    runtime: opts.runtime,
     name: "studio",
-    apiPort: opts.apiPort,
+    identity: opts.identity,
     image: opts.image,
     networkArgs: dockerNetworkArgs(opts.platformOs, [opts.port]),
     env: {

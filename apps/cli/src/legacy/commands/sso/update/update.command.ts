@@ -50,6 +50,7 @@ const config = {
     Flag.withDescription(
       "Skip local validation of the SAML 2.0 Metadata URL (HTTPS requirement, live GET probe, and UTF-8 body decode). Use in air-gapped CI where the IDP is not reachable from the build agent.",
     ),
+    Flag.withDefault(false),
   ),
   attributeMappingFile: Flag.string("attribute-mapping-file").pipe(
     Flag.withDescription(
@@ -70,9 +71,9 @@ const config = {
 export type LegacySsoUpdateFlags = CliCommand.Command.Config.Infer<typeof config>;
 
 export const legacySsoUpdateCommand = Command.make("update", config).pipe(
-  // Mirrors Go's long description verbatim, including the `of a already added`
-  // grammar slip in `apps/cli-go/cmd/sso.go`. Strict 1:1 port — file a Go-side
-  // fix upstream rather than diverging here.
+  // This description includes the `of a already added` grammar slip
+  // verbatim and intentionally — it is an established output string; do not
+  // "fix" the grammar here.
   Command.withDescription(
     "Update the configuration settings of a already added SSO identity provider.",
   ),

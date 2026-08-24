@@ -151,6 +151,102 @@ describe("supervisor-runtime", () => {
     },
   );
 
+  test(
+    "runs cleanup exactly once when graceful shutdown races with child exit",
+    { timeout: 15_000 },
+    async () => {
+      const tempDir = mkdtempSync(path.join(tmpdir(), "process-compose-supervisor-race-"));
+      const cleanupMarker = path.join(tempDir, "cleanup-runs");
+      const readyFile = path.join(tempDir, "ready");
+      const childScriptPath = path.join(tempDir, "child.mjs");
+
+      writeFileSync(
+        childScriptPath,
+        [
+          `import { writeFileSync } from "node:fs";`,
+          `writeFileSync(${JSON.stringify(readyFile)}, "ready");`,
+          `process.on("SIGTERM", () => setTimeout(() => process.exit(0), 25));`,
+          `setInterval(() => {}, 1000);`,
+        ].join("\n"),
+      );
+
+      const encodedConfig = Buffer.from(
+        JSON.stringify({
+          command: process.execPath,
+          args: [childScriptPath],
+          shutdownSignal: "SIGTERM",
+          shutdownTimeoutMs: 1_000,
+          cleanup: [
+            {
+              _tag: "RunCommand",
+              executable: process.execPath,
+              args: [
+                "-e",
+                [
+                  `const { appendFileSync } = require("node:fs");`,
+                  `appendFileSync(${JSON.stringify(cleanupMarker)}, "cleanup\\n");`,
+                  `setTimeout(() => process.exit(0), 250);`,
+                ].join("\n"),
+              ],
+            },
+          ],
+        }),
+      ).toString("base64url");
+      const supervisor = spawnSupervisor("source path", encodedConfig);
+
+      try {
+        await waitFor(() => existsSync(readyFile));
+        supervisor.stdin.end();
+        await waitFor(() => supervisor.exitCode != null, { timeoutMs: 10_000 });
+
+        expect(readFileSync(cleanupMarker, "utf8")).toBe("cleanup\n");
+      } finally {
+        supervisor.kill("SIGKILL");
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test(
+    "exits successfully when graceful shutdown races with cleanup-less child exit",
+    { timeout: 15_000 },
+    async () => {
+      const tempDir = mkdtempSync(path.join(tmpdir(), "process-compose-supervisor-exit-race-"));
+      const readyFile = path.join(tempDir, "ready");
+      const childScriptPath = path.join(tempDir, "child.mjs");
+
+      writeFileSync(
+        childScriptPath,
+        [
+          `import { writeFileSync } from "node:fs";`,
+          `writeFileSync(${JSON.stringify(readyFile)}, "ready");`,
+          `setInterval(() => {}, 1000);`,
+        ].join("\n"),
+      );
+
+      const encodedConfig = Buffer.from(
+        JSON.stringify({
+          command: process.execPath,
+          args: [childScriptPath],
+          shutdownSignal: "SIGTERM",
+          shutdownTimeoutMs: 1_000,
+        }),
+      ).toString("base64url");
+      const supervisor = spawnSupervisor("source path", encodedConfig);
+
+      try {
+        await waitFor(() => existsSync(readyFile));
+        supervisor.stdin.end();
+        await waitFor(() => supervisor.exitCode != null, { timeoutMs: 10_000 });
+
+        expect(supervisor.exitCode).toBe(0);
+      } finally {
+        supervisor.kill("SIGKILL");
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    },
+  );
+
   test.each([
     [
       "non-string command argument",
@@ -195,56 +291,65 @@ describe("supervisor-runtime", () => {
     expect(childEnv).toEqual({ KEEP_ME: "value" });
   });
 
-  test("bounds a cleanup command tree by its timeout and continues remaining cleanup", async () => {
-    const tempDir = mkdtempSync(path.join(tmpdir(), "process-compose-supervisor-timeout-"));
-    const cleanupDir = path.join(tempDir, "cleanup-dir");
-    const cleanupWorkerPidFile = path.join(tempDir, "cleanup-worker.pid");
-    const childScriptPath = path.join(tempDir, "child.mjs");
-    mkdirSync(cleanupDir);
-    writeFileSync(childScriptPath, "process.exit(0);\n");
-    const encodedConfig = Buffer.from(
-      JSON.stringify({
-        command: process.execPath,
-        args: [childScriptPath],
-        cleanup: [
-          {
-            _tag: "RunCommand",
-            executable: process.execPath,
-            args: [
-              "-e",
-              [
-                `const { spawn } = require("node:child_process");`,
-                `const { writeFileSync } = require("node:fs");`,
-                `const worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });`,
-                `writeFileSync(${JSON.stringify(cleanupWorkerPidFile)}, String(worker.pid));`,
-                `setInterval(() => {}, 1000);`,
-              ].join("\n"),
-            ],
-            timeoutMs: 100,
-          },
-          { _tag: "RemovePath", path: cleanupDir, recursive: true },
-        ],
-      }),
-    ).toString("base64url");
-    const supervisor = spawnSupervisor("source path", encodedConfig);
+  test(
+    "bounds a cleanup command tree by its timeout and continues remaining cleanup",
+    { timeout: 12_000 },
+    async () => {
+      const tempDir = mkdtempSync(path.join(tmpdir(), "process-compose-supervisor-timeout-"));
+      const cleanupDir = path.join(tempDir, "cleanup-dir");
+      const cleanupWorkerPidFile = path.join(tempDir, "cleanup-worker.pid");
+      const childScriptPath = path.join(tempDir, "child.mjs");
+      mkdirSync(cleanupDir);
+      writeFileSync(childScriptPath, "process.exit(0);\n");
+      const encodedConfig = Buffer.from(
+        JSON.stringify({
+          command: process.execPath,
+          args: [childScriptPath],
+          cleanup: [
+            {
+              _tag: "RunCommand",
+              executable: process.execPath,
+              args: [
+                "-e",
+                [
+                  `const { spawn } = require("node:child_process");`,
+                  `const { writeFileSync } = require("node:fs");`,
+                  `const worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });`,
+                  `writeFileSync(${JSON.stringify(cleanupWorkerPidFile)}, String(worker.pid));`,
+                  `setInterval(() => {}, 1000);`,
+                ].join("\n"),
+              ],
+              // Budget starts at spawn, so it must outlast node booting, spawning
+              // the worker, and writing the pid file. 100ms lost that race on CI.
+              timeoutMs: 2_000,
+            },
+            { _tag: "RemovePath", path: cleanupDir, recursive: true },
+          ],
+        }),
+      ).toString("base64url");
+      const supervisor = spawnSupervisor("source path", encodedConfig);
 
-    try {
-      await waitFor(() => supervisor.exitCode != null);
-      expect(supervisor.exitCode).toBe(0);
-      expect(existsSync(cleanupDir)).toBe(false);
-      const cleanupWorkerPid = Number.parseInt(readFileSync(cleanupWorkerPidFile, "utf8"), 10);
-      expect(Number.isSafeInteger(cleanupWorkerPid)).toBe(true);
-      await waitFor(() => !isPidAlive(cleanupWorkerPid));
-    } finally {
-      supervisor.kill("SIGKILL");
-      if (existsSync(cleanupWorkerPidFile)) {
-        try {
-          process.kill(Number.parseInt(readFileSync(cleanupWorkerPidFile, "utf8"), 10), "SIGKILL");
-        } catch {}
+      try {
+        await waitFor(() => supervisor.exitCode != null, { timeoutMs: 10_000 });
+        expect(supervisor.exitCode).toBe(0);
+        expect(existsSync(cleanupDir)).toBe(false);
+        const cleanupWorkerPid = Number.parseInt(readFileSync(cleanupWorkerPidFile, "utf8"), 10);
+        expect(Number.isSafeInteger(cleanupWorkerPid)).toBe(true);
+        await waitFor(() => !isPidAlive(cleanupWorkerPid), { timeoutMs: 10_000 });
+      } finally {
+        supervisor.kill("SIGKILL");
+        if (existsSync(cleanupWorkerPidFile)) {
+          try {
+            process.kill(
+              Number.parseInt(readFileSync(cleanupWorkerPidFile, "utf8"), 10),
+              "SIGKILL",
+            );
+          } catch {}
+        }
+        rmSync(tempDir, { recursive: true, force: true });
       }
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
+    },
+  );
 
   test("bounds a cleanup command when no timeout is configured", { timeout: 12_000 }, async () => {
     const tempDir = mkdtempSync(path.join(tmpdir(), "process-compose-supervisor-timeout-"));

@@ -1,7 +1,12 @@
 import type { ServiceDef } from "@supabase/process-compose";
 import { dockerNetworkArgs } from "../Platform.ts";
+import type { StackIdentity } from "../StackIdentity.ts";
 import { stackHealthBudgets } from "./health-budgets.ts";
-import { dockerRunService, type ServiceDependency } from "./service-utils.ts";
+import {
+  dockerRunService,
+  type ContainerRuntimeOptions,
+  type ServiceDependency,
+} from "./service-utils.ts";
 
 interface AuthServiceOptions {
   readonly dbPort: number;
@@ -21,11 +26,11 @@ interface NativeAuthOptions extends AuthServiceOptions {
   readonly binPath: string;
 }
 
-interface DockerAuthOptions extends AuthServiceOptions {
+interface DockerAuthOptions extends AuthServiceOptions, ContainerRuntimeOptions {
   readonly image: string;
   readonly dbHost: string;
   readonly platformOs: string;
-  readonly apiPort: number;
+  readonly identity: StackIdentity;
 }
 
 const authEnv = (opts: AuthServiceOptions, dbHost = "127.0.0.1"): Record<string, string> => ({
@@ -70,7 +75,7 @@ const authHealthCheck = (port: number) => ({
 
 export const makeAuthServiceNative = (opts: NativeAuthOptions): ServiceDef => ({
   name: "auth",
-  command: `${opts.binPath}/auth`,
+  command: `${opts.binPath}/bin/auth`,
   env: authEnv(opts),
   dependencies: opts.dependencies,
   healthCheck: authHealthCheck(opts.authPort),
@@ -81,8 +86,9 @@ export const makeAuthServiceNative = (opts: NativeAuthOptions): ServiceDef => ({
 export const makeAuthServiceDocker = (opts: DockerAuthOptions): ServiceDef => {
   const env = authEnv(opts, opts.dbHost);
   return dockerRunService({
+    runtime: opts.runtime,
     name: "auth",
-    apiPort: opts.apiPort,
+    identity: opts.identity,
     image: opts.image,
     networkArgs: dockerNetworkArgs(opts.platformOs, [opts.authPort]),
     env,

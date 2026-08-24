@@ -91,7 +91,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4
+      - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4
         with:
           version: 2026.7.0
           install: true
@@ -105,25 +105,6 @@ jobs:
           install-mode: none
           only-new-issues: true
           working-directory: apps/cli-go
-
-  link:
-    name: Link
-    if: ${{ github.event_name == 'merge_group' || (github.event_name ==
-      'pull_request' && !github.event.pull_request.head.repo.fork) }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: apps/cli-go/go.mod
-          cache: true
-      - run: go build main.go
-      - run: ./main link
-        env:
-          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-          SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
 
   codegen:
     name: Codegen

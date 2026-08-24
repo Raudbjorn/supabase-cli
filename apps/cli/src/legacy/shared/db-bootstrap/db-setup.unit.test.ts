@@ -9,7 +9,8 @@ import { Deferred, Effect, FileSystem, Layer, Path, Schema, Sink, Stream } from 
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import { mockOutput, mockRuntimeInfo } from "../../../../tests/helpers/mocks.ts";
-import type { LegacyDbSession } from "../legacy-db-connection.service.ts";
+import { LegacyDbExecError } from "../legacy-db-connection.errors.ts";
+import { LegacyDbConnection, type LegacyDbSession } from "../legacy-db-connection.service.ts";
 import { LegacyDockerRun, type LegacyDockerRunOpts } from "../legacy-docker-run.service.ts";
 import { LegacyDockerRunError } from "../legacy-docker-run.errors.ts";
 import { LegacyEdgeRuntimeScriptError } from "../legacy-edge-runtime-script.errors.ts";
@@ -19,7 +20,9 @@ import {
 } from "../legacy-edge-runtime-script.service.ts";
 import { LegacyPgDeltaSslProbe } from "../legacy-pgdelta-ssl-probe.service.ts";
 import {
-  LegacyStartDbSetupError,
+  LegacyDbSetupError,
+  legacyResolveDbSetupPrelude,
+  legacyRunDatabaseWebhooksSetup,
   legacyStartInitCurrentBranch,
   legacyStartSetupLocalDatabase,
   type LegacyStartSetupLocalDatabaseInput,
@@ -47,6 +50,7 @@ const SCHEMA_13_FINGERPRINT =
 const SCHEMA_14_FINGERPRINT_SUFFIX = "CREATE SCHEMA IF NOT EXISTS graphql";
 const REVOKE_PRIVILEGES_FINGERPRINT =
   "revoke execute on functions from anon, authenticated, service_role";
+const PG_NET_CREATE_FINGERPRINT = "create extension if not exists pg_net schema extensions";
 
 function fakeSession() {
   const calls: Array<{ kind: "exec" | "query"; sql: string; params?: ReadonlyArray<unknown> }> = [];
@@ -54,6 +58,14 @@ function fakeSession() {
     exec: (sql) =>
       Effect.sync(() => {
         calls.push({ kind: "exec", sql });
+      }),
+    // A batched file records the same way a statement-at-a-time run would, so the
+    // fingerprint assertions below read the SQL regardless of how it was sent.
+    execBatch: (statements) =>
+      Effect.sync(() => {
+        for (const { sql, params } of statements) {
+          calls.push(params === undefined ? { kind: "exec", sql } : { kind: "query", sql, params });
+        }
       }),
     query: (sql, params) =>
       Effect.sync(() => {
@@ -124,9 +136,30 @@ function mockAlwaysCachedSpawner(): ChildProcessSpawner.ChildProcessSpawner["Ser
 
 function mockDockerRunFails() {
   const layer = Layer.succeed(LegacyDockerRun, {
-    run: () => Effect.fail(new LegacyDockerRunError({ message: "failed to run docker" })),
-    runCapture: () => Effect.fail(new LegacyDockerRunError({ message: "failed to run docker" })),
-    runStream: () => Effect.fail(new LegacyDockerRunError({ message: "failed to run docker" })),
+    run: () =>
+      Effect.fail(
+        new LegacyDockerRunError({
+          message: "failed to run docker",
+          reason: "spawn",
+          daemonDown: false,
+        }),
+      ),
+    runCapture: () =>
+      Effect.fail(
+        new LegacyDockerRunError({
+          message: "failed to run docker",
+          reason: "spawn",
+          daemonDown: false,
+        }),
+      ),
+    runStream: () =>
+      Effect.fail(
+        new LegacyDockerRunError({
+          message: "failed to run docker",
+          reason: "spawn",
+          daemonDown: false,
+        }),
+      ),
   });
   return { layer };
 }
@@ -183,6 +216,7 @@ function baseInput(
     config: defaultConfig,
     experimental: false,
     majorVersion: 17,
+    dbHost: "supabase_db_proj",
     projectId: "proj",
     networkId: "supabase_network_proj",
     dbUrl: "postgresql://postgres:postgrespassword@127.0.0.1:54322/postgres",
@@ -200,6 +234,8 @@ function baseInput(
     },
     projectEnvValues: undefined,
     debug: false,
+    version: "",
+    seedFlags: { noSeed: false, sqlPaths: [] },
     ...overrides,
   };
 }
@@ -280,21 +316,6 @@ describe("legacyStartSetupLocalDatabase", () => {
           expect(execSql.some((sql) => sql.endsWith(SCHEMA_14_FINGERPRINT_SUFFIX))).toBe(false);
           // Default config: realtime, storage, and auth are all enabled.
           expect(docker.runs.length).toBe(3);
-          rmSync(workdir, { recursive: true, force: true });
-        }),
-      );
-    });
-
-    it.effect('prints "Initialising schema..." once, for either branch', () => {
-      const workdir = makeWorkdir();
-      const { session } = fakeSession();
-      const out = mockOutput();
-      const docker = mockDockerRun();
-      return run(baseInput(workdir, session, { majorVersion: 17 }), out, docker).pipe(
-        Effect.map(() => {
-          const banner = out.rawChunks.filter((c) => c.text === "Initialising schema...\n");
-          expect(banner.length).toBe(1);
-          expect(banner[0]?.stream).toBe("stderr");
           rmSync(workdir, { recursive: true, force: true });
         }),
       );
@@ -381,7 +402,7 @@ describe("legacyStartSetupLocalDatabase", () => {
           baseInput(workdir, session, {
             majorVersion: 15,
             config,
-            projectId: "myproj",
+            dbHost: "supabase_db_myproj",
             jwks: '{"keys":["stub"]}',
           }),
           out,
@@ -523,10 +544,8 @@ describe("legacyStartSetupLocalDatabase", () => {
       return run(baseInput(workdir, session, { majorVersion: 15, config }), out, docker).pipe(
         Effect.flip,
         Effect.map((error) => {
-          expect(error).toBeInstanceOf(LegacyStartDbSetupError);
-          expect((error as LegacyStartDbSetupError).message).toBe(
-            "error running container: exit 1",
-          );
+          expect(error).toBeInstanceOf(LegacyDbSetupError);
+          expect((error as LegacyDbSetupError).message).toBe("error running container: exit 1");
           rmSync(workdir, { recursive: true, force: true });
         }),
       );
@@ -651,11 +670,57 @@ describe("legacyStartSetupLocalDatabase", () => {
       );
     });
 
+    it.effect("skips the legacy catalog when the default next engine is enabled", () => {
+      const workdir = makeWorkdir();
+      writeConfigToml(workdir, "[experimental.pgdelta]\nenabled = true\n");
+      const { session } = fakeSession();
+      const out = mockOutput();
+      const docker = mockDockerRun();
+      const edgeRuntime = mockEdgeRuntime({ stdout: '{"snapshot":"ok"}' });
+      return run(baseInput(workdir, session, { majorVersion: 14 }), out, docker, edgeRuntime).pipe(
+        Effect.map(() => {
+          expect(edgeRuntime.calls).toHaveLength(0);
+          rmSync(workdir, { recursive: true, force: true });
+        }),
+      );
+    });
+
+    it.effect("caches the migrations catalog for the legacy engine after MigrateAndSeed", () => {
+      const workdir = makeWorkdir();
+      writeConfigToml(workdir, "[experimental.pgdelta]\nenabled = true\n");
+      writeFileSync(join(workdir, "supabase", ".env"), "SUPABASE_USE_PG_DELTA_NEXT=false\n");
+      const { session } = fakeSession();
+      const out = mockOutput();
+      const docker = mockDockerRun();
+      const edgeRuntime = mockEdgeRuntime({ stdout: '{"snapshot":"ok"}' });
+      return run(baseInput(workdir, session, { majorVersion: 14 }), out, docker, edgeRuntime).pipe(
+        Effect.map(() => {
+          expect(edgeRuntime.calls).toHaveLength(1);
+          expect(out.stderrText).not.toContain("failed to cache migrations catalog");
+          const tempDir = join(workdir, "supabase", ".temp", "pgdelta");
+          const catalogFiles = readdirSync(tempDir).filter((name) =>
+            name.startsWith("catalog-local-migrations-"),
+          );
+          expect(catalogFiles).toHaveLength(1);
+          expect(readFileSync(join(tempDir, catalogFiles[0]!), "utf8")).toBe('{"snapshot":"ok"}');
+          rmSync(workdir, { recursive: true, force: true });
+        }),
+      );
+    });
+
     it.effect(
-      "caches the migrations catalog after MigrateAndSeed when [experimental.pgdelta] is enabled",
+      "skips the legacy catalog when an empty shell value shadows a project .env false (godotenv parity)",
       () => {
+        // godotenv.Load never replaces a shell value, including an empty one, so
+        // an empty `SUPABASE_USE_PG_DELTA_NEXT` in the shell must suppress the
+        // `supabase/.env` fallback below and resolve to the next implementation —
+        // matching the engine-selector layer's own precedence rather than
+        // `toml.envLookup`'s (which treats an empty shell value as unset).
+        const prev = process.env["SUPABASE_USE_PG_DELTA_NEXT"];
+        process.env["SUPABASE_USE_PG_DELTA_NEXT"] = "";
         const workdir = makeWorkdir();
         writeConfigToml(workdir, "[experimental.pgdelta]\nenabled = true\n");
+        writeFileSync(join(workdir, "supabase", ".env"), "SUPABASE_USE_PG_DELTA_NEXT=false\n");
         const { session } = fakeSession();
         const out = mockOutput();
         const docker = mockDockerRun();
@@ -667,16 +732,15 @@ describe("legacyStartSetupLocalDatabase", () => {
           edgeRuntime,
         ).pipe(
           Effect.map(() => {
-            expect(edgeRuntime.calls).toHaveLength(1);
-            expect(out.stderrText).not.toContain("failed to cache migrations catalog");
-            const tempDir = join(workdir, "supabase", ".temp", "pgdelta");
-            const catalogFiles = readdirSync(tempDir).filter((name) =>
-              name.startsWith("catalog-local-migrations-"),
-            );
-            expect(catalogFiles).toHaveLength(1);
-            expect(readFileSync(join(tempDir, catalogFiles[0]!), "utf8")).toBe('{"snapshot":"ok"}');
+            expect(edgeRuntime.calls).toHaveLength(0);
             rmSync(workdir, { recursive: true, force: true });
           }),
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (prev === undefined) delete process.env["SUPABASE_USE_PG_DELTA_NEXT"];
+              else process.env["SUPABASE_USE_PG_DELTA_NEXT"] = prev;
+            }),
+          ),
         );
       },
     );
@@ -686,7 +750,10 @@ describe("legacyStartSetupLocalDatabase", () => {
       () => {
         const workdir = makeWorkdir();
         mkdirSync(join(workdir, "supabase"), { recursive: true });
-        writeFileSync(join(workdir, "supabase", ".env"), "SUPABASE_EXPERIMENTAL_PG_DELTA=true\n");
+        writeFileSync(
+          join(workdir, "supabase", ".env"),
+          "SUPABASE_EXPERIMENTAL_PG_DELTA=true\nSUPABASE_USE_PG_DELTA_NEXT=false\n",
+        );
         const { session } = fakeSession();
         const out = mockOutput();
         const docker = mockDockerRun();
@@ -724,7 +791,7 @@ describe("legacyStartSetupLocalDatabase", () => {
         mkdirSync(join(workdir, "supabase"), { recursive: true });
         writeFileSync(
           join(workdir, "supabase", ".env"),
-          "PGDELTA_NPM_REGISTRY=https://registry.example.com/supabase\n",
+          "PGDELTA_NPM_REGISTRY=https://registry.example.com/supabase\nSUPABASE_USE_PG_DELTA_NEXT=false\n",
         );
         const { session } = fakeSession();
         const out = mockOutput();
@@ -763,6 +830,7 @@ describe("legacyStartSetupLocalDatabase", () => {
       () => {
         const workdir = makeWorkdir();
         writeConfigToml(workdir, "[experimental.pgdelta]\nenabled = true\n");
+        writeFileSync(join(workdir, "supabase", ".env"), "SUPABASE_USE_PG_DELTA_NEXT=false\n");
         const { session } = fakeSession();
         const out = mockOutput();
         const docker = mockDockerRun();
@@ -783,6 +851,208 @@ describe("legacyStartSetupLocalDatabase", () => {
           }),
         );
       },
+    );
+  });
+});
+
+describe("legacyResolveDbSetupPrelude", () => {
+  const run = (
+    setup: {
+      readonly majorVersion: number;
+      readonly realtimeEnabledForSetup: boolean;
+      readonly jwks: Effect.Effect<string, Error>;
+    },
+    out: ReturnType<typeof mockOutput>,
+  ) =>
+    legacyResolveDbSetupPrelude({ ...setup, serviceVersionOverrides: {} }).pipe(
+      Effect.provide(out.layer),
+    );
+
+  it.effect('prints "Initialising schema..." to stderr exactly once, for either PG branch', () => {
+    const out = mockOutput();
+    return run(
+      { majorVersion: 17, realtimeEnabledForSetup: false, jwks: Effect.succeed("") },
+      out,
+    ).pipe(
+      Effect.map(() => {
+        const banner = out.rawChunks.filter((c) => c.text === "Initialising schema...\n");
+        expect(banner.length).toBe(1);
+        expect(banner[0]?.stream).toBe("stderr");
+      }),
+    );
+  });
+
+  it.effect(
+    'prints the banner BEFORE a JWKS resolution failure — matching Go\'s "initSchema" printing the banner before ever calling "initSchema15" -> "ResolveJWKS" (review: PRRT_kwDOErm0O86W6R-O)',
+    () => {
+      const out = mockOutput();
+      return run(
+        {
+          majorVersion: 15,
+          realtimeEnabledForSetup: true,
+          jwks: Effect.fail(new Error("jwks discovery failed")),
+        },
+        out,
+      ).pipe(
+        Effect.flip,
+        Effect.map((error) => {
+          expect(error.message).toBe("jwks discovery failed");
+          const banner = out.rawChunks.filter((c) => c.text === "Initialising schema...\n");
+          expect(banner.length).toBe(1);
+          expect(banner[0]?.stream).toBe("stderr");
+        }),
+      );
+    },
+  );
+
+  it.effect(
+    "does not resolve JWKS on PG <= 14 even with realtime enabled — Go's initSchema never reaches initSchema15 there",
+    () => {
+      const out = mockOutput();
+      let jwksCalled = false;
+      const jwks = Effect.sync(() => {
+        jwksCalled = true;
+        return "unused";
+      });
+      return run({ majorVersion: 14, realtimeEnabledForSetup: true, jwks }, out).pipe(
+        Effect.map((resolved) => {
+          expect(jwksCalled).toBe(false);
+          expect(resolved.jwks).toBe("");
+        }),
+      );
+    },
+  );
+});
+
+/**
+ * `supabase start` on an EXISTING volume never replays migrations, so this
+ * convergence is the only thing that can reconcile the volume's pg_net with the
+ * current `[experimental.webhooks]` setting — in both directions, and without ever
+ * dropping an extension a user's own migration created.
+ */
+describe("legacyRunDatabaseWebhooksSetup", () => {
+  const PG_NET_DROP_FINGERPRINT = "drop extension if exists pg_net";
+
+  function fakeWebhooksSession(opts: {
+    readonly appliedStatements?: ReadonlyArray<ReadonlyArray<string> | null>;
+    readonly historyUnavailable?: boolean;
+  }) {
+    const execSql: Array<string> = [];
+    const session: LegacyDbSession = {
+      exec: (sql) =>
+        Effect.sync(() => {
+          execSql.push(sql);
+        }),
+      execBatch: (statements) =>
+        Effect.sync(() => {
+          for (const { sql } of statements) execSql.push(sql);
+        }),
+      query: (sql) =>
+        sql.includes("supabase_migrations.schema_migrations")
+          ? opts.historyUnavailable === true
+            ? Effect.fail(
+                new LegacyDbExecError({ message: 'relation "schema_migrations" does not exist' }),
+              )
+            : Effect.succeed(
+                (opts.appliedStatements ?? []).map((statements, index) => ({
+                  version: `2024010100000${index}`,
+                  name: "migration",
+                  statements,
+                })),
+              )
+          : Effect.succeed([]),
+      extensionExists: () => Effect.succeed(false),
+      copyToCsv: () => Effect.succeed(new Uint8Array()),
+      queryRaw: () => Effect.succeed({ fields: [], rows: [], commandTag: "" }),
+    };
+    return { session, execSql };
+  }
+
+  const converge = (
+    enabled: boolean,
+    sessionOpts: Parameters<typeof fakeWebhooksSession>[0] = {},
+  ) => {
+    const { session, execSql } = fakeWebhooksSession(sessionOpts);
+    const dbConnection = Layer.succeed(LegacyDbConnection, {
+      connect: () => Effect.succeed(session),
+    });
+    return {
+      execSql,
+      effect: Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        yield* legacyRunDatabaseWebhooksSetup({
+          fs,
+          path,
+          hostname: "127.0.0.1",
+          dbPort: 54322,
+          dbUrl: "postgresql://postgres:postgres@127.0.0.1:5432/postgres",
+          enabled,
+        });
+      }).pipe(Effect.provide(Layer.mergeAll(dbConnection, BunServices.layer))),
+    };
+  };
+
+  it.effect("installs pg_net when Database Webhooks are enabled", () => {
+    const { execSql, effect } = converge(true);
+    return effect.pipe(
+      Effect.map(() => {
+        expect(execSql.some((sql) => sql.includes(PG_NET_CREATE_FINGERPRINT))).toBe(true);
+        expect(execSql.some((sql) => sql.includes(PG_NET_DROP_FINGERPRINT))).toBe(false);
+      }),
+    );
+  });
+
+  it.effect("drops pg_net when disabled and no applied migration installs it", () => {
+    const { execSql, effect } = converge(false, {
+      appliedStatements: [["create table public.items (id int)"]],
+    });
+    return effect.pipe(
+      Effect.map(() => {
+        expect(execSql.some((sql) => sql.includes(PG_NET_DROP_FINGERPRINT))).toBe(true);
+        expect(execSql.some((sql) => sql.includes(PG_NET_CREATE_FINGERPRINT))).toBe(false);
+      }),
+    );
+  });
+
+  it.effect("preserves pg_net created by an applied migration", () => {
+    const { execSql, effect } = converge(false, {
+      appliedStatements: [
+        ["create table public.items (id int)"],
+        ['CREATE EXTENSION IF NOT EXISTS "pg_net" WITH SCHEMA extensions'],
+      ],
+    });
+    return effect.pipe(
+      Effect.map(() => {
+        expect(execSql.some((sql) => sql.includes(PG_NET_DROP_FINGERPRINT))).toBe(false);
+      }),
+    );
+  });
+
+  it.effect.each([
+    { historyValue: null, description: "NULL" },
+    { historyValue: [], description: "an empty array" },
+  ])(
+    "preserves pg_net when an applied history row records $description for statements",
+    ({ historyValue }) => {
+      // Older volumes store NULL/`{}` in `schema_migrations.statements`. That is
+      // incomplete evidence, not proof the migration did not install pg_net.
+      const { execSql, effect } = converge(false, { appliedStatements: [historyValue] });
+      return effect.pipe(
+        Effect.map(() => {
+          expect(execSql.some((sql) => sql.includes(PG_NET_DROP_FINGERPRINT))).toBe(false);
+        }),
+      );
+    },
+  );
+
+  it.effect("preserves pg_net when the migration history cannot be read", () => {
+    // Erring toward not dropping: an unreadable history is treated as ownership.
+    const { execSql, effect } = converge(false, { historyUnavailable: true });
+    return effect.pipe(
+      Effect.map(() => {
+        expect(execSql.some((sql) => sql.includes(PG_NET_DROP_FINGERPRINT))).toBe(false);
+      }),
     );
   });
 });

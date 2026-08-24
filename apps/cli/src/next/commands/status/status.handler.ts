@@ -1,11 +1,11 @@
 import { Effect, Option } from "effect";
+import { loadProjectConfig } from "@supabase/config";
 import {
   connectLayer,
   fillServiceVersionManifest,
-  resolveManagedStack,
   resolveStackSummary,
-  StateManager,
   Stack,
+  type StackSummary,
 } from "@supabase/stack/effect";
 import { CliConfig } from "../../config/cli-config.service.ts";
 import { ProjectHome } from "../../config/project-home.service.ts";
@@ -13,6 +13,9 @@ import { resolveServiceVersionContext } from "../../config/service-version-resol
 import { Output } from "../../../shared/output/output.service.ts";
 import { RuntimeInfo } from "../../../shared/runtime/runtime-info.service.ts";
 import type { StatusFlags } from "./status.command.ts";
+import { managedPortIntents } from "../../config/managed-port-intents.ts";
+import { isExcludedStackService, toStartStackConfig } from "../../config/stack-config.ts";
+import { formatPortDriftWarning } from "../../stack/port-drift.ts";
 
 function formatServiceStateLine(service: {
   readonly name: string;
@@ -27,6 +30,29 @@ function formatServiceStateLine(service: {
 function formatPortsLine(ports: { readonly apiPort: number; readonly dbPort: number }) {
   return `Ports: API ${ports.apiPort}, DB ${ports.dbPort}`;
 }
+
+const resolveConfiguredSummary = Effect.fnUntraced(function* (input: {
+  readonly cacheRoot: string;
+  readonly projectDir: string;
+  readonly cwd: string;
+  readonly name: string;
+}) {
+  const current = yield* resolveStackSummary(input);
+  const loaded = yield* loadProjectConfig(input.projectDir);
+  const excluded = (current.launch.excludedServices ?? []).filter(isExcludedStackService);
+  const mode = current.launch.mode;
+  return yield* resolveStackSummary({
+    ...input,
+    portDocument: managedPortIntents(toStartStackConfig(excluded, mode), loaded ?? undefined),
+  });
+});
+
+const renderPortDrift = Effect.fnUntraced(function* (drift: NonNullable<StackSummary["drift"]>) {
+  const message = formatPortDriftWarning(drift);
+  if (message === undefined) return;
+  const output = yield* Output;
+  yield* output.warn(message);
+});
 
 const renderUpdateStatus = Effect.fnUntraced(function* (
   updates: ReadonlyArray<{
@@ -56,7 +82,6 @@ export const status = Effect.fnUntraced(function* (_flags: StatusFlags) {
   const cliConfig = yield* CliConfig;
   const projectHome = yield* ProjectHome;
   const runtimeInfo = yield* RuntimeInfo;
-  const stateManager = yield* StateManager;
 
   yield* output.intro("Show local Supabase stack status");
 
@@ -64,24 +89,24 @@ export const status = Effect.fnUntraced(function* (_flags: StatusFlags) {
     cwd: runtimeInfo.cwd,
     cacheRoot: cliConfig.supabaseHome,
     projectDir: projectHome.projectRoot,
-    projectStateRoot: projectHome.projectHomeDir,
     name: _flags.stack,
   }).pipe(
     Effect.map(Option.some),
     Effect.catchTag("NoRunningStackError", () => Effect.succeed(Option.none())),
   );
 
-  if (layer._tag === "None") {
-    const summary = yield* resolveStackSummary({
+  if (Option.isNone(layer)) {
+    const summary = yield* resolveConfiguredSummary({
       cacheRoot: cliConfig.supabaseHome,
-      projectStateRoot: projectHome.projectHomeDir,
+      projectDir: projectHome.projectRoot,
+      cwd: runtimeInfo.cwd,
       name: _flags.stack,
     }).pipe(
       Effect.map(Option.some),
       Effect.catchTag("NoRunningStackError", () => Effect.succeed(Option.none())),
     );
 
-    if (summary._tag === "None") {
+    if (Option.isNone(summary)) {
       const message = "No local Supabase stack is running for this project.";
       if (output.format === "text") {
         yield* output.outro(message);
@@ -93,7 +118,10 @@ export const status = Effect.fnUntraced(function* (_flags: StatusFlags) {
     }
 
     const message = "Local Supabase stack is stopped.";
-    const serviceVersionContext = yield* resolveServiceVersionContext([], summary.value.versions);
+    const serviceVersionContext = yield* resolveServiceVersionContext(
+      [],
+      fillServiceVersionManifest(summary.value.versions),
+    );
     const data = {
       stack: summary.value.name,
       running: false,
@@ -125,25 +153,18 @@ export const status = Effect.fnUntraced(function* (_flags: StatusFlags) {
     return;
   }
 
-  const managedStack = yield* resolveManagedStack({
-    cwd: runtimeInfo.cwd,
+  const summary = yield* resolveConfiguredSummary({
     cacheRoot: cliConfig.supabaseHome,
     projectDir: projectHome.projectRoot,
-    projectStateRoot: projectHome.projectHomeDir,
+    cwd: runtimeInfo.cwd,
     name: _flags.stack,
   });
 
   const stack = yield* Effect.provide(Stack, layer.value);
   const [info, services] = yield* Effect.all([stack.getInfo(), stack.getAllStates()]);
-  const existingMetadata = yield* stateManager.readMetadata(managedStack.state.name).pipe(
-    Effect.map(Option.some),
-    Effect.catchTag("StackMetadataNotFoundError", () => Effect.succeed(Option.none())),
-  );
   const serviceVersionContext = yield* resolveServiceVersionContext(
     [],
-    existingMetadata._tag === "Some"
-      ? existingMetadata.value.services
-      : fillServiceVersionManifest(managedStack.state.services),
+    fillServiceVersionManifest(summary.versions),
   );
   const sortedServices = [...services].sort((a, b) => a.name.localeCompare(b.name));
   const allReady = services.every((service) =>
@@ -152,15 +173,16 @@ export const status = Effect.fnUntraced(function* (_flags: StatusFlags) {
   const message = allReady
     ? "Local Supabase stack is running."
     : "Local Supabase stack is running, but some services are not ready.";
+  yield* renderPortDrift(summary.drift ?? []);
   const data = {
-    stack: managedStack.state.name,
+    stack: summary.name,
     running: true,
     api_url: info.url,
     db_url: info.dbUrl,
     publishable_key: info.publishableKey,
     secret_key: info.secretKey,
     service_endpoints: info.serviceEndpoints,
-    versions: managedStack.state.services,
+    versions: summary.versions,
     up_to_date: serviceVersionContext.availableUpdates.length === 0,
     available_updates: serviceVersionContext.availableUpdates.map((updateEntry) => ({
       service: updateEntry.service,
@@ -189,12 +211,12 @@ export const status = Effect.fnUntraced(function* (_flags: StatusFlags) {
     yield* output.warn(message);
   }
 
-  yield* output.info(`Stack: ${managedStack.state.name}`);
+  yield* output.info(`Stack: ${summary.name}`);
   yield* output.info(`API URL: ${info.url}`);
   yield* output.info(`DB URL: ${info.dbUrl}`);
   yield* output.info(`Publishable key: ${info.publishableKey}`);
   yield* output.info(`Secret key: ${info.secretKey}`);
-  for (const [name, version] of Object.entries(managedStack.state.services).sort(([a], [b]) =>
+  for (const [name, version] of Object.entries(summary.versions).sort(([a], [b]) =>
     a.localeCompare(b),
   )) {
     yield* output.info(`${name} version: ${version}`);

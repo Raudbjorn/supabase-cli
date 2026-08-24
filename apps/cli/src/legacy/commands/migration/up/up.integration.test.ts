@@ -11,6 +11,7 @@ import {
   mockLegacyLinkedProjectCacheTracked,
   mockLegacyTelemetryStateTracked,
   useLegacyTempWorkdir,
+  legacySequentialExecBatch,
 } from "../../../../../tests/helpers/legacy-mocks.ts";
 import { mockOutput } from "../../../../../tests/helpers/mocks.ts";
 import { CliArgs } from "../../../../shared/cli/cli-args.service.ts";
@@ -23,7 +24,10 @@ import type {
   LegacyResolvedDbConfig,
 } from "../../../shared/legacy-db-config.types.ts";
 import { LegacyDbExecError } from "../../../shared/legacy-db-connection.errors.ts";
-import { LegacyDbConnection } from "../../../shared/legacy-db-connection.service.ts";
+import {
+  type LegacyDbSession,
+  LegacyDbConnection,
+} from "../../../shared/legacy-db-connection.service.ts";
 import { LegacyMigrationVaultError } from "../../../shared/legacy-vault.ts";
 import { legacyMigrationUp } from "./up.handler.ts";
 import type { LegacyMigrationUpFlags } from "./up.command.ts";
@@ -69,8 +73,8 @@ function setup(workdir: string, opts: SetupOpts = {}) {
   });
 
   const connection = Layer.succeed(LegacyDbConnection, {
-    connect: () =>
-      Effect.succeed({
+    connect: () => {
+      const session: LegacyDbSession = {
         exec: (sql: string) =>
           Effect.suspend(() => {
             execs.push(sql);
@@ -94,14 +98,25 @@ function setup(workdir: string, opts: SetupOpts = {}) {
         extensionExists: () => Effect.succeed(false),
         copyToCsv: () => Effect.succeed(new Uint8Array()),
         queryRaw: () => Effect.succeed({ fields: [], rows: [], commandTag: "" }),
-      }),
+        // A migration file's statements arrive as one batch; replay them through
+        // `exec`/`query` so this suite's recordings and failure injection still apply.
+        execBatch: (statements) => legacySequentialExecBatch(session)(statements),
+      };
+      return Effect.succeed(session);
+    },
   });
 
+  // `loadProjectRef` gives an explicit `--project-ref` flag top precedence, same
+  // as Go's `flags.LoadProjectRef` — mirror that so a test can prove the flag
+  // (not just the hardcoded `LEGACY_VALID_REF` fallback) drives the linked ref.
   const projectRef = Layer.succeed(LegacyProjectRefResolver, {
     resolve: () => Effect.succeed(LEGACY_VALID_REF),
     resolveForLink: () => Effect.succeed(LEGACY_VALID_REF),
     resolveOptional: () => Effect.succeed(Option.some(LEGACY_VALID_REF)),
-    loadProjectRef: () => Effect.succeed(LEGACY_VALID_REF),
+    loadProjectRef: (flagValue: Option.Option<string>) =>
+      Effect.succeed(
+        Option.isSome(flagValue) && flagValue.value.length > 0 ? flagValue.value : LEGACY_VALID_REF,
+      ),
     promptProjectRef: () => Effect.succeed(LEGACY_VALID_REF),
   });
 
@@ -117,7 +132,7 @@ function setup(workdir: string, opts: SetupOpts = {}) {
     Layer.succeed(CliArgs, { args: opts.args ?? [] }),
     BunServices.layer,
   );
-  return { layer, out, telemetry, execs, queries };
+  return { layer, out, telemetry, execs, queries, cache };
 }
 
 const flags = (over: Partial<LegacyMigrationUpFlags> = {}): LegacyMigrationUpFlags => ({
@@ -125,6 +140,7 @@ const flags = (over: Partial<LegacyMigrationUpFlags> = {}): LegacyMigrationUpFla
   dbUrl: over.dbUrl ?? Option.none(),
   linked: over.linked ?? false,
   local: over.local ?? true,
+  projectRef: over.projectRef ?? Option.none(),
 });
 
 const seed = (workdir: string, name: string, body = "create table a;\n") => {
@@ -149,13 +165,13 @@ describe("legacy migration up", () => {
       yield* legacyMigrationUp(flags());
       const stderr = stripAnsi(out.stderrText);
       const stdout = stripAnsi(out.stdoutText);
-      // Go prints the connection banner to stderr before dialing (connect.go:343-348).
+      // The connection banner prints to stderr before dialing.
       expect(stderr).toContain("Connecting to local database...");
       expect(stderr).toContain("Applying migration 20240102000000_b.sql...");
       expect(stderr).toContain("Applying migration 20240103000000_c.sql...");
       expect(stdout).toContain("Local database is up to date.");
-      // Lock Go's channel split: "Applying ..." is stderr (`fmt.Fprintf(os.Stderr, ...)`)
-      // and the final "up to date" is stdout (`fmt.Println`) — neither bleeds across.
+      // Lock the channel split: "Applying ..." is stderr
+      // and the final "up to date" is stdout — neither bleeds across.
       expect(stdout).not.toContain("Applying migration");
       expect(stderr).not.toContain("Local database is up to date.");
       expect(insertedVersions(queries)).toEqual(["20240102000000", "20240103000000"]);
@@ -202,7 +218,7 @@ describe("legacy migration up", () => {
     const { layer, queries } = setup(tmp.current, { remote: ["20240102000000"] });
     return Effect.gen(function* () {
       yield* legacyMigrationUp(flags({ includeAll: true }));
-      // Go appends the trailing pending set after the out-of-order set.
+      // The trailing pending set is appended after the out-of-order set.
       expect(insertedVersions(queries)).toEqual(["20240101000000", "20240103000000"]);
     }).pipe(Effect.provide(layer));
   });
@@ -268,6 +284,50 @@ describe("legacy migration up", () => {
           "LegacyMigrationTargetFlagsError",
         );
       }
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.live(
+    "applies on the project given via --project-ref --linked, overriding the linked ref",
+    () => {
+      // up defaults to local; only with --linked does the flag's ref get cached.
+      // The fake resolver's own fallback (LEGACY_VALID_REF) represents whatever
+      // the workdir would resolve to absent the flag — the flag must win over it.
+      const FLAG_REF = "flagflagflagflagflag";
+      const { layer, cache } = setup(tmp.current, { args: ["--linked"], remote: [] });
+      return Effect.gen(function* () {
+        yield* legacyMigrationUp(
+          flags({ linked: true, local: false, projectRef: Option.some(FLAG_REF) }),
+        );
+        expect(cache.cached).toBe(true);
+        expect(cache.cachedRef).toBe(FLAG_REF);
+        expect(cache.cachedRef).not.toBe(LEGACY_VALID_REF);
+      }).pipe(Effect.provide(layer));
+    },
+  );
+
+  it.live("rejects --project-ref on the default local target", () => {
+    // up defaults to local when no target flag is set — the guard must fire
+    // from the flag alone, with no explicit --local/--db-url needed.
+    const FLAG_REF = "flagflagflagflagflag";
+    const { layer, execs, queries, cache } = setup(tmp.current, { remote: [] });
+    return Effect.gen(function* () {
+      const exit = yield* legacyMigrationUp(flags({ projectRef: Option.some(FLAG_REF) })).pipe(
+        Effect.exit,
+      );
+      expect(Exit.isFailure(exit)).toBe(true);
+      if (Exit.isFailure(exit)) {
+        const failure = Cause.findErrorOption(exit.cause);
+        expect(Option.isSome(failure) && failure.value._tag).toBe(
+          "LegacyMigrationTargetFlagsError",
+        );
+        expect(Option.isSome(failure) && (failure.value as { message: string }).message).toBe(
+          "--project-ref only applies when targeting the linked project; use it with --linked (not --local or --db-url)",
+        );
+      }
+      expect(execs).toEqual([]);
+      expect(queries).toEqual([]);
+      expect(cache.cached).toBe(false);
     }).pipe(Effect.provide(layer));
   });
 

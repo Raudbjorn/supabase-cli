@@ -1,7 +1,7 @@
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as http from "node:http";
 import { gzipSync } from "node:zlib";
-import { Effect, Layer, ManagedRuntime } from "effect";
+import { Effect, Layer, ManagedRuntime, Predicate } from "effect";
 import { FetchHttpClient } from "effect/unstable/http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { ApiProxy, type ProxyConfig } from "./ApiProxy.ts";
@@ -129,7 +129,7 @@ async function startProxy(
   const proxy = await proxyRuntime.runPromise(ApiProxy);
   const addr = proxy.address;
   let url = "";
-  if (addr._tag === "TcpAddress") {
+  if (Predicate.isTagged(addr, "TcpAddress")) {
     const host = addr.hostname === "0.0.0.0" ? "127.0.0.1" : addr.hostname;
     url = `http://${host}:${addr.port}`;
   }
@@ -176,7 +176,7 @@ describe("ApiProxy", () => {
 
     const proxy = await runtime.runPromise(ApiProxy);
     const addr = proxy.address;
-    if (addr._tag === "TcpAddress") {
+    if (Predicate.isTagged(addr, "TcpAddress")) {
       const host = addr.hostname === "0.0.0.0" ? "127.0.0.1" : addr.hostname;
       proxyUrl = `http://${host}:${addr.port}`;
     }
@@ -411,16 +411,14 @@ describe("ApiProxy", () => {
   // ---------------------------------------------------------------------------
 
   test("returns 502 when backend is unreachable", async () => {
-    // Build a second proxy that points all routes to a port with nothing listening.
-    // Use a port that was assigned then freed so we know nothing is there.
+    // Keep ownership of the backend endpoint and deterministically refuse every
+    // connection. A released port could be reclaimed by another process.
     const deadServer = await new Promise<http.Server>((resolve) => {
-      const s = http.createServer();
+      const s = http.createServer((request) => request.socket.destroy());
       s.listen(0, "127.0.0.1", () => resolve(s));
     });
     const deadAddr = deadServer.address() as { port: number };
     const deadPort = deadAddr.port;
-    await new Promise<void>((res) => deadServer.close(() => res()));
-
     const deadConfig: ProxyConfig = {
       listenPort: 0,
       gotruePort: deadPort,
@@ -444,7 +442,7 @@ describe("ApiProxy", () => {
       const deadProxy = await deadRuntime.runPromise(ApiProxy);
       const deadAddr2 = deadProxy.address;
       let deadProxyUrl = "";
-      if (deadAddr2._tag === "TcpAddress") {
+      if (Predicate.isTagged(deadAddr2, "TcpAddress")) {
         const host = deadAddr2.hostname === "0.0.0.0" ? "127.0.0.1" : deadAddr2.hostname;
         deadProxyUrl = `http://${host}:${deadAddr2.port}`;
       }
@@ -453,6 +451,9 @@ describe("ApiProxy", () => {
       expect(res.status).toBe(502);
     } finally {
       await deadRuntime.dispose();
+      await new Promise<void>((resolve, reject) =>
+        deadServer.close((error) => (error === undefined ? resolve() : reject(error))),
+      );
     }
   });
 

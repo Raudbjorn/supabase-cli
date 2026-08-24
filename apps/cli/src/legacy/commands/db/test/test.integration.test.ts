@@ -1,6 +1,6 @@
 /**
- * `db test` is a hidden Go-parity alias that reuses `test db`'s flag config
- * and assembled handler verbatim (see `test.command.ts`). The core pgTAP
+ * `db test` is a hidden alias that reuses `test db`'s flag config and
+ * assembled handler verbatim (see `test.command.ts`). The core pgTAP
  * enable/disable + `pg_prove` docker-invocation behavior is already
  * exhaustively covered by `../../../shared/legacy-test-db.integration.test.ts` (calling the
  * same `legacyTestDb` this alias ultimately runs), so this file focuses on
@@ -10,9 +10,8 @@
  *    `legacyRunTestDbCommand` (one golden path + one failure path), proving
  *    the delegation itself is wired correctly.
  * 2. The `cli_command_executed` telemetry `command` property records the
- *    ACTUAL invoked path — `"db test"`, not `"test db"` — matching Go's
- *    `cmd.CommandPath()` (`cmd/root_analytics.go:33`), which differs between
- *    the two entry points even though `RunE`/the handler is identical. This
+ *    ACTUAL invoked path — `"db test"`, not `"test db"` — which differs
+ *    between the two entry points even though the handler is identical. This
  *    is proven by dispatching through the REAL exported `legacyDbTestCommand`
  *    (via `Command.runWith` on a minimal root, mirroring
  *    `../../../../shared/cli/hidden-flag.unit.test.ts`'s pattern) rather than
@@ -49,6 +48,7 @@ import {
 import {
   mockLegacyCliConfig,
   mockLegacyTelemetryStateTracked,
+  legacySequentialExecBatch,
 } from "../../../../../tests/helpers/legacy-mocks.ts";
 import { CliArgs } from "../../../../shared/cli/cli-args.service.ts";
 import { commandRuntimeLayer } from "../../../../shared/runtime/command-runtime.layer.ts";
@@ -79,6 +79,8 @@ import {
   LegacyDockerRun,
   type LegacyDockerRunOpts,
 } from "../../../shared/legacy-docker-run.service.ts";
+import { LegacyEdgeRuntimeScript } from "../../../shared/legacy-edge-runtime-script.service.ts";
+import { LegacyPgDeltaSslProbe } from "../../../shared/legacy-pgdelta-ssl-probe.service.ts";
 import { legacyRunTestDbCommand } from "../../../shared/legacy-test-db.command-handler.ts";
 import { LegacyGoProxy } from "../../../../shared/legacy/go-proxy.service.ts";
 import { legacyDbCommand } from "../db.command.ts";
@@ -123,6 +125,7 @@ function mockDbConnection() {
       Effect.sync(() => {
         execCalls.push(sql);
       }),
+    execBatch: (statements) => legacySequentialExecBatch(session)(statements),
     extensionExists: () => Effect.succeed(false),
     queryRaw: () => Effect.succeed({ fields: [], rows: [], commandTag: "" }),
     copyToCsv: () => Effect.succeed(new Uint8Array()),
@@ -134,7 +137,7 @@ function mockDbConnection() {
   return { layer, execCalls };
 }
 
-function mockDockerRun(opts: { exitCode?: number } = {}) {
+function mockDockerRun(opts: { exitCode?: number; stdout?: ReadonlyArray<string> } = {}) {
   let lastOpts: LegacyDockerRunOpts | undefined;
   const layer = Layer.succeed(LegacyDockerRun, {
     run: (runOpts) => {
@@ -149,9 +152,15 @@ function mockDockerRun(opts: { exitCode?: number } = {}) {
         stderr: "",
       });
     },
-    runStream: (runOpts) => {
+    runStream: (runOpts, streamOpts) => {
       lastOpts = runOpts;
-      return Effect.succeed({ exitCode: opts.exitCode ?? 0, stderr: "" });
+      return Effect.gen(function* () {
+        const encoder = new TextEncoder();
+        for (const chunk of opts.stdout ?? []) {
+          yield* streamOpts.onStdout(encoder.encode(chunk));
+        }
+        return { exitCode: opts.exitCode ?? 0, stderr: "" };
+      });
     },
   });
   return {
@@ -174,6 +183,7 @@ const runtimeInfoLayer = Layer.succeed(RuntimeInfo, {
 interface SetupOpts {
   format?: "text" | "json" | "stream-json";
   exitCode?: number;
+  stdout?: ReadonlyArray<string>;
 }
 
 function setup(opts: SetupOpts = {}) {
@@ -182,7 +192,7 @@ function setup(opts: SetupOpts = {}) {
   const analytics = mockContextualAnalytics();
   const telemetry = mockLegacyTelemetryStateTracked();
   const connection = mockDbConnection();
-  const docker = mockDockerRun({ exitCode: opts.exitCode });
+  const docker = mockDockerRun({ exitCode: opts.exitCode, stdout: opts.stdout });
   const args = ["db", "test"];
   const layer = Layer.mergeAll(
     out.layer,
@@ -210,6 +220,7 @@ const flags = () => ({
   dbUrl: Option.none<string>(),
   linked: false,
   local: true,
+  projectRef: Option.none<string>(),
 });
 
 describe("legacy db test (alias) integration", () => {
@@ -268,6 +279,14 @@ describe("legacy db test (alias) integration", () => {
           exec: () => Effect.die("LegacyGoProxy not needed for `db test` dispatch"),
           execCapture: () => Effect.die("LegacyGoProxy not needed for `db test` dispatch"),
         }),
+        Layer.succeed(LegacyEdgeRuntimeScript, {
+          run: () => Effect.die("LegacyEdgeRuntimeScript not needed for `db test` dispatch"),
+        }),
+        Layer.succeed(LegacyPgDeltaSslProbe, {
+          requireSsl: () => Effect.die("LegacyPgDeltaSslProbe not needed for `db test` dispatch"),
+          requireSslForHost: () =>
+            Effect.die("LegacyPgDeltaSslProbe not needed for `db test` dispatch"),
+        }),
       );
       const root = Command.make("supabase").pipe(
         Command.withGlobalFlags(LEGACY_GLOBAL_FLAGS),
@@ -298,13 +317,41 @@ describe("legacy db test (alias) integration", () => {
     () => {
       const { layer, out, processControl } = setup({ format: "json", exitCode: 1 });
       return Effect.gen(function* () {
-        // Succeeds (no thrown/failed Effect) so a JSON error envelope is never
-        // appended after the TAP stream — matching Go's `recoverAndExit`
-        // (stderr + os.Exit(1), never corrupting stdout).
+        // Succeeds (no thrown/failed Effect) so a JSON error envelope is
+        // never appended after the TAP stream — established output
+        // contract: stderr + exit 1, never corrupting stdout.
         yield* legacyRunTestDbCommand(flags());
         expect(out.stderrText).toContain("error running container: exit 1");
         expect(processControl.exitCode).toBe(1);
       }).pipe(Effect.provide(layer));
     },
   );
+
+  it.live("fails in text mode when the run found no tests", () => {
+    const { layer, processControl } = setup({
+      exitCode: 0,
+      stdout: ["Files=0, Tests=0,  0 wallclock secs\nResult: NOTESTS\n"],
+    });
+    return Effect.gen(function* () {
+      const exit = yield* Effect.exit(legacyRunTestDbCommand(flags()));
+      expect(exit._tag).toBe("Failure");
+      // Text mode lets the failed Effect drive the exit code, as for a run failure.
+      expect(processControl.exitCode).toBeUndefined();
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.live("in json mode, a run that found no tests takes the same stderr + exit 1 path", () => {
+    const { layer, out, processControl } = setup({
+      format: "json",
+      exitCode: 0,
+      stdout: ["Files=0, Tests=0,  0 wallclock secs\nResult: NOTESTS\n"],
+    });
+    return Effect.gen(function* () {
+      yield* legacyRunTestDbCommand(flags());
+      expect(out.stderrText).toContain("no pgTAP tests found in /work/project/supabase/tests");
+      expect(processControl.exitCode).toBe(1);
+      // The TAP stream reached stdout intact, with no JSON envelope appended.
+      expect(out.stdoutText).toBe("Files=0, Tests=0,  0 wallclock secs\nResult: NOTESTS\n");
+    }).pipe(Effect.provide(layer));
+  });
 });

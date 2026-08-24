@@ -137,13 +137,34 @@ describe("native hidden flags", () => {
             "--backup=false",
           ]).pipe(Effect.exit);
           expect(JSON.stringify(stopExit)).not.toContain("UnrecognizedFlag");
+          // `functions download --use-docker` now runs the native Docker-unbundle
+          // path (CLI-1963) instead of forwarding to `LegacyGoProxy` — the
+          // deliberately-invalid slug makes it fail at `validateSlug`
+          // (`download.ts`, checked BEFORE `isDockerRunning`/any image pull),
+          // so the invocation stays fast and side-effect-free even on a CI
+          // runner with a live Docker daemon (a valid slug here triggered a
+          // real multi-second `docker pull` and timed this test out), while
+          // still proving the hidden flag parses by exact name.
+          // `--legacy-bundle` is the one remaining case that still forwards to the
+          // proxy, asserted below.
+          const downloadUseDockerExit = yield* Command.runWith(legacyTestRoot, {
+            version: "0.0.0-test",
+          })([
+            "functions",
+            "download",
+            "Not_A_Valid-Slug!",
+            "--project-ref",
+            "abcdefghijklmnopqrst",
+            "--use-docker",
+          ]).pipe(Effect.exit);
+          expect(JSON.stringify(downloadUseDockerExit)).not.toContain("UnrecognizedFlag");
           yield* Command.runWith(legacyTestRoot, { version: "0.0.0-test" })([
             "functions",
             "download",
             "hello",
             "--project-ref",
             "abcdefghijklmnopqrst",
-            "--use-docker",
+            "--legacy-bundle",
           ]);
           const useDockerExit = yield* Command.runWith(legacyTestRoot, {
             version: "0.0.0-test",
@@ -171,7 +192,14 @@ describe("native hidden flags", () => {
     );
 
     expect(proxy.calls).toEqual([
-      ["functions", "download", "hello", "--project-ref", "abcdefghijklmnopqrst", "--use-docker"],
+      [
+        "functions",
+        "download",
+        "hello",
+        "--project-ref",
+        "abcdefghijklmnopqrst",
+        "--legacy-bundle",
+      ],
     ]);
   });
 
@@ -289,11 +317,10 @@ describe("legacy hidden subcommands", () => {
         Effect.exit,
       ) as Effect.Effect<unknown, never, never>,
     );
-    // Effect CLI's own raw `_tag` for this error is misspelled "UnknownSubcomand"
-    // (`CliError.js`, upstream typo); `cliErrorCode()`/`normalize-error.ts` already
-    // correct it for user-facing output, but this assertion checks the raw,
-    // un-normalized tag, so it must match the upstream spelling as-is.
-    expect(JSON.stringify(unknownExit)).toContain("UnknownSubcomand");
+    // Effect CLI's raw `_tag` uses the corrected "UnknownSubcommand" spelling.
+    // This assertion checks the raw, un-normalized tag so it stays aligned with
+    // the upstream parser error value.
+    expect(JSON.stringify(unknownExit)).toContain("UnknownSubcommand");
     expect(causeOf(unknownExit).reasons[0]?._tag).toBe("Fail"); // typed CliError, pre-handler — dispatch never reached a handler
   });
 });

@@ -11,11 +11,16 @@ import { legacyGetPendingSeeds, legacySeedData } from "./legacy-seed-ops.ts";
 
 class TestError extends Data.TaggedError("TestError")<{ readonly message: string }> {}
 
-function fakeSeedSession() {
+function fakeSeedSession(opts: { restoreRoleSql?: string } = {}) {
   const calls: Array<{ kind: "exec" | "query"; sql: string }> = [];
   const session: LegacyDbSession = {
+    ...(opts.restoreRoleSql === undefined ? {} : { restoreRoleSql: opts.restoreRoleSql }),
     exec: (sql) => {
       calls.push({ kind: "exec", sql });
+      return Effect.void;
+    },
+    execBatch: (statements) => {
+      for (const { sql } of statements) calls.push({ kind: "exec", sql });
       return Effect.void;
     },
     query: (sql) => {
@@ -34,7 +39,7 @@ function fakeSeedSession() {
 // `legacy-path-match.unit.test.ts` (including the `^`-only negation / `!`-is-literal
 // rule this file used to duplicate — and get wrong — in a local `legacyMatchPattern`).
 // This exercises that the seed pipeline's own glob resolution (`legacyGetPendingSeeds`)
-// actually uses it end to end, per Go's `config.Glob.Files` → `fs.Glob` → `path.Match`.
+// actually uses it end to end, per `config.Glob.Files` → `fs.Glob` → `path.Match`.
 describe("legacyGetPendingSeeds (glob character classes)", () => {
   it.effect(
     "treats a leading `!` in a bracket class as literal, not negation (Go path.Match parity)",
@@ -46,7 +51,7 @@ describe("legacyGetPendingSeeds (glob character classes)", () => {
       return Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
-        // Go's `[!a]` is a positive class of the literal members `!` and `a` — only a
+        // `[!a]` is a positive class of the literal members `!` and `a` — only a
         // leading `^` negates. So this pattern matches `a.sql`, not `b.sql` (the old
         // shell-style bug negated on `!` too, and would have matched `b.sql` instead).
         const pending = yield* legacyGetPendingSeeds(session, fs, path, ["[!a].sql"], dir);
@@ -102,7 +107,7 @@ const runSeed = (
 
 describe("legacySeedData (dirty parse)", () => {
   it.effect("fails on an unreadable dirty seed instead of refreshing its hash", () => {
-    // Go's `ExecBatchWithCache` reads + parses the file UNCONDITIONALLY before the
+    // `ExecBatchWithCache` reads + parses the file UNCONDITIONALLY before the
     // dirty check, so a dirty seed pointing at a missing file must fail (and leave
     // the previous hash) rather than silently upserting the new hash.
     const dir = mkdtempSync(join(tmpdir(), "legacy-seed-"));
@@ -122,6 +127,35 @@ describe("legacySeedData (dirty parse)", () => {
     );
   });
 
+  it.effect(
+    "rejects an oversized seed statement when SUPABASE_SCANNER_BUFFER_SIZE is configured (Go SeedFile.ExecBatchWithCache parity)",
+    () => {
+      // Go's SeedFile.ExecBatchWithCache parses through the same parseFile every
+      // other file type does, so an oversized statement must abort the seed run —
+      // same as legacy-migration-apply.unit.test.ts's equivalent case for migrations.
+      const dir = mkdtempSync(join(tmpdir(), "legacy-seed-scanner-"));
+      // Raw text must exceed the 4096-byte floor Go's bufio.Scanner starts at
+      // regardless of the configured limit (see legacy-migration-apply.unit.test.ts's
+      // equivalent case for the exact same 4096-byte floor).
+      writeFileSync(join(dir, "big.sql"), `select '${"x".repeat(5000)}';`);
+      const { session, calls } = fakeSeedSession();
+      const previous = process.env["SUPABASE_SCANNER_BUFFER_SIZE"];
+      process.env["SUPABASE_SCANNER_BUFFER_SIZE"] = "100b";
+      return runSeed(session, dir, [{ path: "big.sql", hash: "newhash", dirty: false }]).pipe(
+        Effect.exit,
+        Effect.tap((exit) =>
+          Effect.sync(() => {
+            expect(Exit.isFailure(exit)).toBe(true);
+            expect(calls.some((c) => c.sql.includes("select"))).toBe(false);
+            rmSync(dir, { recursive: true, force: true });
+            if (previous === undefined) delete process.env["SUPABASE_SCANNER_BUFFER_SIZE"];
+            else process.env["SUPABASE_SCANNER_BUFFER_SIZE"] = previous;
+          }),
+        ),
+      );
+    },
+  );
+
   it.effect("refreshes the hash for a dirty seed that parses, without running statements", () => {
     const dir = mkdtempSync(join(tmpdir(), "legacy-seed-"));
     writeFileSync(join(dir, "data.sql"), "insert into t values (1);");
@@ -135,6 +169,47 @@ describe("legacySeedData (dirty parse)", () => {
           // Statements are NOT executed for a dirty seed, but the hash IS upserted.
           expect(calls.some((c) => c.sql.includes("insert into t"))).toBe(false);
           expect(calls.some((c) => c.kind === "query" && c.sql.includes("seed_files"))).toBe(true);
+          rmSync(dir, { recursive: true, force: true });
+        }),
+      ),
+    );
+  });
+
+  it.effect("re-asserts the stepped-down role before the seed_files upsert", () => {
+    // A seed's own `reset role` reverts a stepped-down session to the login role,
+    // which used to fail the CLI's hash upsert with 42501 (supabase/cli#6236).
+    const dir = mkdtempSync(join(tmpdir(), "legacy-seed-"));
+    writeFileSync(join(dir, "data.sql"), "set role r;\ninsert into t values (1);\nreset role;");
+    const { session, calls } = fakeSeedSession({ restoreRoleSql: "SET SESSION ROLE postgres" });
+    return runSeed(session, dir, [{ path: "data.sql", hash: "h", dirty: false }]).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const sqls = calls.map((c) => c.sql);
+          const restoreAt = sqls.indexOf("SET SESSION ROLE postgres");
+          const upsertAt = calls.findIndex(
+            (c) => c.kind === "query" && c.sql.includes("seed_files"),
+          );
+          expect(restoreAt).toBeGreaterThan(sqls.indexOf("reset role"));
+          expect(upsertAt).toBeGreaterThan(restoreAt);
+          expect(sqls.lastIndexOf("COMMIT")).toBeGreaterThan(upsertAt);
+          rmSync(dir, { recursive: true, force: true });
+        }),
+      ),
+    );
+  });
+
+  it.effect("restores the role right after a mid-seed reset, before later statements", () => {
+    const dir = mkdtempSync(join(tmpdir(), "legacy-seed-"));
+    writeFileSync(join(dir, "data.sql"), "set role r;\nreset role;\ninsert into t values (1);");
+    const { session, calls } = fakeSeedSession({ restoreRoleSql: "SET SESSION ROLE postgres" });
+    return runSeed(session, dir, [{ path: "data.sql", hash: "h", dirty: false }]).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const sqls = calls.map((c) => c.sql);
+          const resetAt = sqls.indexOf("reset role");
+          // Injected immediately, so the following insert runs as postgres again.
+          expect(sqls[resetAt + 1]).toBe("SET SESSION ROLE postgres");
+          expect(sqls.indexOf("insert into t values (1)")).toBeGreaterThan(resetAt + 1);
           rmSync(dir, { recursive: true, force: true });
         }),
       ),

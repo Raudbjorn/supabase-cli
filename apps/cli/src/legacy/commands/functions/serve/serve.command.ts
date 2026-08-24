@@ -1,5 +1,5 @@
 import { Layer } from "effect";
-import { Command, Flag } from "effect/unstable/cli";
+import { Argument, Command, Flag } from "effect/unstable/cli";
 import { withJsonErrorHandling } from "../../../../shared/output/json-error-handling.ts";
 import { commandRuntimeLayer } from "../../../../shared/runtime/command-runtime.layer.ts";
 import {
@@ -27,20 +27,26 @@ const config = {
     Flag.optional,
   ),
   envFile: Flag.string("env-file").pipe(
-    Flag.withDescription("Path to an env file to be populated to the Function environment."),
+    Flag.withDescription(
+      "Path to an env file. Overrides supabase/functions/.env and per-Function .env files.",
+    ),
     Flag.optional,
   ),
   importMap: Flag.string("import-map").pipe(
     Flag.withDescription("Path to import map file."),
     Flag.optional,
   ),
-  inspect: Flag.boolean("inspect").pipe(Flag.withDescription("Alias of --inspect-mode brk.")),
+  inspect: Flag.boolean("inspect").pipe(
+    Flag.withDescription("Alias of --inspect-mode brk."),
+    Flag.withDefault(false),
+  ),
   inspectMode: Flag.choice("inspect-mode", FUNCTIONS_SERVE_INSPECT_MODES).pipe(
     Flag.withDescription("Activate inspector capability for debugging."),
     Flag.optional,
   ),
   inspectMain: Flag.boolean("inspect-main").pipe(
     Flag.withDescription("Allow inspecting the main worker."),
+    Flag.withDefault(false),
   ),
   all: Flag.boolean("all").pipe(
     Flag.withDescription("Serve all Functions."),
@@ -49,7 +55,15 @@ const config = {
   ),
 } as const;
 
-export const legacyFunctionsServeCommand = Command.make("serve", config).pipe(
+const commandConfig = {
+  ...config,
+  legacyFunctionNames: Argument.string("Function name").pipe(
+    Argument.withDescription("Legacy Function names. All Functions are served."),
+    Argument.variadic(),
+  ),
+} as const;
+
+export const legacyFunctionsServeCommand = Command.make("serve", commandConfig).pipe(
   Command.withDescription("Serve all Functions locally."),
   Command.withShortDescription("Serve all Functions locally"),
   Command.withHandler((flags) =>

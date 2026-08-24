@@ -1,24 +1,22 @@
 # `supabase db start`
 
-Fully native TypeScript port of `apps/cli-go/internal/db/start/start.go`'s `Run` +
-`StartDatabase` (CLI-1954 removed the last Go delegation — the hidden `db __db-bootstrap
---mode start` case no longer exists; that command still exists for `db reset --local`'s
-`--mode recreate`/`--mode await-storage`, see the "Notes" section). This is `db start`,
+Fully native. CLI-1954 removed the last Go delegation — the hidden `db __db-bootstrap
+--mode start` case no longer exists; CLI-1955 removed the REST of that hidden command too
+— see `db reset --local`'s own `SIDE_EFFECTS.md`. This is `db start`,
 **not** the top-level `supabase start`: no status table, no `cli_stack_started` event, no
 `Finished` line, no `--exclude`, no `--ignore-health-check`.
 
 The handler validates config, checks whether the local Postgres container is already
 running (`legacyIsLocalDbRunning` — a native `docker container inspect`, hoisted to
 `legacy/shared/db-bootstrap/local-db-running.ts` and shared with `db reset --local`'s
-own running-check; `db start` composes no `LegacyDbBootstrapSeam` at all anymore — that
-seam still exists only for `db reset --local`'s own, still-Go-delegated
-`recreateDatabase`/`awaitStorageReady` methods, see CLI-1955), and otherwise natively
-brings up the container itself, reusing `legacy/shared/db-bootstrap/`'s container-bootstrap
-primitives (the same ones `supabase start` uses for its own Postgres bring-up):
+own running-check), and otherwise natively brings up the container itself, reusing
+`legacy/shared/db-bootstrap/`'s container-bootstrap primitives (the same ones `supabase
+start` uses for its own Postgres bring-up, and `db reset --local`'s own recreate
+composition reuses too — see that command's `SIDE_EFFECTS.md`):
 
 1. Ensure the Docker network exists (`--network-id` override or `supabase_network_<project>`).
 2. Probe whether the Postgres data volume (`supabase_db_<project>`) already exists —
-   BEFORE creating it, matching Go's `NoBackupVolume` check ordering.
+   BEFORE creating it.
 3. **`--from-backup` + an existing volume**: fail with `backup volume already exists`
    (suggestion: `supabase stop --no-backup`), roll back (see below), and exit — no
    container is created on this path.
@@ -32,8 +30,7 @@ primitives (the same ones `supabase start` uses for its own Postgres bring-up):
    that restores roles then schema from the bind-mounted backup file, and
    `cron.launch_active_jobs = off` appended to `postgresql.conf` — applies regardless of
    `db.major_version`. The backup file itself is bind-mounted `:ro` at `/etc/backup.sql`
-   (host path resolved against the CALLER's cwd when relative, matching Go's
-   `CurrentDirAbs`).
+   (host path resolved against the CALLER's cwd when relative).
 6. Wait for the container to become healthy (`db.health_timeout`, default `2m`). A timeout
    fails the command UNLESS `--from-backup` is set, in which case it is swallowed (a large
    restore can exceed the timeout) — the container-logs dump to stderr still happens
@@ -45,8 +42,8 @@ primitives (the same ones `supabase start` uses for its own Postgres bring-up):
    revocation, `[db.vault]` secret upsert, `supabase/roles.sql` seed, and finally either every
    pending migration + seed, OR — when `--experimental`/`SUPABASE_EXPERIMENTAL` is set AND
    `[experimental.pgdelta] enabled` is false — every `db.migrations.schema_paths` file
-   (declarative schema files) instead of migrations, followed by seed either way (Go's
-   `apply.MigrateAndSeed`). Skipped IN FULL when `--from-backup` is set (not merely reduced).
+   (declarative schema files) instead of migrations, followed by seed either way
+   (`MigrateAndSeed`). Skipped IN FULL when `--from-backup` is set (not merely reduced).
 8. Write `supabase/.branches/_current_branch` = `"main"` if absent — runs on EVERY path
    that reaches this point (fresh volume, existing volume, and a swallowed
    `--from-backup` health-check timeout), but NOT on the already-running short-circuit or
@@ -54,8 +51,7 @@ primitives (the same ones `supabase start` uses for its own Postgres bring-up):
 
 Any failure from step 1 onward rolls back via `legacyRollbackStart` (stop + prune every
 container/network this project's label matches; volumes are pruned too, but ONLY when the
-volume was confirmed fresh this run) — matching Go's `Run`, which calls `DockerRemoveAll`
-on any `StartDatabase` failure.
+volume was confirmed fresh this run).
 
 ## Files Read
 
@@ -76,32 +72,31 @@ on any `StartDatabase` failure.
 
 ## Files Written
 
-| Path                                                                               | Format | When                                                                                                                                                                                                                                                                                  |
-| ---------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `<workdir>/supabase/.branches/_current_branch`                                     | text   | only if absent — writes `"main"` (see the step-by-step sequence above for exactly when)                                                                                                                                                                                               |
-| `<tmpdir>/supabase-start-secret-<random>/secret` (short-lived, `docker cp`'d away) | binary | Postgres's pgsodium root key (mode `0644`) — every entrypoint variant except the PG<=14 no-backup one carries this; delivered via `docker cp` straight into the container, never a host bind mount (supabase/cli#6022) — nothing persists on disk beyond the copy itself              |
-| `<workdir>/supabase/.temp/pgdelta/catalog-local-migrations-<hash>-<ts>.json`       | JSON   | best-effort, on a fresh volume with no `--from-backup`, after `MigrateAndSeed`, when pg-delta is enabled (`[experimental.pgdelta] enabled` or `SUPABASE_EXPERIMENTAL_PG_DELTA`); a failure only warns on stderr and never fails `db start` (Go's `pgcache.TryCacheMigrationsCatalog`) |
-| local Docker volume `supabase_db_<project>`                                        | —      | the Postgres data volume, created on first start (or first `--from-backup` restore)                                                                                                                                                                                                   |
-| local Docker network `supabase_network_<project>` (or `--network-id`)              | —      | created if it doesn't already exist                                                                                                                                                                                                                                                   |
-| `~/.supabase/telemetry.json`                                                       | JSON   | always — telemetry flush (`Effect.ensuring(telemetryState.flush)`), success and failure                                                                                                                                                                                               |
+| Path                                                                         | Format | When                                                                                                                                                                                                                                                                                                                                                                  |
+| ---------------------------------------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<workdir>/supabase/.branches/_current_branch`                               | text   | only if absent — writes `"main"` (see the step-by-step sequence above for exactly when)                                                                                                                                                                                                                                                                               |
+| `<workdir>/supabase/.temp/pgdelta/catalog-local-migrations-<hash>-<ts>.json` | JSON   | best-effort, on a fresh volume with no `--from-backup`, after `MigrateAndSeed`, when pg-delta is enabled (`[experimental.pgdelta] enabled` or `SUPABASE_EXPERIMENTAL_PG_DELTA`) AND the legacy engine is selected (`SUPABASE_USE_PG_DELTA_NEXT=false`); the default next engine skips this warmup entirely; a failure only warns on stderr and never fails `db start` |
+| local Docker volume `supabase_db_<project>`                                  | —      | the Postgres data volume, created on first start (or first `--from-backup` restore)                                                                                                                                                                                                                                                                                   |
+| local Docker network `supabase_network_<project>` (or `--network-id`)        | —      | created if it doesn't already exist                                                                                                                                                                                                                                                                                                                                   |
+| `~/.supabase/telemetry.json`                                                 | JSON   | always — telemetry flush (`Effect.ensuring(telemetryState.flush)`), success and failure                                                                                                                                                                                                                                                                               |
 
 ## Subprocesses
 
 Every step below shells out to `docker` (falling back to `podman`), matching every other
 native container command in this codebase — never `supabase-go`.
 
-| Command                                                                                                                          | When                                                                                                              |
-| -------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `docker container inspect supabase_db_<project>`                                                                                 | always — the already-running probe                                                                                |
-| `docker network create --label ... <networkId>`                                                                                  | when not already running, unless `--network-id` names a built-in network                                          |
-| `docker volume inspect supabase_db_<project>`                                                                                    | when not already running — the pre-create fresh-volume probe                                                      |
-| `docker image inspect` / `docker pull` (registry-fallback resolve)                                                               | when not already running — resolves the Postgres image                                                            |
-| `docker volume create --label ...`                                                                                               | when not already running, unless a `--from-backup` restore onto an existing volume (fails first)                  |
-| `docker create` + `docker cp <tempfile> <id>:/etc/postgresql-custom/pgsodium_root.key` + `docker start`                          | when not already running — the `cp` delivers the pgsodium root key between create and start (supabase/cli#6022)   |
-| `docker container inspect` (repeated)                                                                                            | health-wait polling, 1s constant backoff up to `db.health_timeout`                                                |
-| `docker logs <id>`                                                                                                               | on a health-check timeout (either path — swallowed or not)                                                        |
-| `docker run --rm ...`                                                                                                            | fresh volume, no `--from-backup`, `db.major_version >= 15`: up to 3 one-shot migrate jobs (realtime/storage/auth) |
-| `docker ps` / `docker stop` / `docker container prune` / `docker volume prune` (fresh-volume runs only) / `docker network prune` | on ANY failure from network-ensure through `_current_branch` — the rollback                                       |
+| Command                                                                                                                          | When                                                                                                                                                       |
+| -------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `docker container inspect supabase_db_<project>`                                                                                 | always — the already-running probe                                                                                                                         |
+| `docker network create --label ... <networkId>`                                                                                  | when not already running, unless `--network-id` names a built-in network                                                                                   |
+| `docker volume inspect supabase_db_<project>`                                                                                    | when not already running — the pre-create fresh-volume probe                                                                                               |
+| `docker image inspect` / `docker pull` (registry-fallback resolve)                                                               | when not already running — resolves the Postgres image                                                                                                     |
+| `docker volume create --label ...`                                                                                               | when not already running, unless a `--from-backup` restore onto an existing volume (fails first)                                                           |
+| `docker create` + optional `docker cp - <id>:/` + `docker start`                                                                 | when not already running — `cp` streams one in-memory tar archive containing the pgsodium root key at its exact path when the selected entrypoint needs it |
+| `docker container inspect` (repeated)                                                                                            | health-wait polling, 1s constant backoff up to `db.health_timeout`                                                                                         |
+| `docker logs <id>`                                                                                                               | on a health-check timeout (either path — swallowed or not)                                                                                                 |
+| `docker run --rm ...`                                                                                                            | fresh volume, no `--from-backup`, `db.major_version >= 15`: up to 3 one-shot migrate jobs (realtime/storage/auth)                                          |
+| `docker ps` / `docker stop` / `docker container prune` / `docker volume prune` (fresh-volume runs only) / `docker network prune` | on ANY failure from network-ensure through `_current_branch` — the rollback                                                                                |
 
 ## API Routes
 
@@ -111,34 +106,34 @@ native container command in this codebase — never `supabase-go`.
 
 ## Environment Variables
 
-| Variable                                                                                           | Purpose                                                                                                                                                                                                                                 | Required? |
-| -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
-| `SUPABASE_PROJECT_ID`                                                                              | overrides the local container id (`utils.DbId`)                                                                                                                                                                                         | no        |
-| `SUPABASE_DB_PORT`                                                                                 | overrides `db.port` (the published host port)                                                                                                                                                                                           | no        |
-| `SUPABASE_DB_MAJOR_VERSION`                                                                        | overrides `db.major_version` (image selection, schema branch)                                                                                                                                                                           | no        |
-| `SUPABASE_DB_HEALTH_TIMEOUT`                                                                       | overrides `db.health_timeout`                                                                                                                                                                                                           | no        |
-| `SUPABASE_DB_SETTINGS_*`                                                                           | overrides individual `[db.settings]` fields                                                                                                                                                                                             | no        |
-| `SUPABASE_EXPERIMENTAL_ORIOLEDB_VERSION`                                                           | overrides `experimental.orioledb_version` (image + env)                                                                                                                                                                                 | no        |
-| `SUPABASE_EXPERIMENTAL_S3_{HOST,REGION,ACCESS_KEY,SECRET_KEY}`                                     | OrioleDB S3 env overrides                                                                                                                                                                                                               | no        |
-| `SUPABASE_REALTIME_ENABLED`                                                                        | gates the fresh-volume realtime migrate job                                                                                                                                                                                             | no        |
-| `SUPABASE_REALTIME_IP_VERSION` / `_MAX_HEADER_LENGTH`                                              | realtime migrate job env overrides                                                                                                                                                                                                      | no        |
-| `SUPABASE_STORAGE_ENABLED`                                                                         | gates the fresh-volume storage migrate job                                                                                                                                                                                              | no        |
-| `SUPABASE_STORAGE_FILE_SIZE_LIMIT`                                                                 | storage migrate job env override                                                                                                                                                                                                        | no        |
-| `SUPABASE_AUTH_ENABLED`                                                                            | gates the fresh-volume auth migrate job                                                                                                                                                                                                 | no        |
-| `SUPABASE_AUTH_EXTERNAL_URL` / `SUPABASE_AUTH_SITE_URL`                                            | auth migrate job env overrides                                                                                                                                                                                                          | no        |
-| `SUPABASE_AUTH_JWT_EXPIRY`                                                                         | Postgres's `JWT_EXP` env / signing                                                                                                                                                                                                      | no        |
-| `SUPABASE_EXPERIMENTAL` (or `--experimental`)                                                      | fresh volume + no pg-delta: applies `db.migrations.schema_paths` files instead of `migrations/*.sql`                                                                                                                                    | no        |
-| `SUPABASE_EXPERIMENTAL_PG_DELTA`                                                                   | enables the post-`MigrateAndSeed` migrations-catalog cache warmup when `[experimental.pgdelta].enabled` is unset                                                                                                                        | no        |
-| `DOCKER_HOST` / `DOCKER_CONTEXT` / `DOCKER_TLS_VERIFY` / `DOCKER_CERT_PATH` / `DOCKER_API_VERSION` | Read (ambient shell OR a project `.env`/`.env.<env>`/`.env.local` file — matching Go's `godotenv.Load`, which installs these into the process environment before any Docker work) to pick the Docker daemon this whole command talks to | no        |
+| Variable                                                                                                             | Purpose                                                                                                                                                                                                       | Required? |
+| -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- |
+| `SUPABASE_PROJECT_ID`                                                                                                | overrides the local container id                                                                                                                                                                              | no        |
+| `SUPABASE_DB_PORT`                                                                                                   | overrides `db.port` (the published host port)                                                                                                                                                                 | no        |
+| `SUPABASE_DB_MAJOR_VERSION`                                                                                          | overrides `db.major_version` (image selection, schema branch)                                                                                                                                                 | no        |
+| `SUPABASE_DB_HEALTH_TIMEOUT`                                                                                         | overrides `db.health_timeout`                                                                                                                                                                                 | no        |
+| `SUPABASE_DB_SETTINGS_*`                                                                                             | overrides individual `[db.settings]` fields                                                                                                                                                                   | no        |
+| `SUPABASE_EXPERIMENTAL_ORIOLEDB_VERSION`                                                                             | overrides `experimental.orioledb_version` (image + env)                                                                                                                                                       | no        |
+| `SUPABASE_EXPERIMENTAL_S3_{HOST,REGION,ACCESS_KEY,SECRET_KEY}`                                                       | OrioleDB S3 env overrides                                                                                                                                                                                     | no        |
+| `SUPABASE_REALTIME_ENABLED`                                                                                          | gates the fresh-volume realtime migrate job                                                                                                                                                                   | no        |
+| `SUPABASE_REALTIME_IP_VERSION` / `_MAX_HEADER_LENGTH`                                                                | realtime migrate job env overrides                                                                                                                                                                            | no        |
+| `SUPABASE_STORAGE_ENABLED`                                                                                           | gates the fresh-volume storage migrate job                                                                                                                                                                    | no        |
+| `SUPABASE_STORAGE_FILE_SIZE_LIMIT`                                                                                   | storage migrate job env override                                                                                                                                                                              | no        |
+| `SUPABASE_AUTH_ENABLED`                                                                                              | gates the fresh-volume auth migrate job                                                                                                                                                                       | no        |
+| `SUPABASE_AUTH_EXTERNAL_URL` / `SUPABASE_AUTH_SITE_URL`                                                              | auth migrate job env overrides                                                                                                                                                                                | no        |
+| `SUPABASE_AUTH_JWT_EXPIRY`                                                                                           | Postgres's `JWT_EXP` env / signing                                                                                                                                                                            | no        |
+| `SUPABASE_EXPERIMENTAL` (or `--experimental`)                                                                        | fresh volume + no pg-delta: applies `db.migrations.schema_paths` files instead of `migrations/*.sql`                                                                                                          | no        |
+| `SUPABASE_EXPERIMENTAL_PG_DELTA`                                                                                     | enables the post-`MigrateAndSeed` migrations-catalog cache warmup when `[experimental.pgdelta].enabled` is unset                                                                                              | no        |
+| `SUPABASE_USE_PG_DELTA_NEXT`                                                                                         | selects the pg-delta implementation; `false` selects the legacy edge-runtime engine and thereby restores the migrations-catalog cache warmup (unset/unrecognized defaults to the next engine, which skips it) | no        |
+| `DOCKER_HOST` / `DOCKER_CONTEXT` / `DOCKER_TLS_VERIFY` / `DOCKER_CERT_PATH` / `DOCKER_API_VERSION` / `DOCKER_CONFIG` | Read (ambient shell OR a project `.env`/`.env.<env>`/`.env.local` file, installed into the process environment before any Docker work) to pick the Docker daemon this whole command talks to                  | no        |
 
 `--network-id` (a global CLI flag, not an environment variable — `shared/legacy/global-flags.ts`)
 forces every created container/network onto that Docker network instead of the generated
 `supabase_network_<project>`.
 
 `--debug` tees each fresh-volume PG15+ one-shot migrate job's (realtime/storage/auth) own
-stderr to the parent process's stderr in real time, matching Go's `utils.GetDebugLogger()`
-(`os.Stderr` under `--debug`, else discarded) — outside `--debug` only the job's exit code is
-surfaced on failure.
+stderr to the parent process's stderr in real time — outside `--debug` only the job's exit
+code is surfaced on failure.
 
 ## Exit Codes
 
@@ -154,7 +149,7 @@ surfaced on failure.
 
 ## Output
 
-### `--output-format text` (Go CLI compatible)
+### `--output-format text`
 
 - Already running → `Postgres database is already running.` on **stderr**, exit 0.
 - Starting → `Starting database...` / `Starting database from backup...`, then (fresh
@@ -179,11 +174,18 @@ Same result object as the terminal `result` event; progress on stderr.
 
 ## Notes
 
+- **`pg_net` converges with `[experimental.webhooks]` on every non-backup start** (shared
+  `legacyStartDatabase` behavior — see `supabase start`'s SIDE_EFFECTS.md note and
+  `docs/go-cli-divergences.md`): fresh volumes install it only when webhooks are enabled or
+  migration history owns it; existing volumes with webhooks disabled DROP a `pg_net` that
+  migration history does not own. `pg_net` installed outside migrations (Studio SQL editor)
+  is dropped on the next start — accepted, documented edge.
 - `--from-backup` restores the database from a logical backup file on start; the health
   check is skipped (not failed) for backups — a large restore can exceed
   `db.health_timeout`.
 - No `cli_stack_started` telemetry — that event belongs to `supabase start`, not
   `db start`. The only event is the standard `cli_command_executed`.
-- `db reset --local` (a different command) still delegates its container-recreate flow to
-  the bundled Go binary's hidden `db __db-bootstrap --mode recreate` seam — that is
-  CLI-1955's scope, not this one.
+- `db reset --local` (a different command) is ALSO fully native now (CLI-1955) — it
+  reuses this same `legacy/shared/db-bootstrap/` primitive set, but through its own
+  composition (`legacy/shared/db-bootstrap/recreate-local-database.ts`), not through
+  `legacyStartDatabase`/this command's own handler — see that command's `SIDE_EFFECTS.md`.

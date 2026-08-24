@@ -4263,6 +4263,7 @@ const (
 	V1ListEntitlementsResponseEntitlementsFeatureKeyInstancesOrioledb                     V1ListEntitlementsResponseEntitlementsFeatureKey = "instances.orioledb"
 	V1ListEntitlementsResponseEntitlementsFeatureKeyInstancesReadReplicas                 V1ListEntitlementsResponseEntitlementsFeatureKey = "instances.read_replicas"
 	V1ListEntitlementsResponseEntitlementsFeatureKeyIntegrationsGithubConnections         V1ListEntitlementsResponseEntitlementsFeatureKey = "integrations.github_connections"
+	V1ListEntitlementsResponseEntitlementsFeatureKeyIntegrationsGithubPushWebhooksLimit   V1ListEntitlementsResponseEntitlementsFeatureKey = "integrations.github_push_webhooks_limit"
 	V1ListEntitlementsResponseEntitlementsFeatureKeyIpv4                                  V1ListEntitlementsResponseEntitlementsFeatureKey = "ipv4"
 	V1ListEntitlementsResponseEntitlementsFeatureKeyLogDrains                             V1ListEntitlementsResponseEntitlementsFeatureKey = "log_drains"
 	V1ListEntitlementsResponseEntitlementsFeatureKeyLogRetentionDays                      V1ListEntitlementsResponseEntitlementsFeatureKey = "log.retention_days"
@@ -4362,6 +4363,8 @@ func (e V1ListEntitlementsResponseEntitlementsFeatureKey) Valid() bool {
 	case V1ListEntitlementsResponseEntitlementsFeatureKeyInstancesReadReplicas:
 		return true
 	case V1ListEntitlementsResponseEntitlementsFeatureKeyIntegrationsGithubConnections:
+		return true
+	case V1ListEntitlementsResponseEntitlementsFeatureKeyIntegrationsGithubPushWebhooksLimit:
 		return true
 	case V1ListEntitlementsResponseEntitlementsFeatureKeyIpv4:
 		return true
@@ -7431,6 +7434,9 @@ type RealtimeConfigResponse struct {
 	// MaxPresenceEventsPerSecond Sets maximum number of presence events per second rate limit
 	MaxPresenceEventsPerSecond nullable.Nullable[int] `json:"max_presence_events_per_second"`
 
+	// PostgresChangesPool Sets connection pool size used to create Postgres Changes subscriptions
+	PostgresChangesPool nullable.Nullable[int] `json:"postgres_changes_pool"`
+
 	// PresenceEnabled Whether to enable presence
 	PresenceEnabled bool `json:"presence_enabled"`
 
@@ -8237,6 +8243,9 @@ type UpdateRealtimeConfigBody struct {
 
 	// MaxPresenceEventsPerSecond Sets maximum number of presence events per second rate limit
 	MaxPresenceEventsPerSecond *int `json:"max_presence_events_per_second,omitempty"`
+
+	// PostgresChangesPool Sets connection pool size used to create Postgres Changes subscriptions
+	PostgresChangesPool *int `json:"postgres_changes_pool,omitempty"`
 
 	// PresenceEnabled Whether to enable presence
 	PresenceEnabled *bool `json:"presence_enabled,omitempty"`

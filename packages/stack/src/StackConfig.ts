@@ -1,9 +1,13 @@
 import { Schema } from "effect";
 import type { ResolvedFunctionsBundle } from "./functions.ts";
-import type { AllocatedPorts } from "./PortAllocator.ts";
+import type { ResolvedPorts } from "./PortCatalog.ts";
+import type { ServiceName } from "./ServiceName.ts";
 
-type StackMode = "native" | "auto" | "docker";
-type StackStartupMode = "eager" | "lazy";
+import type { StackRuntimeSelection } from "./ContainerRuntime.ts";
+
+export type StackMode = "native" | "docker";
+export type ServicePolicy = "off" | "lazy" | "eager";
+export type ServicePolicyManifest = Readonly<Record<ServiceName, ServicePolicy>>;
 
 export type ReadinessPolicy =
   | { readonly mode: "finite"; readonly timeoutMs: number }
@@ -26,6 +30,18 @@ export const ReadyOptionsSchema = Schema.Union([
 ]);
 
 export const inheritReadyOptions: ReadyOptions = { mode: "inherit" };
+
+/**
+ * What a Docker container name segment tolerates: this is used in the
+ * namespaced `supabase-<service>-id-<instanceId>` form, so anything Docker
+ * itself rejects there (path separators, colons, whitespace, …) must be
+ * rejected here first. A managed caller's stack UUID always matches; a
+ * hand-supplied `instanceId` must be shaped the same way.
+ */
+export const INSTANCE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/i;
+
+/** Validates {@link StackConfig.instanceId} against {@link INSTANCE_ID_PATTERN}. */
+export const InstanceIdSchema = Schema.String.check(Schema.isPattern(INSTANCE_ID_PATTERN));
 
 /** Default readiness deadline; lazy activation expands it for longer transitive startup budgets. */
 export const DEFAULT_STACK_READINESS_POLICY: ReadinessPolicy = {
@@ -146,13 +162,24 @@ export interface PoolerConfig {
 }
 
 export interface StackConfig {
+  /**
+   * An opaque identity for this stack, namespaced in the names and preserved
+   * verbatim in the labels of the Docker resources it owns so two stacks never
+   * collide on them — which is exactly why it must itself be a Docker-name-safe
+   * token: see {@link INSTANCE_ID_PATTERN}.
+   *
+   * The runtime never interprets its structure beyond that — a managed caller
+   * passes its stack id (a UUID, which already matches), and a caller that
+   * passes nothing keeps the port-derived names it always had.
+   */
+  readonly instanceId?: string;
   readonly cacheRoot?: string;
   readonly stackRoot?: string;
   readonly runtimeRoot?: string;
   readonly projectDir?: string;
   readonly mode?: StackMode;
-  /** Start all services immediately, or defer proxied services until first use. */
-  readonly startupMode?: StackStartupMode;
+  /** Per-service resource policy. `off` excludes a service from the graph. */
+  readonly servicePolicies?: Partial<Record<ServiceName, ServicePolicy>>;
   /** Stack-wide readiness policy. Per-call ReadyOptions take precedence. */
   readonly readiness?: ReadinessPolicy;
   readonly jwtSecret?: string;
@@ -274,17 +301,20 @@ export interface ResolvedPoolerConfig {
 }
 
 export interface ResolvedStackConfig {
+  /** The opaque identity this stack's Docker resources are keyed by, if any. */
+  readonly instanceId?: string;
   readonly cacheRoot: string;
   readonly stackRoot: string;
   readonly runtimeRoot: string;
   readonly projectDir: string;
-  readonly mode: StackMode;
-  readonly startupMode: StackStartupMode;
+  /** Concrete execution mode and, for containers, the selected executable. */
+  readonly runtime: StackRuntimeSelection;
+  readonly servicePolicies: ServicePolicyManifest;
   readonly readiness: ReadinessPolicy;
   /** Whether readiness came from the package default or an explicit stack policy. */
   readonly readinessSource: "default" | "configured";
   readonly jwtSecret: string;
-  readonly ports: AllocatedPorts;
+  readonly ports: ResolvedPorts;
   readonly apiPort: number;
   readonly dbPort: number;
   readonly publishableKey: string;

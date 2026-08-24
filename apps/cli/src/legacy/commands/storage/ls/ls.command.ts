@@ -10,6 +10,7 @@ import { legacyStorageGatewayRuntimeLayer } from "../../../shared/legacy-storage
 import {
   LegacyStorageLinkedFlagDef,
   LegacyStorageLocalFlagDef,
+  LegacyStorageProjectRefFlagDef,
   legacyAssertStorageTargetsExclusive,
 } from "../storage.flags.ts";
 import { legacyStorageLs } from "./ls.handler.ts";
@@ -22,9 +23,11 @@ const config = {
   recursive: Flag.boolean("recursive").pipe(
     Flag.withAlias("r"),
     Flag.withDescription("Recursively list a directory."),
+    Flag.withDefault(false),
   ),
   linked: LegacyStorageLinkedFlagDef,
   local: LegacyStorageLocalFlagDef,
+  projectRef: LegacyStorageProjectRefFlagDef,
 } as const;
 
 export type LegacyStorageLsFlags = CliCommand.Command.Config.Infer<typeof config>;
@@ -49,8 +52,12 @@ export const legacyStorageLsCommand = Command.make("ls", config).pipe(
         recursive: flags.recursive,
         linked: flags.linked,
         local: flags.local,
+        "project-ref": flags.projectRef,
       };
       return yield* legacyStorageLs(flags).pipe(
+        // TS-only flag with no Go telemetry-safety baseline; Go's nearest
+        // --project-ref registrations (cmd/pgdelta_catalog.go:44 and most
+        // others) are unmarked, so it stays redacted.
         withLegacyCommandInstrumentation({ flags: telemetryFlags }),
       );
     }).pipe(withJsonErrorHandling),

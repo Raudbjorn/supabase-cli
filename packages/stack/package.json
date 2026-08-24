@@ -12,6 +12,11 @@
       "bun": "./src/effect-bun.ts",
       "default": "./src/effect-node.ts"
     },
+    "./managed": {
+      "bun": "./src/managed-bun.ts",
+      "default": "./src/managed-node.ts"
+    },
+    "./managed-model": "./src/managed/model.ts",
     "./testing": "./src/testing.ts",
     "./daemon-bun": "./src/daemon-bun.ts"
   },
@@ -31,15 +36,15 @@
   },
   "devDependencies": {
     "@effect/vitest": "catalog:",
-    "@supabase/supabase-js": "^2.111.0",
+    "@supabase/supabase-js": "^2.112.3",
     "@tsconfig/bun": "catalog:",
     "@types/bun": "catalog:",
-    "@typescript/native-preview": "catalog:",
     "@vitest/coverage-istanbul": "catalog:",
     "knip": "catalog:",
     "oxfmt": "catalog:",
     "oxlint": "catalog:",
     "oxlint-tsgolint": "catalog:",
+    "typescript": "catalog:",
     "vitest": "catalog:"
   },
   "knip": {
@@ -50,14 +55,12 @@
       "tests/**/*.ts"
     ],
     "ignoreDependencies": [
-      "@typescript/native-preview",
       "oxfmt",
       "oxlint",
       "oxlint-tsgolint"
     ],
     "ignoreBinaries": [
-      "nx",
-      "ps"
+      "nx"
     ]
   }
 }

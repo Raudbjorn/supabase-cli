@@ -12,6 +12,7 @@ import {
   mockLegacyLinkedProjectCacheTracked,
   mockLegacyTelemetryStateTracked,
   useLegacyTempWorkdir,
+  legacySequentialExecBatch,
 } from "../../../../../tests/helpers/legacy-mocks.ts";
 import { mockOutput, mockStdin, mockTty } from "../../../../../tests/helpers/mocks.ts";
 import { CliArgs } from "../../../../shared/cli/cli-args.service.ts";
@@ -25,7 +26,10 @@ import type {
   LegacyResolvedDbConfig,
 } from "../../../shared/legacy-db-config.types.ts";
 import { LegacyDbExecError } from "../../../shared/legacy-db-connection.errors.ts";
-import { LegacyDbConnection } from "../../../shared/legacy-db-connection.service.ts";
+import {
+  type LegacyDbSession,
+  LegacyDbConnection,
+} from "../../../shared/legacy-db-connection.service.ts";
 import { LegacyMigrationDropError } from "../../../shared/legacy-drop-objects.ts";
 import { LegacyMigrationSeedError } from "../../../shared/legacy-seed.ts";
 import { legacyMigrationDown } from "./down.handler.ts";
@@ -87,8 +91,8 @@ function setup(workdir: string, opts: SetupOpts = {}) {
   });
 
   const connection = Layer.succeed(LegacyDbConnection, {
-    connect: () =>
-      Effect.succeed({
+    connect: () => {
+      const session: LegacyDbSession = {
         exec: (sql: string) =>
           Effect.suspend(() => {
             execs.push(sql);
@@ -111,14 +115,25 @@ function setup(workdir: string, opts: SetupOpts = {}) {
         extensionExists: () => Effect.succeed(false),
         copyToCsv: () => Effect.succeed(new Uint8Array()),
         queryRaw: () => Effect.succeed({ fields: [], rows: [], commandTag: "" }),
-      }),
+        // A migration file's statements arrive as one batch; replay them through
+        // `exec`/`query` so this suite's recordings and failure injection still apply.
+        execBatch: (statements) => legacySequentialExecBatch(session)(statements),
+      };
+      return Effect.succeed(session);
+    },
   });
 
+  // `loadProjectRef` gives an explicit `--project-ref` flag top precedence, same
+  // as Go's `flags.LoadProjectRef` — mirror that so a test can prove the flag
+  // (not just the hardcoded `LEGACY_VALID_REF` fallback) drives the linked ref.
   const projectRef = Layer.succeed(LegacyProjectRefResolver, {
     resolve: () => Effect.succeed(LEGACY_VALID_REF),
     resolveForLink: () => Effect.succeed(LEGACY_VALID_REF),
     resolveOptional: () => Effect.succeed(Option.some(LEGACY_VALID_REF)),
-    loadProjectRef: () => Effect.succeed(LEGACY_VALID_REF),
+    loadProjectRef: (flagValue: Option.Option<string>) =>
+      Effect.succeed(
+        Option.isSome(flagValue) && flagValue.value.length > 0 ? flagValue.value : LEGACY_VALID_REF,
+      ),
     promptProjectRef: () => Effect.succeed(LEGACY_VALID_REF),
   });
 
@@ -136,13 +151,13 @@ function setup(workdir: string, opts: SetupOpts = {}) {
     mockTty({ stdinIsTty: opts.isTTY ?? true }),
     mockStdin(
       opts.isTTY ?? true,
-      // Migration prompts read stdin directly (Go's PromptYesNo), so a confirm answer is
+      // Migration prompts read stdin directly, so a confirm answer is
       // supplied via piped stdin rather than the Output prompt mock.
       opts.pipedInput ?? (opts.confirm === undefined ? undefined : opts.confirm ? "y\n" : "n\n"),
     ),
     BunServices.layer,
   );
-  return { layer, out, telemetry, execs, queries };
+  return { layer, out, telemetry, execs, queries, cache };
 }
 
 const flags = (over: Partial<LegacyMigrationDownFlags> = {}): LegacyMigrationDownFlags => ({
@@ -150,6 +165,7 @@ const flags = (over: Partial<LegacyMigrationDownFlags> = {}): LegacyMigrationDow
   dbUrl: over.dbUrl ?? Option.none(),
   linked: over.linked ?? false,
   local: over.local ?? true,
+  projectRef: over.projectRef ?? Option.none(),
 });
 
 const seed = (workdir: string, name: string, body = "create table a;\n") => {
@@ -174,8 +190,8 @@ describe("legacy migration down", () => {
   });
 
   it.live("resolves the DB target before rejecting --last 0", () => {
-    // Go runs ParseDatabaseConfig (PersistentPreRunE, root.go:118) before down.Run's
-    // last==0 check, so an unlinked/invalid target error wins over --last 0.
+    // The DB config resolves before the `--last === 0`
+    // check, so an unlinked/invalid target error wins over --last 0.
     const { layer } = setup(tmp.current, { failResolve: true });
     return Effect.gen(function* () {
       const exit = yield* legacyMigrationDown(flags({ last: 0 })).pipe(Effect.exit);
@@ -210,7 +226,7 @@ describe("legacy migration down", () => {
     });
     return Effect.gen(function* () {
       yield* legacyMigrationDown(flags({ last: 1 }));
-      // Go prints the connection banner to stderr before dialing (connect.go:343-348).
+      // The connection banner prints to stderr before dialing.
       expect(stripAnsi(out.stderrText)).toContain("Connecting to local database...");
       expect(stripAnsi(out.stderrText)).toContain("Resetting database to version: 20240101000000");
       // dropped user schemas, then re-applied the migration <= target version.
@@ -221,6 +237,57 @@ describe("legacy migration down", () => {
             q.sql.includes("INSERT INTO supabase_migrations") && q.params?.[0] === "20240101000000",
         ),
       ).toBe(true);
+    }).pipe(Effect.provide(layer));
+  });
+
+  it.live(
+    "reverts on the project given via --project-ref --linked, overriding the linked ref",
+    () => {
+      // down defaults to local; only with --linked does the flag's ref get
+      // cached. The fake resolver's own fallback (LEGACY_VALID_REF) represents
+      // whatever the workdir would resolve to absent the flag.
+      const FLAG_REF = "flagflagflagflagflag";
+      seed(tmp.current, "20240101000000_a.sql");
+      const { layer, cache } = setup(tmp.current, {
+        args: ["--linked"],
+        confirm: true,
+        remote: ["20240101000000", "20240102000000"],
+      });
+      return Effect.gen(function* () {
+        yield* legacyMigrationDown(
+          flags({ last: 1, linked: true, local: false, projectRef: Option.some(FLAG_REF) }),
+        );
+        expect(cache.cached).toBe(true);
+        expect(cache.cachedRef).toBe(FLAG_REF);
+        expect(cache.cachedRef).not.toBe(LEGACY_VALID_REF);
+      }).pipe(Effect.provide(layer));
+    },
+  );
+
+  it.live("rejects --project-ref on the default local target", () => {
+    // down defaults to local when no target flag is set — the guard must fire
+    // from the flag alone, with no explicit --local/--db-url needed.
+    const FLAG_REF = "flagflagflagflagflag";
+    const { layer, execs, queries, cache } = setup(tmp.current, {
+      remote: ["20240101000000", "20240102000000"],
+    });
+    return Effect.gen(function* () {
+      const exit = yield* legacyMigrationDown(
+        flags({ last: 1, projectRef: Option.some(FLAG_REF) }),
+      ).pipe(Effect.exit);
+      expect(Exit.isFailure(exit)).toBe(true);
+      if (Exit.isFailure(exit)) {
+        const failure = Cause.findErrorOption(exit.cause);
+        expect(Option.isSome(failure) && failure.value._tag).toBe(
+          "LegacyMigrationTargetFlagsError",
+        );
+        expect(Option.isSome(failure) && (failure.value as { message: string }).message).toBe(
+          "--project-ref only applies when targeting the linked project; use it with --linked (not --local or --db-url)",
+        );
+      }
+      expect(execs).toEqual([]);
+      expect(queries).toEqual([]);
+      expect(cache.cached).toBe(false);
     }).pipe(Effect.provide(layer));
   });
 
@@ -242,7 +309,7 @@ describe("legacy migration down", () => {
   });
 
   it.live("falls back to NO (cancels) without a TTY and no piped answer", () => {
-    // Go reads stdin regardless of TTY (IsTTY only changes the timeout); with no piped
+    // Stdin is read regardless of TTY (isTTY only changes the timeout); with no piped
     // answer the empty read falls back to the default (NO) → cancel.
     const { layer, out } = setup(tmp.current, {
       isTTY: false,
@@ -280,7 +347,7 @@ describe("legacy migration down", () => {
 
   it.live("auto-confirms from SUPABASE_YES in the project .env (Go loadNestedEnv)", () => {
     seed(tmp.current, "20240101000000_a.sql");
-    // SUPABASE_YES lives only in supabase/.env, not the shell — Go's loadNestedEnv loads it
+    // SUPABASE_YES lives only in supabase/.env, not the shell — the project env loads it
     // before the prompt, so the revert auto-confirms with no --yes flag and no stdin answer.
     writeFileSync(join(tmp.current, "supabase", ".env"), "SUPABASE_YES=true\n");
     const { layer, out } = setup(tmp.current, {
@@ -401,7 +468,6 @@ describe("legacy migration down", () => {
     });
     return Effect.gen(function* () {
       yield* legacyMigrationDown(flags({ last: 1 }));
-      // No migration re-applied when migrations are disabled.
       expect(queries.some((q) => q.sql.includes("INSERT INTO supabase_migrations"))).toBe(false);
     }).pipe(Effect.provide(layer));
   });

@@ -1,5 +1,6 @@
 /**
- * Port of Go's `ensureImagesCached` (`apps/cli-go/internal/start/start.go:225-262`):
+ * Port of Go's `ensureImagesCached` (`apps/cli-go/internal/start/start.go:225-262`,
+ * deleted in CLI-1966; last present at commit a253ccba2):
  * guarantees every image `supabase start` needs is resolved/pulled into the
  * local Docker cache BEFORE any container is created, using the same
  * multi-registry fallback as the per-container start path
@@ -19,6 +20,11 @@
 import { Data, Effect, Result } from "effect";
 import type { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner";
 
+import {
+  actionability,
+  type CliErrorActionabilityDeclaration,
+  ErrorActionabilityId,
+} from "../../../shared/telemetry/error-actionability.ts";
 import { legacyMakeDockerImageResolver } from "../legacy-docker-image-resolve.ts";
 import {
   LEGACY_SUGGEST_DOCKER_INSTALL,
@@ -35,7 +41,19 @@ type Spawner = ChildProcessSpawner["Service"];
  */
 export class LegacyImagePrepullError extends Data.TaggedError("LegacyImagePrepullError")<{
   readonly message: string;
-}> {}
+  readonly reason: "docker_daemon" | "registry_pull" | "image_inspect";
+}> {
+  get [ErrorActionabilityId](): CliErrorActionabilityDeclaration {
+    switch (this.reason) {
+      case "docker_daemon":
+        return { ...actionability.dockerNotRunning, fingerprint_suffix: "docker_not_running" };
+      case "registry_pull":
+        return { ...actionability.externalNetwork, fingerprint_suffix: "registry_pull" };
+      default:
+        return { ...actionability.invalidConfig, fingerprint_suffix: "image_inspect" };
+    }
+  }
+}
 
 /**
  * Resolves every image in `images` concurrently (Go's `utils.WaitAll` —
@@ -66,10 +84,19 @@ export function legacyEnsureImagesCached(
 
     const resolved = new Map<string, string>();
     const failures: Array<string> = [];
+    let failureReason: LegacyImagePrepullError["reason"] = "image_inspect";
     for (const [index, image] of uniqueImages.entries()) {
       const result = results[index];
       if (result === undefined || Result.isFailure(result)) {
         failures.push(result === undefined ? `${image}: unknown error` : result.failure.message);
+        if (result !== undefined) {
+          const failure = result.failure;
+          if (failure.reason === "spawn" || failure.daemonDown) {
+            failureReason = "docker_daemon";
+          } else if (failure.reason === "pull" && failureReason !== "docker_daemon") {
+            failureReason = "registry_pull";
+          }
+        }
         continue;
       }
       resolved.set(image, result.success);
@@ -86,7 +113,10 @@ export function legacyEnsureImagesCached(
         ? `\n\n${LEGACY_SUGGEST_DOCKER_INSTALL}`
         : "";
       return yield* Effect.fail(
-        new LegacyImagePrepullError({ message: `${failures.join("\n")}${hint}` }),
+        new LegacyImagePrepullError({
+          message: `${failures.join("\n")}${hint}`,
+          reason: failureReason,
+        }),
       );
     }
 

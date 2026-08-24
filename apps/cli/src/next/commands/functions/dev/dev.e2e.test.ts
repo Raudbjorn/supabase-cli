@@ -1,84 +1,85 @@
-import { describe, expect, test } from "vitest";
-import { writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { afterEach, describe, expect, test } from "vitest";
+
 import {
+  makeTempCliProject,
   makeTempHome,
-  makeTempStackProject,
   runSupabase,
   spawnSupabase,
 } from "../../../../../tests/helpers/cli.ts";
+import { cleanupRegisteredStackProjects } from "../../../../../tests/helpers/stack-e2e-cleanup.ts";
 
 const FUNCTIONS_DEV_STARTUP_TIMEOUT_MS = 60_000;
 const FUNCTIONS_DEV_STEP_TIMEOUT_MS = 30_000;
-const FUNCTIONS_DEV_TEST_TIMEOUT_MS = 90_000;
+const FUNCTIONS_DEV_CLEANUP_TIMEOUT_MS = 30_000;
+const FUNCTIONS_DEV_TEST_TIMEOUT_MS =
+  FUNCTIONS_DEV_STARTUP_TIMEOUT_MS +
+  FUNCTIONS_DEV_STEP_TIMEOUT_MS * 7 +
+  FUNCTIONS_DEV_CLEANUP_TIMEOUT_MS;
+const FUNCTION_RESPONSE_ATTEMPT_TIMEOUT_MS = 5_000;
+const FUNCTION_RESPONSE_RETRY_BACKOFF_MS = 250;
 const FUNCTION_FILES_RESTART_PATTERN = /Function files changed\. Restarting edge-runtime\./;
-const FUNCTION_FILES_RESTART_PATTERN_GLOBAL = /Function files changed\. Restarting edge-runtime\./g;
 
 type SpawnedSupabase = ReturnType<typeof spawnSupabase>;
 
-function countOutputMatches(proc: SpawnedSupabase, pattern: RegExp): number {
-  return [...`${proc.stdout()}\n${proc.stderr()}`.matchAll(pattern)].length;
-}
-
-async function waitForOutputMatchCount(
-  proc: SpawnedSupabase,
-  pattern: RegExp,
-  expectedCount: number,
-) {
-  const deadline = Date.now() + FUNCTIONS_DEV_STEP_TIMEOUT_MS;
-
-  while (Date.now() < deadline) {
-    if (countOutputMatches(proc, pattern) >= expectedCount) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-
-  throw new Error(
-    `Timed out waiting for ${expectedCount.toString()} occurrences of ${pattern.toString()}`,
-  );
-}
-
-async function waitForFunctionResponse(
+async function assertFunctionResponse(
   url: string,
   init: RequestInit,
   assertResponse: (response: Response, body: string) => void,
-) {
-  const deadline = Date.now() + FUNCTIONS_DEV_STEP_TIMEOUT_MS;
-  let lastError: unknown;
+  timeoutMs = FUNCTIONS_DEV_STEP_TIMEOUT_MS,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastFailure: unknown = new Error("No response received");
 
   while (Date.now() < deadline) {
+    const remainingMs = deadline - Date.now();
     try {
-      const response = await fetch(url, init);
+      const response = await fetch(url, {
+        ...init,
+        signal: AbortSignal.timeout(Math.min(remainingMs, FUNCTION_RESPONSE_ATTEMPT_TIMEOUT_MS)),
+      });
       const body = await response.text();
-      try {
-        assertResponse(response, body);
-        return;
-      } catch (error) {
-        lastError = error;
-      }
+      assertResponse(response, body);
+      return;
     } catch (error) {
-      lastError = error;
+      lastFailure = error;
+      // Bound request frequency while the worker catches up after a reload;
+      // the wall-clock deadline, rather than an attempt count, remains the guard.
+      const retryDelayMs = Math.min(
+        FUNCTION_RESPONSE_RETRY_BACKOFF_MS,
+        Math.max(0, deadline - Date.now()),
+      );
+      if (retryDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      }
     }
-
-    await new Promise((resolve) => setTimeout(resolve, 250));
   }
 
-  throw lastError instanceof Error
-    ? lastError
-    : new Error(`Timed out waiting for function response: ${String(lastError)}`);
+  throw new Error(
+    `Function request ${url} did not reach the expected response within ${timeoutMs}ms. ` +
+      `Last failure: ${lastFailure instanceof Error ? lastFailure.message : String(lastFailure)}`,
+  );
 }
 
-describe("supabase functions dev", () => {
+describe("supabase functions dev (e2e)", () => {
+  afterEach(cleanupRegisteredStackProjects);
+
   test(
-    "serves a function created while running and applies live config and source changes",
+    "serves a function created while running and applies config and source changes",
     { timeout: FUNCTIONS_DEV_TEST_TIMEOUT_MS },
     async () => {
       const home = makeTempHome();
-      const project = await makeTempStackProject("supabase-functions-dev-e2e-");
+      // The next functions runtime owns managed port allocation. This project
+      // intentionally contains no released-port reservations from the test.
+      const project = await makeTempCliProject("supabase-functions-dev-e2e-");
+      await mkdir(join(project.dir, "supabase"), { recursive: true });
+      await writeFile(
+        join(project.dir, "supabase", "config.toml"),
+        'project_id = "functions-dev-e2e"\n',
+      );
       const functionPath = join(project.dir, "supabase", "functions", "hello-world", "index.ts");
-      const functionUrl = `http://127.0.0.1:${project.ports.apiPort}/functions/v1/hello-world`;
-      let devProc: ReturnType<typeof spawnSupabase> | undefined;
+      let devProc: SpawnedSupabase | undefined;
 
       try {
         devProc = spawnSupabase(["functions", "dev"], {
@@ -92,22 +93,41 @@ describe("supabase functions dev", () => {
           /Edge Functions dev server is running\./,
           FUNCTIONS_DEV_STARTUP_TIMEOUT_MS,
         );
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        const functionUrlMatch = `${devProc.stdout()}\n${devProc.stderr()}`.match(
+          /Functions URL:\s+(https?:\/\/[^\s/]+\/functions\/v1)/,
+        );
+        if (functionUrlMatch?.[1] === undefined) {
+          throw new Error(
+            `Functions dev output did not include a URL.\nstdout:\n${devProc.stdout()}\nstderr:\n${devProc.stderr()}`,
+          );
+        }
+        const functionUrl = `${functionUrlMatch[1]}/hello-world`;
 
+        const functionOffset = devProc.stdout().length;
+        const functionRestart = devProc.waitForOutput(
+          FUNCTION_FILES_RESTART_PATTERN,
+          FUNCTIONS_DEV_STEP_TIMEOUT_MS,
+          functionOffset,
+        );
         const newResult = await runSupabase(["functions", "new", "hello-world"], {
           cwd: project.dir,
           home: home.dir,
           exitTimeoutMs: FUNCTIONS_DEV_STEP_TIMEOUT_MS,
         });
         expect(newResult.exitCode).toBe(0);
+        await functionRestart;
 
-        await devProc.waitForOutput(FUNCTION_FILES_RESTART_PATTERN, FUNCTIONS_DEV_STEP_TIMEOUT_MS);
-
-        await waitForFunctionResponse(functionUrl, {}, (response, body) => {
+        await assertFunctionResponse(functionUrl, {}, (response, body) => {
           expect(response.status).toBe(401);
           expect(body).toContain("Missing authorization header");
         });
 
+        const configOffset = devProc.stdout().length;
+        const configRestart = devProc.waitForOutput(
+          FUNCTION_FILES_RESTART_PATTERN,
+          FUNCTIONS_DEV_STEP_TIMEOUT_MS,
+          configOffset,
+        );
         await writeFile(
           join(project.dir, "supabase", "config.toml"),
           `project_id = "functions-dev-e2e"
@@ -116,13 +136,9 @@ describe("supabase functions dev", () => {
 verify_jwt = false
 `,
         );
+        await configRestart;
 
-        await devProc.waitForOutput(
-          /Edge runtime config changed\. Restarting edge-runtime\./,
-          FUNCTIONS_DEV_STEP_TIMEOUT_MS,
-        );
-
-        await waitForFunctionResponse(
+        await assertFunctionResponse(
           functionUrl,
           {
             method: "POST",
@@ -135,7 +151,12 @@ verify_jwt = false
           },
         );
 
-        const restartCount = countOutputMatches(devProc, FUNCTION_FILES_RESTART_PATTERN_GLOBAL);
+        const sourceOffset = devProc.stdout().length;
+        const sourceRestart = devProc.waitForOutput(
+          FUNCTION_FILES_RESTART_PATTERN,
+          FUNCTIONS_DEV_STEP_TIMEOUT_MS,
+          sourceOffset,
+        );
         await writeFile(
           functionPath,
           `Deno.serve(() => {
@@ -145,13 +166,9 @@ verify_jwt = false
 });
 `,
         );
-        await waitForOutputMatchCount(
-          devProc,
-          FUNCTION_FILES_RESTART_PATTERN_GLOBAL,
-          restartCount + 1,
-        );
+        await sourceRestart;
 
-        await waitForFunctionResponse(
+        await assertFunctionResponse(
           functionUrl,
           {
             method: "POST",
@@ -165,7 +182,7 @@ verify_jwt = false
         );
       } finally {
         devProc?.kill("SIGTERM");
-        await devProc?.waitForExit().catch(() => {});
+        await devProc?.waitForExit().catch(() => undefined);
       }
     },
   );

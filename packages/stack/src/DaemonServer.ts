@@ -1,4 +1,4 @@
-import { Deferred, Effect, Layer, Context, Stream } from "effect";
+import { Deferred, Effect, Fiber, Layer, Context, Stream } from "effect";
 import {
   Headers,
   HttpRouter,
@@ -7,10 +7,14 @@ import {
   HttpServerResponse,
 } from "effect/unstable/http";
 import * as Sse from "effect/unstable/encoding/Sse";
-import type { DaemonErrorResponse } from "./DaemonProtocol.ts";
+import type { ControlOwnerStatus, DaemonErrorResponse } from "./DaemonProtocol.ts";
 import { FunctionsReloadConfigSchema } from "./functions.ts";
 import { EdgeRuntimeReloadConfigSchema, Stack } from "./Stack.ts";
 import { ReadyOptionsSchema } from "./StackConfig.ts";
+import {
+  managedStackLaunchUpdateSchema,
+  type ManagedStackLaunchUpdate,
+} from "./managed/document.ts";
 
 // ---------------------------------------------------------------------------
 // Service
@@ -26,15 +30,28 @@ export class DaemonServer extends Context.Service<
 >()("stack/DaemonServer") {
   static layerWithShutdown = (
     beforeShutdown: Effect.Effect<void> = Effect.void,
+    ownerStatus: Effect.Effect<ControlOwnerStatus> = Effect.succeed({
+      protocolVersion: 1,
+      ownershipId: "unbound",
+      state: "running",
+      ready: true,
+    }),
+    options: {
+      readonly includeOwnerRoute?: boolean;
+      readonly launchUpdate?: (launch: ManagedStackLaunchUpdate) => Effect.Effect<void, unknown>;
+      /** Supervisor-owned shutdown callbacks already stop the local stack. */
+      readonly stopOnShutdown?: boolean;
+    } = {},
   ): Layer.Layer<DaemonServer, never, Stack | HttpServer.HttpServer> =>
     Layer.effect(
       this,
       Effect.gen(function* () {
         const stack = yield* Stack;
         const server = yield* HttpServer.HttpServer;
+        const scope = yield* Effect.scope;
         const shutdownDeferred = yield* Deferred.make<void>();
         const textEncoder = new TextEncoder();
-        const errorResponse = (body: DaemonErrorResponse, status: 400 | 404 | 500) =>
+        const errorResponse = (body: DaemonErrorResponse, status: 400 | 404 | 409 | 500) =>
           HttpServerResponse.jsonUnsafe(body, { status });
         const notFoundResponse = (name: string) =>
           errorResponse(
@@ -51,8 +68,24 @@ export class DaemonServer extends Context.Service<
             },
             500,
           );
-        const buildErrorResponse = (detail: string) =>
-          errorResponse({ code: "STACK_BUILD_ERROR", error: detail }, 500);
+        const buildErrorResponse = (detail: string, reason?: DaemonErrorResponse["reason"]) =>
+          errorResponse(
+            {
+              code: "STACK_BUILD_ERROR",
+              error: detail,
+              ...(reason === undefined ? {} : { reason }),
+            },
+            500,
+          );
+        const notRunningResponse = (phase: string) =>
+          errorResponse(
+            {
+              code: "STACK_NOT_RUNNING",
+              error: `Stack is not running (phase: ${phase})`,
+              phase,
+            },
+            409,
+          );
         const invalidReloadPayloadResponse = () =>
           errorResponse(
             { code: "STACK_BUILD_ERROR", error: "Invalid Edge Functions reload payload" },
@@ -70,17 +103,32 @@ export class DaemonServer extends Context.Service<
             },
             500,
           );
-        const beginShutdown = beforeShutdown.pipe(
-          Effect.ensuring(
-            // The HTTP module has no response-flushed hook. Delay the process
-            // shutdown signal long enough for the final JSON response to leave
-            // the socket.
-            Deferred.succeed(shutdownDeferred, void 0).pipe(
-              Effect.delay("25 millis"),
-              Effect.forkDetach,
+        const shutdownTransaction = Effect.uninterruptible(
+          Effect.gen(function* () {
+            if (options.stopOnShutdown !== false) yield* stack.stop();
+            yield* beforeShutdown;
+          }).pipe(
+            Effect.ensuring(
+              // The HTTP module has no response-flushed hook. Delay the process
+              // shutdown signal long enough for the final JSON response to leave
+              // the socket.
+              Deferred.succeed(shutdownDeferred, void 0).pipe(
+                Effect.delay("25 millis"),
+                Effect.forkIn(scope, { startImmediately: true, uninterruptible: true }),
+                Effect.asVoid,
+              ),
             ),
           ),
         );
+        const shutdownFiber = yield* Effect.cached(
+          Effect.uninterruptible(
+            Effect.forkIn(shutdownTransaction, scope, {
+              startImmediately: true,
+              uninterruptible: true,
+            }),
+          ),
+        );
+        const beginShutdown = shutdownFiber.pipe(Effect.flatMap(Fiber.join));
         const terminalReadinessResponse = (target: string, timeoutMs: number, detail: string) =>
           beginShutdown.pipe(Effect.as(readinessTimeoutResponse(target, timeoutMs, detail)));
 
@@ -108,10 +156,40 @@ export class DaemonServer extends Context.Service<
             },
           );
 
+        const ownerRoutes =
+          options.includeOwnerRoute === false
+            ? []
+            : [
+                HttpRouter.route(
+                  "GET",
+                  "/owner",
+                  ownerStatus.pipe(Effect.map((status) => HttpServerResponse.jsonUnsafe(status))),
+                ),
+              ];
+        const launchUpdate = options.launchUpdate;
         const routes = [
+          ...ownerRoutes,
           // Health check
           HttpRouter.route("GET", "/health", HttpServerResponse.text("OK", { status: 200 })),
 
+          ...(launchUpdate === undefined
+            ? []
+            : [
+                HttpRouter.route(
+                  "POST",
+                  "/managed/launch",
+                  Effect.gen(function* () {
+                    const launch = yield* HttpServerRequest.schemaBodyJson(
+                      managedStackLaunchUpdateSchema,
+                    );
+                    yield* launchUpdate(launch);
+                    return HttpServerResponse.jsonUnsafe({ ok: true });
+                  }),
+                ),
+              ]),
+
+          // Versioned lifecycle ownership/readiness status. The remaining
+          // routes are the existing Stack management transport.
           // Status: connection info + all service states
           HttpRouter.route(
             "GET",
@@ -144,7 +222,7 @@ export class DaemonServer extends Context.Service<
                 Effect.succeed(notReadyResponse(e.name, e.reason, e.exitCode)),
               ),
               Effect.catchTag("StackBuildError", (e) =>
-                Effect.succeed(buildErrorResponse(e.detail)),
+                Effect.succeed(buildErrorResponse(e.detail, e.reason)),
               ),
               Effect.catchTag("StackReadinessError", (e) =>
                 terminalReadinessResponse(e.target, e.timeoutMs, e.detail),
@@ -168,7 +246,7 @@ export class DaemonServer extends Context.Service<
                 Effect.succeed(notReadyResponse(e.name, e.reason, e.exitCode)),
               ),
               Effect.catchTag("StackBuildError", (e) =>
-                Effect.succeed(buildErrorResponse(e.detail)),
+                Effect.succeed(buildErrorResponse(e.detail, e.reason)),
               ),
               Effect.catchTag("StackReadinessError", (e) =>
                 terminalReadinessResponse(e.target, e.timeoutMs, e.detail),
@@ -181,7 +259,6 @@ export class DaemonServer extends Context.Service<
             "POST",
             "/stop",
             Effect.gen(function* () {
-              yield* stack.stop();
               yield* beginShutdown;
               return HttpServerResponse.jsonUnsafe({ ok: true });
             }),
@@ -252,7 +329,10 @@ export class DaemonServer extends Context.Service<
                 Effect.succeed(notReadyResponse(e.name, e.reason, e.exitCode)),
               ),
               Effect.catchTag("StackBuildError", (e) =>
-                Effect.succeed(buildErrorResponse(e.detail)),
+                Effect.succeed(buildErrorResponse(e.detail, e.reason)),
+              ),
+              Effect.catchTag("StackNotRunningError", (e) =>
+                Effect.succeed(notRunningResponse(e.phase)),
               ),
               Effect.catchTag("StackReadinessError", (e) =>
                 terminalReadinessResponse(e.target, e.timeoutMs, e.detail),
@@ -280,7 +360,7 @@ export class DaemonServer extends Context.Service<
                 Effect.succeed(notReadyResponse(e.name, e.reason, e.exitCode)),
               ),
               Effect.catchTag("StackBuildError", (e) =>
-                Effect.succeed(buildErrorResponse(e.detail)),
+                Effect.succeed(buildErrorResponse(e.detail, e.reason)),
               ),
               Effect.catchTag("StackReadinessError", (e) =>
                 terminalReadinessResponse(e.target, e.timeoutMs, e.detail),
@@ -300,7 +380,10 @@ export class DaemonServer extends Context.Service<
                 Effect.succeed(notFoundResponse(e.name)),
               ),
               Effect.catchTag("StackBuildError", (e) =>
-                Effect.succeed(buildErrorResponse(e.detail)),
+                Effect.succeed(buildErrorResponse(e.detail, e.reason)),
+              ),
+              Effect.catchTag("StackNotRunningError", (e) =>
+                Effect.succeed(notRunningResponse(e.phase)),
               ),
             ),
           ),
@@ -320,7 +403,10 @@ export class DaemonServer extends Context.Service<
                 Effect.succeed(notReadyResponse(e.name, e.reason, e.exitCode)),
               ),
               Effect.catchTag("StackBuildError", (e) =>
-                Effect.succeed(buildErrorResponse(e.detail)),
+                Effect.succeed(buildErrorResponse(e.detail, e.reason)),
+              ),
+              Effect.catchTag("StackNotRunningError", (e) =>
+                Effect.succeed(notRunningResponse(e.phase)),
               ),
               Effect.catchTag("StackReadinessError", (e) =>
                 terminalReadinessResponse(e.target, e.timeoutMs, e.detail),
@@ -347,7 +433,10 @@ export class DaemonServer extends Context.Service<
                 Effect.succeed(notReadyResponse(e.name, e.reason, e.exitCode)),
               ),
               Effect.catchTag("StackBuildError", (e) =>
-                Effect.succeed(buildErrorResponse(e.detail)),
+                Effect.succeed(buildErrorResponse(e.detail, e.reason)),
+              ),
+              Effect.catchTag("StackNotRunningError", (e) =>
+                Effect.succeed(notRunningResponse(e.phase)),
               ),
               Effect.catchTag("StackReadinessError", (e) =>
                 terminalReadinessResponse(e.target, e.timeoutMs, e.detail),
@@ -374,7 +463,10 @@ export class DaemonServer extends Context.Service<
                 Effect.succeed(notReadyResponse(e.name, e.reason, e.exitCode)),
               ),
               Effect.catchTag("StackBuildError", (e) =>
-                Effect.succeed(buildErrorResponse(e.detail)),
+                Effect.succeed(buildErrorResponse(e.detail, e.reason)),
+              ),
+              Effect.catchTag("StackNotRunningError", (e) =>
+                Effect.succeed(notRunningResponse(e.phase)),
               ),
               Effect.catchTag("StackReadinessError", (e) =>
                 terminalReadinessResponse(e.target, e.timeoutMs, e.detail),

@@ -19,7 +19,7 @@ export interface FormattedCliErrors {
 }
 
 export function cliErrorCode(error: CliError.CliError): string {
-  return error._tag === "UnknownSubcomand" ? "UnknownSubcommand" : error._tag;
+  return error._tag;
 }
 
 interface CommandWithHelpDoc extends Command.Command.Any {
@@ -62,6 +62,33 @@ function findCommand(
   return current;
 }
 
+/**
+ * The longest command-path prefix argv's positionals resolve to in the tree,
+ * cobra-`Find`-style: segments descend while they match a subcommand and stop
+ * at the first that doesn't (an operand). Includes the root's own name, the
+ * shape `isValueTakingFlagTokenFor` expects.
+ */
+export function resolvedCommandPathForArgv(
+  rootCommand: Command.Command.Any,
+  positionals: ReadonlyArray<string>,
+): ReadonlyArray<string> {
+  const path: Array<string> = [rootCommand.name];
+  let current: Command.Command.Any = rootCommand;
+  for (const segment of positionals) {
+    let next: Command.Command.Any | undefined;
+    for (const group of current.subcommands) {
+      next = group.commands.find(
+        (command) => command.name === segment || command.alias === segment,
+      );
+      if (next) break;
+    }
+    if (!next) break;
+    current = next;
+    path.push(segment);
+  }
+  return path;
+}
+
 function collectDescendants(
   command: Command.Command.Any,
   commandPath: ReadonlyArray<string>,
@@ -70,7 +97,7 @@ function collectDescendants(
   const visit = (current: Command.Command.Any, path: ReadonlyArray<string>) => {
     for (const group of current.subcommands) {
       for (const child of group.commands) {
-        if (child.hidden) continue;
+        if (child.unlisted) continue;
 
         const childPath = [...path, child.name];
         const helpDoc = helpDocFor(child, childPath);
@@ -293,7 +320,7 @@ export function formatCliErrorsForDisplay(
       }
     }
 
-    if (error._tag === "UnknownSubcomand" && suppressedUnknownSubcommands.has(error.subcommand)) {
+    if (error._tag === "UnknownSubcommand" && suppressedUnknownSubcommands.has(error.subcommand)) {
       changed = true;
       continue;
     }

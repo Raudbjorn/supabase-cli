@@ -1,6 +1,7 @@
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { ServiceNotFoundError, type LogEntry } from "@supabase/process-compose";
-import { Effect, Layer, ManagedRuntime, Stream } from "effect";
+import { Deferred, Effect, Fiber, Layer, ManagedRuntime, Predicate, Stream } from "effect";
+import { HttpServer } from "effect/unstable/http";
 import * as http from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { DaemonServer } from "./DaemonServer.ts";
@@ -55,8 +56,14 @@ const MOCK_LOGS: ReadonlyArray<LogEntry> = [
 // Mock Stack
 // ---------------------------------------------------------------------------
 
-function mockStack(options: { readonly startTimeoutMs?: number } = {}) {
+function mockStack(
+  options: {
+    readonly startTimeoutMs?: number;
+    readonly stopEffect?: Effect.Effect<void>;
+  } = {},
+) {
   let stopped = false;
+  let stopCalls = 0;
   const serviceCalls: string[] = [];
   const functionReloads: FunctionsReloadConfig[] = [];
 
@@ -73,8 +80,10 @@ function mockStack(options: { readonly startTimeoutMs?: number } = {}) {
             }),
           ),
     stop: () =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
         stopped = true;
+        stopCalls += 1;
+        if (options.stopEffect !== undefined) yield* options.stopEffect;
       }),
     dispose: () =>
       Effect.sync(() => {
@@ -144,6 +153,9 @@ function mockStack(options: { readonly startTimeoutMs?: number } = {}) {
     get stopped() {
       return stopped;
     },
+    get stopCalls() {
+      return stopCalls;
+    },
     serviceCalls,
     functionReloads,
   };
@@ -177,16 +189,12 @@ function buildDaemonLayer(
   ) as Layer.Layer<DaemonServer, never, never>;
 }
 
-function getUrl(address: {
-  readonly _tag: string;
-  readonly hostname?: string;
-  readonly port?: number;
-}): string {
-  if (address._tag === "TcpAddress") {
+function getUrl(address: HttpServer.Address): string {
+  if (Predicate.isTagged(address, "TcpAddress")) {
     const host = address.hostname === "0.0.0.0" ? "127.0.0.1" : address.hostname;
     return `http://${host}:${address.port}`;
   }
-  throw new Error(`Unexpected address type: ${address._tag}`);
+  throw new Error("Unexpected address type");
 }
 
 // ---------------------------------------------------------------------------
@@ -492,6 +500,51 @@ describe("DaemonServer", () => {
     const body = (await res.json()) as { ok: boolean };
     expect(body.ok).toBe(true);
     expect(mock.stopped).toBe(true);
+  });
+
+  test("concurrent POST /stop requests share one shutdown", async () => {
+    const concurrentMock = mockStack();
+    const concurrentRuntime = ManagedRuntime.make(
+      buildDaemonLayer(concurrentMock, Effect.sleep("20 millis")),
+    );
+    const concurrentDaemon = await concurrentRuntime.runPromise(DaemonServer);
+    const concurrentUrl = getUrl(concurrentDaemon.address);
+    try {
+      const responses = await Promise.all([
+        fetch(`${concurrentUrl}/stop`, { method: "POST" }),
+        fetch(`${concurrentUrl}/stop`, { method: "POST" }),
+      ]);
+      expect(responses.map((response) => response.status)).toEqual([200, 200]);
+      expect(concurrentMock.stopCalls).toBe(1);
+    } finally {
+      await concurrentRuntime.dispose();
+    }
+  });
+
+  test("an interrupted shutdown caller cannot strand the cached transaction", async () => {
+    const stopEntered = await Effect.runPromise(Deferred.make<void>());
+    const releaseStop = await Effect.runPromise(Deferred.make<void>());
+    const gatedMock = mockStack({
+      stopEffect: Effect.gen(function* () {
+        yield* Deferred.succeed(stopEntered, void 0);
+        yield* Deferred.await(releaseStop);
+      }),
+    });
+    const gatedRuntime = ManagedRuntime.make(buildDaemonLayer(gatedMock));
+    try {
+      const daemon = await gatedRuntime.runPromise(DaemonServer);
+      const first = gatedRuntime.runFork(daemon.beginShutdown);
+      await gatedRuntime.runPromise(Deferred.await(stopEntered));
+      const interrupt = gatedRuntime.runFork(Fiber.interrupt(first));
+      await gatedRuntime.runPromise(Deferred.succeed(releaseStop, void 0));
+
+      await gatedRuntime.runPromise(Fiber.join(interrupt));
+      await gatedRuntime.runPromise(daemon.beginShutdown);
+      await gatedRuntime.runPromise(daemon.awaitShutdown);
+      expect(gatedMock.stopCalls).toBe(1);
+    } finally {
+      await gatedRuntime.dispose();
+    }
   });
 
   test("POST /stop unregisters the daemon before responding", async () => {

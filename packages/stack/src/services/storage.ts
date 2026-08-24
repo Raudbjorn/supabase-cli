@@ -1,13 +1,18 @@
 import type { ServiceDef } from "@supabase/process-compose";
 import { dockerNetworkArgs } from "../Platform.ts";
+import type { StackIdentity } from "../StackIdentity.ts";
 import { removePathOnOrphanCleanup } from "./docker-cleanup.ts";
-import { dockerRunService, type ServiceDependency } from "./service-utils.ts";
+import {
+  dockerRunService,
+  type ContainerRuntimeOptions,
+  type ServiceDependency,
+} from "./service-utils.ts";
 import { stackHealthBudgets } from "./health-budgets.ts";
 
-interface DockerStorageOptions {
+interface DockerStorageOptions extends ContainerRuntimeOptions {
   readonly image: string;
   readonly port: number;
-  readonly apiPort: number;
+  readonly identity: StackIdentity;
   readonly dbHost: string;
   readonly dbPort: number;
   readonly dataDir: string;
@@ -45,8 +50,9 @@ const storageHealthCheck = (port: number): ServiceDef["healthCheck"] => ({
 
 export const makeStorageServiceDocker = (opts: DockerStorageOptions): ServiceDef =>
   dockerRunService({
+    runtime: opts.runtime,
     name: "storage",
-    apiPort: opts.apiPort,
+    identity: opts.identity,
     image: opts.image,
     networkArgs: dockerNetworkArgs(opts.platformOs, [opts.port]),
     volumes: [`${opts.dataDir}:${STORAGE_DATA_DIR}`],

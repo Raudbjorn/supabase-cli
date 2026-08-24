@@ -8,9 +8,11 @@ import type * as HttpClientRequest from "effect/unstable/http/HttpClientRequest"
 
 import { makeApiClient, operationDefinitions } from "./effect.ts";
 import {
+  V1CreateASsoProviderInput,
   V1CreateASsoProviderOutput,
   V1DeleteASsoProviderOutput,
   V1GetASsoProviderOutput,
+  V1GetDatabaseOpenapiOutput,
   V1ListAllSsoProviderOutput,
   V1UpdateASsoProviderOutput,
 } from "./generated/contracts.ts";
@@ -57,7 +59,7 @@ const config = {
   userAgent: "supabase-api/test",
 } as const;
 
-describe("SSO provider response contracts", () => {
+describe("SSO provider contracts", () => {
   // The provider payload the Management API actually returns: no `saml.id` and
   // no `domains[].id` — neither field exists in the spec (or in the Go CLI's
   // `api.ListProvidersResponse`). Every SSO subcommand decodes one of these
@@ -111,6 +113,38 @@ describe("SSO provider response contracts", () => {
       expect(decoded.saml).not.toHaveProperty("id");
       expect(decoded.domains?.[0]).not.toHaveProperty("id");
     }
+  });
+
+  test("accepts object-valued SSO attribute mapping defaults", () => {
+    expect(() =>
+      Schema.decodeUnknownSync(V1CreateASsoProviderInput)({
+        ref: "abcdefghijklmnopqrst",
+        type: "saml",
+        attribute_mapping: {
+          keys: {
+            role: { default: { department: "engineering" } },
+          },
+        },
+      }),
+    ).not.toThrow();
+  });
+});
+
+describe("database OpenAPI response contract", () => {
+  test("accepts a normal non-empty OpenAPI document", () => {
+    expect(() =>
+      Schema.decodeUnknownSync(V1GetDatabaseOpenapiOutput)({
+        openapi: "3.0.0",
+        info: { title: "Example", version: "1.0.0" },
+        paths: {
+          "/users": {
+            get: {
+              responses: { "200": { description: "ok" } },
+            },
+          },
+        },
+      }),
+    ).not.toThrow();
   });
 });
 
@@ -438,6 +472,75 @@ describe("makeApiClient", () => {
       {
         method: "GET",
         url: "https://api.supabase.com/v1/projects",
+      },
+    ]);
+  });
+
+  test("addresses same-named v1 and v2 operations independently by namespace", async () => {
+    const seenRequests: Array<{ method: string; url: string }> = [];
+
+    const client = await Effect.runPromise(
+      makeApiClient(config).pipe(
+        Effect.provide(
+          httpClientLayer((request) => {
+            seenRequests.push({
+              method: request.method,
+              url: request.url,
+            });
+
+            if (request.url === "https://api.supabase.com/v1/organizations/my-org/members") {
+              return Effect.succeed(
+                jsonResponse(request, 200, [
+                  {
+                    user_id: "user-id",
+                    user_name: "user-name",
+                    role_name: "Owner",
+                    mfa_enabled: false,
+                    avatar_url: null,
+                  },
+                ]),
+              );
+            }
+
+            return Effect.succeed(
+              jsonResponse(request, 200, {
+                data: [],
+                links: { prev: null, next: null },
+              }),
+            );
+          }),
+        ),
+      ),
+    );
+
+    expect(typeof client.v1.listOrganizationMembers).toBe("function");
+    expect(typeof client.v2.listOrganizationMembers).toBe("function");
+
+    const v1Members = await Effect.runPromise(
+      client.v1.listOrganizationMembers({ slug: "my-org" }),
+    );
+    const v2Members = await Effect.runPromise(
+      client.v2.listOrganizationMembers({ slug: "my-org" }),
+    );
+
+    expect(v1Members).toEqual([
+      {
+        user_id: "user-id",
+        user_name: "user-name",
+        role_name: "Owner",
+        mfa_enabled: false,
+        avatar_url: null,
+      },
+    ]);
+    expect(v2Members.data).toEqual([]);
+    expect(seenRequests).toEqual([
+      {
+        method: "GET",
+        url: "https://api.supabase.com/v1/organizations/my-org/members",
+      },
+      {
+        method: "GET",
+        url: "https://api.supabase.com/v2/organizations/my-org/members",
       },
     ]);
   });

@@ -1,39 +1,40 @@
 import {
   DEFAULT_VERSIONS,
   SERVICE_NAMES,
-  dockerImageCandidatesForArtifact,
   dockerImageForArtifact,
-  imageTagPrefixForService,
+  serviceMetadata,
 } from "./ServiceCatalog.ts";
 import type { ServiceName } from "./ServiceName.ts";
+import { Schema } from "effect";
 
 export { DEFAULT_VERSIONS, SERVICE_NAMES } from "./ServiceCatalog.ts";
 export type { ServiceName } from "./ServiceName.ts";
 
 export type VersionManifest = Readonly<Record<ServiceName, string>>;
 
-export const IMAGE_TAG_PREFIX: Partial<Record<ServiceName, string>> = Object.fromEntries(
-  SERVICE_NAMES.flatMap((service) => {
-    const prefix = imageTagPrefixForService(service);
-    return prefix === undefined ? [] : [[service, prefix]];
-  }),
-);
+export const PartialVersionManifestSchema = Schema.Struct({
+  postgres: Schema.optionalKey(Schema.String),
+  postgrest: Schema.optionalKey(Schema.String),
+  auth: Schema.optionalKey(Schema.String),
+  "edge-runtime": Schema.optionalKey(Schema.String),
+  realtime: Schema.optionalKey(Schema.String),
+  storage: Schema.optionalKey(Schema.String),
+  imgproxy: Schema.optionalKey(Schema.String),
+  mailpit: Schema.optionalKey(Schema.String),
+  pgmeta: Schema.optionalKey(Schema.String),
+  studio: Schema.optionalKey(Schema.String),
+  analytics: Schema.optionalKey(Schema.String),
+  vector: Schema.optionalKey(Schema.String),
+  pooler: Schema.optionalKey(Schema.String),
+});
+
+export type PartialVersionManifest = Schema.Schema.Type<typeof PartialVersionManifestSchema>;
 
 /**
  * Returns the full Docker image URL for a service.
- *
- * Uses the same registry resolution as the Go CLI: images are pulled from
- * `public.ecr.aws/supabase/` by default (faster than Docker Hub).
  */
 export function dockerImageForService(service: ServiceName, version: string): string {
-  return dockerImageForArtifact(service, version);
-}
-
-export function dockerImageCandidatesForService(
-  service: ServiceName,
-  version: string,
-): ReadonlyArray<string> {
-  return dockerImageCandidatesForArtifact(service, version);
+  return dockerImageForArtifact(service, normalizeServiceVersion(service, version));
 }
 
 function assertFullVersions(
@@ -52,28 +53,20 @@ export function fullVersionManifest(
   return versions;
 }
 
-/**
- * Normalizes a version string for a service based on its image tag prefix.
- *
- * Services with a "v" prefix in IMAGE_TAG_PREFIX (e.g. postgrest, auth) store
- * versions without the "v" prefix (it gets prepended at image-pull time).
- * Services without a prefix entry but whose DEFAULT_VERSIONS start with "v"
- * (e.g. imgproxy, mailpit) store versions with the "v" prefix.
- * All other services pass through trimmed.
- */
+/** Normalizes a version string to the catalog's canonical stored form. */
 export function normalizeServiceVersion(service: ServiceName, version: string): string {
-  const trimmed = version.trim();
-  const prefix = IMAGE_TAG_PREFIX[service];
-
-  if (prefix === "v") {
-    return trimmed.replace(/^v/i, "");
-  }
-
-  if (prefix === undefined && DEFAULT_VERSIONS[service].startsWith("v")) {
-    return /^v/i.test(trimmed) ? `v${trimmed.slice(1)}` : `v${trimmed}`;
-  }
-
-  return trimmed;
+  const normalized = version.trim();
+  const metadata = serviceMetadata(service);
+  const tagPrefix = metadata.artifact.docker.tagPrefix;
+  const withoutDockerTagPrefix =
+    tagPrefix !== undefined &&
+    normalized.slice(0, tagPrefix.length).toLowerCase() === tagPrefix.toLowerCase()
+      ? normalized.slice(tagPrefix.length)
+      : normalized;
+  if (!metadata.defaultVersion.startsWith("v")) return withoutDockerTagPrefix;
+  return withoutDockerTagPrefix.slice(0, 1).toLowerCase() === "v"
+    ? `v${withoutDockerTagPrefix.slice(1)}`
+    : `v${withoutDockerTagPrefix}`;
 }
 
 export function normalizeServiceVersions(

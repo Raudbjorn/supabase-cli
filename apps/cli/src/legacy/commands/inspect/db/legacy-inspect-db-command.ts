@@ -6,8 +6,8 @@ import { withLegacyCommandInstrumentation } from "../../../telemetry/legacy-comm
 import type { LegacyInspectConnectionFlags } from "./legacy-inspect-query.ts";
 
 /**
- * The `inspect` persistent flag set, inherited by every `inspect db` subcommand
- * (`apps/cli-go/cmd/inspect.go:259-263`). Shared verbatim across all 25 commands
+ * The `inspect` persistent flag set, inherited by every `inspect db` subcommand.
+ * Shared verbatim across all 25 commands
  * so the flag names and descriptions live in one place. `Command.make` reads this
  * immutable descriptor without mutating it, so a single instance is safe to reuse.
  */
@@ -18,8 +18,19 @@ export const LEGACY_INSPECT_DB_FLAGS = {
     ),
     Flag.optional,
   ),
-  linked: Flag.boolean("linked").pipe(Flag.withDescription("Inspect the linked project.")),
-  local: Flag.boolean("local").pipe(Flag.withDescription("Inspect the local database.")),
+  linked: Flag.boolean("linked").pipe(
+    Flag.withDescription("Inspect the linked project."),
+    Flag.withDefault(false),
+  ),
+  local: Flag.boolean("local").pipe(
+    Flag.withDescription("Inspect the local database."),
+    Flag.withDefault(false),
+  ),
+  // TS-only override of the linked project ref — see push.command.ts (db push).
+  projectRef: Flag.string("project-ref").pipe(
+    Flag.withDescription("Project ref of the Supabase project."),
+    Flag.optional,
+  ),
 } as const;
 
 /**
@@ -34,7 +45,15 @@ export function legacyInspectDbCommandHandler<E, R>(
   return (flags: LegacyInspectConnectionFlags) =>
     handler(flags).pipe(
       withLegacyCommandInstrumentation({
-        flags: { "db-url": flags.dbUrl, linked: flags.linked, local: flags.local },
+        flags: {
+          "db-url": flags.dbUrl,
+          linked: flags.linked,
+          local: flags.local,
+          "project-ref": flags.projectRef,
+        },
+        // TS-only flag with no Go telemetry-safety baseline; Go's nearest
+        // --project-ref registrations (cmd/pgdelta_catalog.go:44 and most
+        // others) are unmarked, so it stays redacted.
       }),
       withJsonErrorHandling,
     );

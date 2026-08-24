@@ -1,319 +1,318 @@
-# Architecture of `@supabase/stack`
+# How `@supabase/stack` works
 
-`@supabase/stack` turns Supabase-local configuration into a supervised graph of native processes
-and Docker containers. It owns Supabase-specific configuration, artifact selection, topology,
-proxying, state projection, managed-daemon persistence, and cleanup. Generic process lifecycle is
-delegated to [`@supabase/process-compose`](../../process-compose/docs/architecture.md).
+`@supabase/stack` is the local Supabase runtime for Node and Bun. It has two
+runtime modes that share the same service graph, port allocator, and HTTP
+proxy:
+
+- **Direct** (`createStack`) keeps the stack in the caller's process and lets
+  the caller own its lifecycle.
+- **Managed** (`daemonLayer` and the managed lifecycle facade) runs one
+  supervisor child per deterministic stack identity. The CLI uses this mode
+  when a stack must outlive one command, be reattached by another command, or
+  be isolated from a sibling worktree.
+
+Choose direct mode for an application, test, or script that can keep a handle
+open and dispose it. Choose managed mode for a CLI workflow or any caller that
+needs detached ownership, durable status, sticky ports, logs, or reattachment.
+Managed mode is a coordination layer around the direct runtime; it does not
+introduce a second service registry, repository contract, or SQLite adapter.
+
+## Managed startup at a glance
+
+The parent resolves the workspace identity before forking. During normal
+startup, the child owns the lease, binds the control endpoint, and performs the
+manager writes under that ownership. Recovery operations can acquire the same
+ownership through the lifecycle facade.
+
+```mermaid
+sequenceDiagram
+    participant CLI
+    participant Parent as supervisor parent
+    participant Child as managed child
+    participant Manager as ManagedStackManager
+    participant Control as loopback control endpoint
+    participant Runtime as direct Stack runtime
+
+    CLI->>Parent: daemonLayer(config, port intents, launch)
+    Parent->>Child: fork + start message (resolved stack id)
+    Child->>Control: acquire ownership + bind deterministic endpoint
+    Child->>Manager: ensure workspace + verify stack id
+    Child->>Manager: resolve document, allocate/reuse ports
+    Child->>Manager: write starting
+    Child->>Runtime: build Stack, ApiProxy, and DaemonServer
+    Child->>Manager: write running + runtime endpoint
+    Child-->>Parent: started(endpoint)
+    Parent-->>CLI: RemoteStack layer
+    CLI->>Control: stack.start(), status, logs, or service operation
+```
+
+`running` in the managed document means that the supervisor and control owner
+are ready. The service states are published by the same `Stack` runtime and
+move when the caller invokes `stack.start()` or an individual service
+operation.
 
 ## Public entrypoints
 
-The package exposes two levels of Interface:
+The package exposes the same platform-neutral contracts through conditional
+Node and Bun bindings:
 
-- `@supabase/stack` selects `bun.ts` or `node.ts` through export conditions and exposes the
-  Promise-oriented `createStack()` / `StackHandle` Interface plus prefetch helpers.
-- `@supabase/stack/effect` selects a runtime Adapter through the same export conditions and exposes
-  Effect Interfaces plus platform-bound layer factories used by the CLI and advanced callers.
-- `@supabase/stack/testing` exposes only the service tags needed to replace daemon transport in
-  consumer tests. Runtime implementation tags do not leak through the root or Effect barrels.
+- `@supabase/stack` is the Promise-based direct API (`createStack`, `prefetch`,
+  and the stack types).
+- `@supabase/stack/effect` provides the platform-bound Effect layers. It
+  includes `foregroundLayer` for direct use, `daemonLayer` to launch a managed
+  supervisor, `connectLayer` to reattach, and lifecycle/discovery helpers such
+  as `stopDaemon` and `updateManagedLaunch`.
+- `@supabase/stack/managed` exposes managed identity, control, document,
+  manager, and lifecycle operations for consumers that need those boundaries
+  directly.
+- `@supabase/stack/testing` exposes only runtime seams used to build integration
+  tests; it is not a production repository or fixture contract.
 
-Internal runtime Adapters provide Effect filesystem, path, child-process, HTTP-server, and Unix
-socket HTTP implementations. `createStack.ts` and the layer factories remain platform-agnostic;
-the conditional root and Effect entries bind them to their selected runtime.
+`@supabase/stack/daemon-bun` is an internal compiled-Bun re-entry target. The
+Node and Bun entrypoints provide filesystem, path, process, HTTP, and control
+transport services to the shared implementation.
 
-```mermaid
-flowchart LR
-    Input["StackConfig"] --> Resolve["StackConfigResolver"]
-    Resolve --> Layer["foregroundLayer"]
-    Layer --> Prepare["StackPreparation"]
-    Prepare --> Builder["StackBuilder"]
-    Builder --> Orch["process-compose Orchestrator"]
-    Layer --> Proxy["ApiProxy"]
-    Orch --> Stack["Stack Interface"]
-    Proxy --> Stack
-```
+## Direct runtime
 
-`StackHandle` converts Effect calls and streams to Promises and `AsyncIterable`s and implements
-`AsyncDisposable`. The Effect `Stack` Interface is also implemented by `RemoteStack`, so CLI code
-can use the same lifecycle calls against an in-process stack or a detached daemon.
+The internal `createStack` Effect validates allocation-free port intents, acquires
+one authoritative lease for every active field, then resolves configuration once
+with those selected ports and builds a scoped runtime and handle. Temporary roots
+created during resolution are tracked and removed on failure. Node and Bun adapt
+that handle to the Promise/`AsyncIterable` facade at the package edge; there is no
+Promise resolver that can expose a placeholder port set. The lease owns each
+socket until its exact runtime consumer takes over the port, and retains every
+remaining reservation until disposal. Automatic API-port handoff may retry with
+an OS-selected port only before the first successful start, while explicit ports
+remain sticky.
+The direct runtime does **not** start service processes. Asset preparation and
+process-compose graph construction happen when the handle is first started or
+a service is activated.
 
-## Configuration and roots
+`stack.start()` starts services according to the configured startup mode and
+waits for the selected readiness policy. The handle also exposes status, logs,
+per-service operations, and graceful `stop()`/`dispose()` methods. Its scope
+owns service processes and releases the lease when disposed. A direct stack
+never reads or writes managed documents and never coordinates with a sibling
+stack.
 
-`StackConfig` is an in-memory library input, not the project configuration-file schema. Its
-top-level fields choose runtime mode, startup mode, cache/runtime roots, API keys, JWT secret, a
-resolved Edge Functions bundle, and per-service configuration. `false` disables an optional
-service.
+### Concurrency and cleanup
 
-`StackConfigResolver.resolveConfig()`:
+`DaemonServer` creates one lazily-started, uninterruptible shutdown fiber in
+the layer scope. Every stop or terminal-readiness caller joins that fiber, so
+concurrent requests share one transaction and interrupting one caller cannot
+cancel the owner. The short response-flush signal is also a scoped fiber.
 
-1. chooses cache, durable stack, runtime, and project roots;
-2. allocates every required port through one port allocator;
-3. creates development JWTs and opaque publishable/secret keys;
-4. applies per-service defaults and current `DEFAULT_VERSIONS`;
-5. records auto-managed paths for scoped cleanup.
+`StackPreparation` resolves independent services with a concurrency cap of four.
+Its closure includes the resources for every public graph dependency a requested
+service can start, so Docker never auto-pulls outside the preparation pipeline.
+Each service resolves one canonical GHCR image. Pulls retry only transient
+registry and network failures on a one-second exponential `Schedule`, capped at
+five retries; non-retryable failures surface immediately with deterministic
+details. Auto-managed roots are removed through the Effect `FileSystem` with a
+bounded retry schedule. Each removal pass is uninterruptible, while the delay
+between attempts remains interruptible; cleanup stays scoped to the exact paths
+owned by that stack. Stale binary staging directories use the same small
+concurrency cap during reconciliation.
 
-Readiness policy is part of the resolved configuration. The package default is a finite three-minute
-deadline; callers can choose a different finite deadline or explicit infinite waiting. Per-call
-`ReadyOptions` take precedence over the stack policy, while `inherit` delegates to the stack
-policy. The local Implementation applies this resolver to startup, service activation, restart,
-reload, and explicit readiness waits. A finite deadline fails with `StackReadinessError` and runs
-the same scoped cleanup used by disposal. Promise and remote Adapters pass `ReadyOptions` through
-to that Implementation instead of layering a second timeout rule around it.
+## Managed lifecycle
 
-Request-triggered lazy activation expands the package-default deadline when a service's transitive
-startup budget is longer than three minutes. Explicit finite and infinite stack policies are never
-expanded.
+### One document and one owner
 
-The current zero-config stack enables PostgreSQL, PostgREST, Auth, and Edge Runtime. Realtime,
-Storage, imgproxy, Mailpit, Postgres Meta, Studio, Analytics, Vector, and Supavisor are enabled only
-when their corresponding configuration object is present. In `native` mode, Edge Runtime is also
-disabled by omission because the automatic artifact policy currently classifies it as Docker-only.
-
-`mode` has these meanings:
-
-- `native`: require native artifacts and reject enabled Docker-only services;
-- `auto`: prefer supported native artifacts, then fall back to Docker;
-- `docker`: resolve every enabled service to a Docker image.
-
-`startupMode` defaults to `eager`; `lazy` defers eligible proxied services until first use.
-
-## Preparation and artifact resolution
-
-Preparation is separate from topology construction:
-
-- `ServiceCatalog.ts` is the exhaustive source for service identity, default version, runtime
-  support, artifact providers, activation policy, and allocated port fields.
-- `BinaryResolver` detects the platform, downloads and verifies archives, restores executable
-  permissions, and publishes complete cache entries atomically.
-- `StackPreparation` resolves all enabled public services, emits download/pull progress, and
-  returns `PreparedStackArtifacts`.
-- `StackBuilder` consumes only resolved artifacts; it does not perform network fetches.
-
-Native cache identity includes service, provider, version, and asset name. `.complete` is written
-last, so an incomplete download is never treated as reusable. Supabase-owned Docker images are
-tried through ECR, Docker Hub, then GHCR; upstream images use their canonical repository.
-
-`ServiceResolution` belongs to this preparation domain. `prefetch()` uses the same
-`StackPreparation` Interface and its binary-to-Docker fallback without constructing a lifecycle
-runtime.
-
-## Service coverage and topology
-
-`StackBuilder.build(config, prepared)` is the explicit owner of cross-service topology. Individual
-factories under `src/services/` own executable arguments, environment, mounts, health checks, and
-per-process cleanup. Docker factories also own their host-network and port-mapping arguments. The
-builder owns which definitions exist and how they depend on one another, including the choice
-between `postgres-init (completed)` and `postgres (healthy)` for every database consumer.
-
-| Public service | Automatic runtime support               | Principal dependency or role                                                                                       |
-| -------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `postgres`     | Native preferred, Docker fallback       | Root database process. Native PostgreSQL also introduces the internal `postgres-init` one-shot definition.         |
-| `postgrest`    | Native preferred, Docker fallback       | Database initialization completed, or PostgreSQL healthy in all-Docker mode.                                       |
-| `auth`         | Native preferred, Docker fallback       | Database initialization completed/healthy; optionally sends mail through Mailpit.                                  |
-| `edge-runtime` | Docker-only under automatic preparation | Database initialization completed/healthy; reads a generated functions runtime file.                               |
-| `realtime`     | Docker                                  | Database initialization completed/healthy; started eagerly and routed by the API proxy for ordinary HTTP requests. |
-| `storage`      | Docker                                  | Database initialization completed/healthy; optionally calls imgproxy.                                              |
-| `imgproxy`     | Docker                                  | Storage healthy; owned and activated with Storage.                                                                 |
-| `mailpit`      | Docker                                  | Direct web, SMTP, and POP3 listeners.                                                                              |
-| `pgmeta`       | Docker                                  | Database initialization completed/healthy.                                                                         |
-| `analytics`    | Docker                                  | Database initialization completed/healthy.                                                                         |
-| `vector`       | Docker                                  | Analytics healthy; owned and activated with Analytics.                                                             |
-| `pooler`       | Docker                                  | Database initialization completed/healthy; direct database and admin listeners.                                    |
-| `studio`       | Docker                                  | Postgres Meta healthy and, when enabled, Analytics healthy.                                                        |
-
-`postgres-init` is an internal helper only for native PostgreSQL. It applies initial schema and
-privilege setup and completes before database consumers start. `StackStateProjection` hides it and
-projects active initialization as `postgres: Initializing`; helper failure is projected onto
-PostgreSQL.
-
-Configuration validation prevents unsupported combinations, including imgproxy without Storage,
-Vector without Analytics, and Studio without Postgres Meta.
-
-## Lifecycle ownership
-
-The local Implementation is `LocalStack`. Its scoped layer owns one lifecycle:
-
-- preparation and its single-flight deferred;
-- graph construction and the process-compose runtime;
-- a shared `LogBuffer`;
-- public state projection;
-- activation and lifecycle locks;
-- exact cleanup targets and metadata persistence;
-- disposal of processes, Docker resources, ports, and auto-managed paths.
-
-`Stack.ts` contains only the public Effect Interface and transport schemas. `LocalStack` constructs
-the state once and publishes both `Stack` and the narrower `StackServiceActivator` Interface from
-the same scoped layer. `ApiProxy` therefore activates a lazy backend without gaining unrelated
-lifecycle operations or requiring a second pass-through lifecycle tag.
-
-Before the orchestrator exists, `LocalStack` publishes synthetic `Pending` and `Downloading`
-states. After construction, it subscribes to raw process-compose state and publishes only public
-projected states. `StackServiceState` adds `Downloading`, `Initializing`, and `Dormant` to the raw
-process statuses.
-
-`start()` prepares artifacts, creates the runtime once, starts the appropriate services, and waits
-for their generic process-compose readiness. `stop()` preserves explicit per-service stop intent;
-`dispose()` additionally closes the scoped runtime and executes cleanup. Stack readiness policy is
-enforced around generic process-compose waits, which remain intentionally policy-free and
-unbounded. Structural `Equal.equals` comparison suppresses duplicate projected state emissions.
-
-## Eager and lazy activation
-
-`ServiceActivation.ts` evaluates the startup and companion-ownership metadata in
-`ServiceCatalog.ts`:
-
-- eager: PostgreSQL, Realtime, Mailpit, Studio, and Pooler;
-- lazy: PostgREST, Auth, Edge Runtime, Storage, imgproxy, Postgres Meta, Analytics, and Vector;
-- Storage activates and owns imgproxy;
-- Analytics activates and owns Vector;
-- Studio activates Analytics but does not own it.
-
-In eager startup mode, every enabled service is started. In lazy mode, the internal
-`postgres-init` service, enabled eager services, and any activation companions they require start
-initially. Proxy handlers activate their backend before forwarding, with single-flight lifecycle
-coordination and a 30-second proxy activation timeout. Unrequested lazy services project as
-`Dormant`; `waitAllReady()` considers only services desired to run.
-
-Realtime stays eager because the HTTP proxy owns ordinary request forwarding, while WebSocket
-transport is not duplicated in a separate lazy-activation Adapter. Direct listeners must also
-exist before their endpoints are advertised.
-
-## API proxy and connection information
-
-`ApiProxy` owns the public API port and routes Supabase paths to loopback service ports. It covers
-Auth, PostgREST, Edge Functions, Realtime, Storage, Postgres Meta, Analytics, Pooler administration,
-and Studio's MCP route. It adds forwarding/CORS headers and translates opaque `publishableKey` and
-`secretKey` values into the internal anon and service-role JWTs when appropriate.
-
-`StackInfo` contains user-facing connection data:
-
-- API URL and database URL;
-- opaque publishable and secret keys;
-- internal anon and service-role JWTs;
-- endpoints for enabled services.
-
-Cleanup targets do not belong to `StackInfo`; they are internal runtime metadata.
-
-## Functions runtime configuration and reload
-
-Project discovery is outside the stack boundary. A caller supplies a serializable
-`ResolvedFunctionsBundle` containing absolute entrypoint, optional import-map, and static-file
-paths plus already-resolved shared and per-function environment values. The import-map path is
-explicitly nullable. Per-function environment values override shared values; stack-owned runtime
-URLs and credentials take final precedence when the worker is created.
-
-`LocalStack` keeps the current bundle in runtime-local memory. `reloadFunctions({ functions })`
-replaces it, while a reload without `functions` preserves the latest bundle. An Edge Runtime reload
-uses that same current bundle unless its body supplies a replacement. The stack combines the
-bundle with runtime URLs and credentials, atomically publishes `functions-runtime-config.json`
-with owner-only permissions under the Edge Runtime workspace, and removes it on disposal.
-
-Detached stacks deliberately exclude resolved bundles from daemon startup IPC, durable metadata,
-live state, logs, URLs, and rendered validation errors. Both `/functions/reload` and
-`/edge-runtime/reload` accept validated JSON bodies over the local Unix socket. This keeps resolved
-environment values confined to an explicit request body and the ephemeral runtime file.
-
-## Port leases
-
-Port allocation returns a `PortLease`, not just numbers. The stack reserves ports before cold asset
-preparation. The lifecycle Adapter passes:
-
-- `beforeStart` to reserve the service's fields again for a restart generation;
-- `beforeSpawn` to release those fields immediately before process creation;
-- a platform-factory release Effect for the public API server.
-
-This narrows but cannot completely remove the race between releasing a reservation and the child
-binding. Supervised Docker services have a wider window because the supervisor starts before
-`docker run` binds published ports.
-
-## Cleanup and crash recovery
-
-Every Docker definition has ordinary in-process cleanup and supervisor-owned orphan cleanup.
-`StackBuilder` also returns exact Docker container names for the definitions it constructed. The
-local Implementation captures these targets before persistence or orchestrator setup, persists
-them for managed daemons, and uses them as a force-removal safety net after graceful stop. Launch,
-exact cleanup, and candidate cleanup all derive container identity through the same naming
-function. Auto-created PostgreSQL, Storage, and runtime paths are also removed.
-
-Cleanup is intentionally defensive:
-
-1. process-compose finalizers stop individual process trees and run definition cleanup;
-2. supervisor runtimes survive abrupt owner loss long enough to kill child trees and clean
-   external resources;
-3. stack disposal force-removes exact known Docker containers;
-4. managed `stop` can use persisted cleanup metadata after daemon death;
-5. a failure before the exact build plan exists has candidate cleanup derived from enabled catalog
-   services; a partial startup failure disposes the exact build-produced plan.
-
-These paths overlap by design and must remain idempotent.
-
-## Foreground and daemon Adapters
-
-`foregroundLayer()` builds the local stack and API proxy in the caller process.
-
-Detached mode adds:
-
-- `daemonLayer()`: forks a runtime-specific daemon entrypoint and returns a `RemoteStack` layer;
-- `daemon.ts`: receives configuration excluding the resolved Functions bundle over Node IPC,
-  resolves ports, builds the foreground daemon layer, claims live state, and waits for HTTP stop or
-  a signal;
-- `DaemonServer`: exposes the `Stack` Interface over HTTP/SSE on a Unix-domain socket;
-- `RemoteStack`: maps that transport back to the same Effect `Stack` Interface;
-- `StateManager`: atomically persists and discovers durable metadata and live state.
-
-The management transport includes health, status, status stream, start/stop, readiness,
-per-service lifecycle, logs/history, and Edge Runtime reload routes. Readiness waits use validated
-`ReadyOptions` JSON bodies and preserve `StackReadinessError` across the transport. It is local
-Unix-socket transport, not the public Supabase API proxy.
-
-See [detach mode](./detach-mode.md) for paths, process startup, and compiled executable dispatch.
-
-## Managed paths
-
-With the default cache root (`~/.supabase`), durable data is project-keyed:
+Each managed stack has one durable document under:
 
 ```text
-<cacheRoot>/projects/<sha256(projectDir)[0:16]>/stacks/<name>/
-  stack.json
-  state.json
-  data/
+<supabase-home>/managed/stacks/<stack-id>/stack.json
 ```
 
-The live runtime directory is short and outside the project tree:
+The same directory contains `data/` for managed service data, `logs/` for
+runtime logs, and `runtime/` for supervisor-owned runtime files. The
+`ManagedStackManager` is the only component that writes `stack.json`.
 
-```text
-/tmp/supabase/s-<sha256(stackRoot)[0:12]>/
-  daemon-<generation>.sock
-```
+Control ownership is the liveness and mutation authority. `acquireControl`
+returns `Owned` for the process that bound the deterministic endpoint or
+`Attached` for a live owner. An attached caller uses the owner's endpoint for
+runtime requests; it never edits the document directly.
 
-Windows substitutes its system temporary directory for `/tmp`. Socket names are generation-scoped
-so a delayed daemon shutdown cannot unlink a replacement daemon's socket.
+### Start and attach
 
-Callers may explicitly supply `projectStateRoot`, in which case durable stacks live under
-`<projectStateRoot>/stacks/`; managed daemon callers may not directly override individual
-`stackRoot` or `runtimeRoot` values.
+1. `daemonLayer` discovers the workspace and derives the stack id before the
+   parent forks a supervisor child. Managed-only port intents and launch
+   metadata stay separate from the generic daemon configuration.
+2. The child binds the loopback control endpoint first, re-checks workspace
+   discovery, and refuses to continue if the identity no longer derives the
+   same id.
+3. The child supervisor removes stale named container resources when required;
+   after acquiring ownership it re-reads the existing document, selects or
+   validates its concrete runtime, then the manager allocates or reuses ports
+   and records `starting`.
+4. The child builds the direct runtime and `DaemonServer`, records `running`
+   with its control endpoint, and sends the endpoint to the parent.
+5. The parent returns a `RemoteStack` layer. The CLI then calls
+   `stack.start()` over the control transport when service startup is needed.
 
-## Runtime entrypoints and exports
+`connectManagedStack` reads the document, probes the deterministic endpoint
+without binding it, and returns a `RemoteStack` only when the owner reports a
+ready running state. Read-only status and discovery therefore do not claim an
+endpoint; mutating operations acquire control ownership.
 
-- `bun.ts` and `node.ts` are root export-condition targets.
-- `effect-bun.ts` and `effect-node.ts` are Effect export-condition targets. They bind foreground,
-  daemon, and Unix-socket layers without exposing raw platform factories or bootstrap paths.
-- `daemon-bun.ts` is exported as `@supabase/stack/daemon-bun` so the compiled CLI can dispatch to
-  it in-process.
-- `daemon-node.ts` is intentionally not a package export. The internal Node platform Adapter
-  resolves it by file URL and passes that filesystem path to `daemonLayer`; the package
-  `knip.entry` list preserves this live file-URL-only entrypoint.
-- `effect.ts` is the platform-agnostic consumer contract re-exported by the conditional Effect
-  entries. There is no general-purpose `internals.ts` entrypoint.
+### Update, stop, and delete
 
-## Testing
+- `updateManagedLaunch` is owner-gated. An attached client posts the validated
+  launch payload to `/managed/launch`; the owner invokes
+  `ManagedStackManager.updateLaunch`, and the caller re-reads the document.
+- `stopManagedStack` asks an attached owner to perform a graceful
+  `RemoteStack.stop()`, waits for the document to become `stopped`, and lets
+  the owner close the runtime before releasing control. If the old owner is
+  gone, the facade acquires control, removes containers named for the
+  stack id, records `stopped`, and does not inspect PIDs or scan processes.
+- `deleteManagedStack` requires owned control, reconciles any owned running or
+  failed runtime resources, and then removes the document and its managed data
+  root. The explicit destructive path can also remove an invalid document
+  after ownership is acquired; ordinary status and start operations report
+  corruption instead of guessing.
 
-- Unit tests cover configuration resolution, ports, versions, artifact definitions, service
-  factories, topology, projection, cleanup metadata, and protocol schemas.
-- Integration tests exercise binary publication, lifecycle coordination, daemon HTTP/SSE, remote
-  stack behavior, state persistence, and Unix socket streaming with stateful Effect Adapters.
-- Targeted e2e tests own the expensive process/container Seam for full stack startup, parallel
-  stacks, daemon lifecycle, and cleanup behavior.
+### Failure and recovery
 
-The authoritative current service versions are the `defaultVersion` fields in
-`src/ServiceCatalog.ts`; `DEFAULT_VERSIONS` is derived from that catalog, and package
-documentation should link to that source rather than copy its values.
+The owner records `starting`, `running`, `stopped`, `failed`, and `deleting`
+transitions. A startup error records `failed` and releases the port lease. A
+graceful stop closes the direct runtime before recording `stopped`.
+
+If a supervisor crashes, its document and possible runtime artifacts remain.
+The next managed start acquires control, reconciles named container resources by
+stack id, and reuses sticky ports according to their persisted `exact` or
+`automatic` intent. No PID file, process scan, second metadata file, or registry
+surgery is needed for recovery.
+
+Every document contains a concrete launch selection. Native documents record
+`mode: "native"`; container documents record `mode: "docker"` together with
+the selected `docker` or `podman` executable. Inputs may omit a mode to request
+selection, but unresolved launch state is never persisted. Resolved direct
+runtime configuration uses the same correlated native-or-container union.
+
+## Identity and state
+
+The stack id is a deterministic hash of workspace lineage, checkout lineage,
+branch or detached context, the canonical local project key, and the managed
+stack name. `workspaceId` identifies a local repository or ordinary-folder
+lineage; it is not a remote Supabase project id.
+
+For a Git checkout, `localProjectKey` is the canonical project-root path
+relative to the enclosing checkout root, normalized with `/` and `.` for the
+root. Sibling nested projects therefore get different identities and ports
+even when they use the default name. Renaming a local project directory
+intentionally creates a new identity; migration is not attempted.
+
+Git metadata supplies checkout and branch context. An ordinary folder receives
+an explicit private marker under `.supabase/`. Git checkout markers and
+ordinary-folder markers are private, unreleased storage owned by the current
+build; there is no migration layer or parallel document format.
+
+Consuming applications resolve and pass the canonical local Supabase project
+root to the managed environment APIs. `workspacePath` is an identity input, not
+an arbitrary current working directory: the stack does not inspect
+`supabase/config.toml`, remote-link metadata, or CLI-specific project layout
+conventions.
+
+Moved checkouts can be repaired with `repairWorkspace`, preserving the identity
+and ports. Duplicate checkout adoption is intentionally unsupported and
+requires an explicit ownership decision. Read-only project discovery treats
+unsupported or unreadable Git metadata as no managed stack; mutating operations
+fail loudly rather than creating state against ambiguous identity evidence.
+
+## Ports and control ownership
+
+Managed port assignments preserve both a port and its intent:
+
+- `exact` means the caller requested that number and a live conflicting owner
+  is an error.
+- `automatic` means the assignment is sticky for the document but may be
+  allocated independently for a sibling worktree or nested project.
+
+Startup derives active and disabled fields from the enabled-service
+configuration and preserves the raw project document so omitted values remain
+automatic. Automatic managed service allocation excludes the entire loopback
+control range (`10000..32767`). Explicit service ports may use that range, but
+they still conflict with the incoming stack's deterministic endpoint, a known
+persisted endpoint, or another stack's reservation under the normal exact-port
+rules. A persisted automatic assignment in the control range is invalid and
+fails loudly rather than being silently migrated.
+
+A deterministic sequence of eight control endpoint candidates is derived from
+the stack id and served on loopback. Acquisition scans for an existing matching
+owner, then binds the first available candidate; read-only probes scan the same
+sequence without claiming it. A hash collision or unrelated listener consumes
+that candidate, and acquisition fails with a typed conflict only when the
+sequence cannot yield an unambiguous owner or free endpoint. The manager
+reserves every known candidate against service allocation, and the document
+records the endpoint the owner actually bound. An exact service port can still
+equal a future candidate of an identity that has never started, so that
+low-probability conflict is rejected when ownership is acquired rather than
+forbidding every explicit port in the reserved range.
+
+This is deliberately a small single-user localhost mechanism. The control
+protocol has no token authentication; ownership, endpoint identity, and
+protocol-version checks provide the lifecycle boundary. `DaemonServer` exposes
+status, service operations, logs, graceful stop, and launch-update routes;
+`RemoteStack` is the typed client used by consumers.
+
+## Service execution and `ApiProxy`
+
+`StackPreparation` resolves each enabled service to a verified native binary or
+a Docker image. Explicit `mode: "native"` uses the supported native services
+and rejects Docker-only services; explicit `mode: "docker"` requires a usable
+Docker or Podman runtime and resolves every service to an image. When mode is
+omitted, selection prefers a usable Docker or Podman runtime and otherwise uses
+native mode only on a host for which native artifacts are published; that
+automatic fallback disables Docker-only services before ports or managed launch
+state are acquired. The selected runtime is then fixed for the stack. Service
+versions are normalized to their catalog form before either binary resolution
+or Docker image resolution, and `StackBuilder` turns the results into one
+process-compose graph. Docker resources are namespaced with the managed stack
+id.
+
+`ApiProxy` listens on the configured public `apiPort` and routes Supabase API
+paths (`/auth`, `/rest`, `/functions`, `/realtime`, `/storage`, `/pg`,
+`/analytics`, and related endpoints) to the service ports. The database URL
+and direct service endpoints remain available from `Stack.getInfo()`. The
+loopback control endpoint is management traffic and is never the user-facing
+API URL.
+
+## Platform re-entry: compiled Bun
+
+In source mode, Node and Bun supervisors fork the adjacent `daemon-node.ts` or
+`daemon-bun.ts` entrypoint. A Bun single-file executable cannot fork a source
+URL from Bun's virtual filesystem, so the child re-enters the compiled CLI
+instead. The parent sets `SUPABASE_STACK_RUN_DAEMON=1`; the CLI entrypoint
+handles that marker before normal command dispatch and invokes the same
+`runBunDaemon()` supervisor entrypoint. This is the only stack-specific
+self-dispatch path; the daemon branch does not run normal CLI command dispatch.
+
+## Component map
+
+| Concern                                           | Owner                                                             |
+| ------------------------------------------------- | ----------------------------------------------------------------- |
+| Public Promise and Effect entrypoints             | `src/{node,bun,effect-node,effect-bun}.ts`                        |
+| Identity discovery and stack id                   | `managed/environment.ts`, `managed/identity.ts`, `managed/git.ts` |
+| Document paths, schema, and atomic persistence    | `managed/paths.ts`, `managed/document.ts`, `managed/store.ts`     |
+| Managed reads, writes, ports, and lifecycle state | `managed/manager.ts`, `managed/lifecycle.ts`, `discovery.ts`      |
+| Ownership and deterministic endpoint              | `managed/control.ts`                                              |
+| Detached child protocol and startup               | `supervisor.ts`, `daemon-node.ts`, `daemon-bun.ts`                |
+| Runtime control routes and client                 | `DaemonServer.ts`, `RemoteStack.ts`, `HttpTransportClient.ts`     |
+| Direct runtime construction and service lifecycle | `createStack.ts`, `layers.ts`, `LocalStack.ts`, `Stack.ts`        |
+| Asset resolution and native/Docker graph          | `StackPreparation.ts`, `StackBuilder.ts`, `ServiceCatalog.ts`     |
+| Public API routing                                | `ApiProxy.ts`                                                     |
+| Platform listeners and process services           | `platform-node.ts`, `platform-bun.ts`                             |
+
+## Testing boundary
+
+Integration tests exercise the surfaces a consumer uses: manager identity and
+documents, sibling worktrees and nested projects, detached start/reattach,
+launch updates, status and logs, graceful stop, stale-owner recovery, and
+deletion. A small number of end-to-end tests cover real subprocess and runtime
+boundaries.
+
+Unit tests are reserved for pure identity, port, document, projection, and
+platform algorithms or for branches unreachable through the public runtime
+surface. The testing entrypoint exposes only the `DaemonServer` and transport
+seams needed to build those journeys; it does not recreate a repository,
+SQLite adapter, or contract-fixture implementation.

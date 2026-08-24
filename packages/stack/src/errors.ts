@@ -1,4 +1,4 @@
-import { Data } from "effect";
+import { Data, Predicate } from "effect";
 
 export class BinaryNotFoundError extends Data.TaggedError("BinaryNotFoundError")<{
   readonly service: string;
@@ -16,15 +16,68 @@ export class ChecksumMismatchError extends Data.TaggedError("ChecksumMismatchErr
   readonly actual: string;
 }> {}
 
+export class BinaryManifestError extends Data.TaggedError("BinaryManifestError")<{
+  readonly url: string;
+  readonly detail: string;
+}> {}
+
+export class BinaryRuntimeError extends Data.TaggedError("BinaryRuntimeError")<{
+  readonly path: string;
+  readonly detail: string;
+}> {}
+
+export class BinaryHostCompatibilityError extends Data.TaggedError("BinaryHostCompatibilityError")<{
+  readonly target: string;
+  readonly detail: string;
+}> {}
+
 export class DockerPullError extends Data.TaggedError("DockerPullError")<{
   readonly image: string;
   readonly detail: string;
   readonly cause: unknown;
+  /**
+   * Whether the pull failed because the container runtime itself is unusable
+   * locally — the daemon is unreachable (detected from the runtime's output
+   * at the boundary where it is produced) or the docker binary could not be
+   * spawned at all. Consumers must branch on this instead of sniffing
+   * `detail` text.
+   */
+  readonly daemonDown: boolean;
 }> {}
+
+/**
+ * Whether a container runtime's output indicates the daemon itself is not
+ * running. This is the boundary vocabulary for `DockerPullError.daemonDown`
+ * and shared with the CLI's legacy docker-run layer so both paths agree on
+ * what "daemon down" looks like.
+ */
+export const isDockerDaemonDownMessage = (message: string): boolean => {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("cannot connect to the docker daemon") ||
+    normalized.includes("docker daemon is not running") ||
+    normalized.includes("docker desktop is not running") ||
+    normalized.includes("is the docker daemon running") ||
+    normalized.includes("cannot connect to podman") ||
+    normalized.includes("error during connect") ||
+    // Spawn succeeds but the socket is not accessible (e.g. a Linux user
+    // missing docker group membership) — a local setup problem, not a
+    // registry failure.
+    normalized.includes("permission denied while trying to connect to the docker daemon")
+  );
+};
 
 export class StackBuildError extends Data.TaggedError("StackBuildError")<{
   readonly detail: string;
   readonly cause?: unknown;
+  /**
+   * Structured discriminant for consumers that need to distinguish failure
+   * classes without parsing `detail`: `invalid_config` for user-fixable
+   * configuration problems, `docker_not_running` for an unavailable local
+   * runtime, and `asset_preparation` for other download/registry failures.
+   * Absent for internal invariant violations.
+   */
+  readonly reason?: "invalid_config" | "docker_not_running" | "asset_preparation";
 }> {}
 
 export class StackNotRunningError extends Data.TaggedError("StackNotRunningError")<{
@@ -51,80 +104,41 @@ export class StackError extends Error {
   }
 }
 
+const taggedStackErrorCodes = [
+  ["ServiceNotFoundError", "SERVICE_NOT_FOUND"],
+  ["StackBuildError", "BUILD_ERROR"],
+  ["StackNotRunningError", "STACK_NOT_RUNNING"],
+  ["StackReadinessError", "STACK_READINESS_TIMEOUT"],
+  ["BinaryNotFoundError", "BINARY_NOT_FOUND"],
+  ["ChecksumMismatchError", "CHECKSUM_MISMATCH"],
+  ["BinaryManifestError", "BINARY_MANIFEST"],
+  ["BinaryRuntimeError", "BINARY_RUNTIME"],
+  ["BinaryHostCompatibilityError", "BINARY_HOST"],
+  ["DownloadError", "DOWNLOAD_ERROR"],
+  ["DockerPullError", "DOCKER_PULL_ERROR"],
+  ["PortConflictError", "PORT_CONFLICT"],
+  ["PortAllocationError", "PORT_ALLOCATION"],
+  ["ServiceReadyError", "SERVICE_NOT_READY"],
+] as const;
+
+const messageForUnknownError = (error: unknown): string => {
+  if (error instanceof Error && error.message.length > 0) return error.message;
+  if (error !== null && typeof error === "object" && "detail" in error) {
+    const detail = error.detail;
+    if (typeof detail === "string" && detail.length > 0) return detail;
+  }
+  return String(error);
+};
+
 export function toStackError(err: unknown): StackError {
   if (err instanceof StackError) return err;
-  if (err != null && typeof err === "object" && "_tag" in err) {
-    const tagged = err as { _tag: string; message?: string; detail?: string };
-    const taggedMessage =
-      (tagged.message !== undefined && tagged.message.length > 0 ? tagged.message : undefined) ??
-      tagged.detail ??
-      String(err);
-    switch (tagged._tag) {
-      case "ServiceNotFoundError":
-        return new StackError({
-          code: "SERVICE_NOT_FOUND",
-          message: taggedMessage,
-        });
-      case "StackBuildError":
-        return new StackError({
-          code: "BUILD_ERROR",
-          message: taggedMessage,
-          cause: err,
-        });
-      case "StackNotRunningError":
-        return new StackError({
-          code: "STACK_NOT_RUNNING",
-          message: taggedMessage,
-          cause: err,
-        });
-      case "StackReadinessError":
-        return new StackError({
-          code: "STACK_READINESS_TIMEOUT",
-          message: taggedMessage,
-          cause: err,
-        });
-      case "BinaryNotFoundError":
-        return new StackError({
-          code: "BINARY_NOT_FOUND",
-          message: taggedMessage,
-          cause: err,
-        });
-      case "DownloadError":
-        return new StackError({
-          code: "DOWNLOAD_ERROR",
-          message: taggedMessage,
-          cause: err,
-        });
-      case "DockerPullError":
-        return new StackError({
-          code: "DOCKER_PULL_ERROR",
-          message: taggedMessage,
-          cause: err,
-        });
-      case "PortConflictError":
-        return new StackError({
-          code: "PORT_CONFLICT",
-          message: taggedMessage,
-          cause: err,
-        });
-      case "PortAllocationError":
-        return new StackError({
-          code: "PORT_ALLOCATION",
-          message: taggedMessage,
-          cause: err,
-        });
-      case "ServiceReadyError":
-        return new StackError({
-          code: "SERVICE_NOT_READY",
-          message: taggedMessage,
-          cause: err,
-        });
-      default:
-        return new StackError({
-          code: tagged._tag,
-          message: taggedMessage,
-          cause: err,
-        });
+  for (const [tag, code] of taggedStackErrorCodes) {
+    if (Predicate.isTagged(err, tag)) {
+      return new StackError({
+        code,
+        message: messageForUnknownError(err),
+        cause: err,
+      });
     }
   }
   if (err instanceof Error) {
